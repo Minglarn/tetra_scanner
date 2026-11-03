@@ -6,6 +6,7 @@ import time
 import socket
 import select
 import signal
+import struct
 import re
 from datetime import datetime, timezone
 
@@ -15,7 +16,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.03.4")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.03.5")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -66,6 +67,14 @@ CALL_PDUS = {
 
 STATUS_MAP = {
     0: "NÖDLARM / Emergency (0)",
+    1: "Status 1 (In Service / Active)",
+    2: "Status 2 (Acknowledged / Sync OK)",
+    3: "Status 3 (At Stop / Station)",
+    4: "Status 4 (Delayed / Traffic Info)",
+    5: "Status 5 (Ready for Departure)",
+    6: "Status 6 (Out of Service / Depot)",
+    10: "Status 10 (Driver Call Request)",
+    12: "Status 12 (Vehicle Fault / Disturbance)",
     65024: "Heartbeat / ACK (65024)",
     65025: "Status ACK (65025)",
     65535: "System Status (65535)",
@@ -112,6 +121,7 @@ ROUTE_SYNC_REGEX = re.compile(
     r"^([A-Za-z0-9_]+),(\d+),(\d+)-(\d+)-(\d+),(\d+)$"
 )
 GENERIC_CSV_SYNC_REGEX = re.compile(r"^([A-Z]_[A-Z]_),(.+)$")
+NMEA_REGEX = re.compile(r"(\$G[PN][A-Z]{3},[^\r\n]+)")
 
 
 def parse_channels(channels_str):
@@ -185,7 +195,7 @@ def classify_ssi(ssi):
     if 3000000 <= val <= 3999999:
         return "Talkgroup (GSSI)"
     if 4500000 <= val <= 4599999:
-        return "Vehicle/Mobile (ISSI)"
+        return "Vehicle/Train Radio (ISSI)"
     return "Radio/Group"
 
 
@@ -241,6 +251,120 @@ def decode_lip_gps(raw_bytes):
     return None, None
 
 
+def scan_binary_for_nordic_coords(raw_bytes):
+    if not raw_bytes or len(raw_bytes) < 7:
+        return None, None
+
+    for i in range(0, max(1, len(raw_bytes) - 6)):
+        lat, lon = decode_lip_gps(raw_bytes[i : i + 8])
+        if lat is not None and lon is not None and 55.0 <= lat <= 69.5 and 11.0 <= lon <= 24.5:
+            return lat, lon
+
+    if len(raw_bytes) >= 8:
+        for i in range(0, len(raw_bytes) - 7):
+            chunk = raw_bytes[i : i + 8]
+            for endian in (">", "<"):
+                try:
+                    a, b = struct.unpack(f"{endian}ii", chunk)
+                    for scale in (1e6, 1e7, 1e5):
+                        lat1, lon1 = a / scale, b / scale
+                        if 55.0 <= lat1 <= 69.5 and 11.0 <= lon1 <= 24.5:
+                            return round(lat1, 6), round(lon1, 6)
+                        lat2, lon2 = b / scale, a / scale
+                        if 55.0 <= lat2 <= 69.5 and 11.0 <= lon2 <= 24.5:
+                            return round(lat2, 6), round(lon2, 6)
+                except struct.error:
+                    pass
+                try:
+                    fa, fb = struct.unpack(f"{endian}ff", chunk)
+                    if 55.0 <= fa <= 69.5 and 11.0 <= fb <= 24.5:
+                        return round(float(fa), 6), round(float(fb), 6)
+                    if 55.0 <= fb <= 69.5 and 11.0 <= fa <= 24.5:
+                        return round(float(fb), 6), round(float(fa), 6)
+                except struct.error:
+                    pass
+
+    return None, None
+
+
+def nmea_coord_to_decimal(coord_str, hemi):
+    if not coord_str or "." not in coord_str:
+        return None
+    try:
+        dot_idx = coord_str.index(".")
+        deg_len = dot_idx - 2
+        if deg_len not in (2, 3):
+            return None
+        degrees = float(coord_str[:deg_len])
+        minutes = float(coord_str[deg_len:])
+        dec = degrees + (minutes / 60.0)
+        if hemi in ("S", "W"):
+            dec = -dec
+        return round(dec, 6)
+    except ValueError:
+        return None
+
+
+def parse_nmea_sentence(text):
+    if not text:
+        return None
+    m = NMEA_REGEX.search(text)
+    if not m:
+        return None
+
+    sentence = m.group(1).split("*")[0].strip()
+    parts = [p.strip() for p in sentence.split(",")]
+    talker_cmd = parts[0].upper()
+
+    lat = None
+    lon = None
+    speed_kmh = None
+    course_deg = None
+    utc_time = None
+    valid = True
+
+    if talker_cmd.endswith("RMC") and len(parts) >= 7:
+        utc_time = parts[1] or None
+        status = parts[2].upper()
+        valid = status == "A"
+        lat = nmea_coord_to_decimal(parts[3], parts[4].upper())
+        lon = nmea_coord_to_decimal(parts[5], parts[6].upper())
+        if len(parts) > 7 and parts[7]:
+            try:
+                speed_kmh = round(float(parts[7]) * 1.852, 1)
+            except ValueError:
+                pass
+        if len(parts) > 8 and parts[8]:
+            try:
+                course_deg = round(float(parts[8]), 1)
+            except ValueError:
+                pass
+    elif talker_cmd.endswith("GGA") and len(parts) >= 6:
+        utc_time = parts[1] or None
+        lat = nmea_coord_to_decimal(parts[2], parts[3].upper())
+        lon = nmea_coord_to_decimal(parts[4], parts[5].upper())
+    elif talker_cmd.endswith("GLL") and len(parts) >= 5:
+        lat = nmea_coord_to_decimal(parts[1], parts[2].upper())
+        lon = nmea_coord_to_decimal(parts[3], parts[4].upper())
+        if len(parts) > 5 and parts[5]:
+            utc_time = parts[5]
+
+    if lat is None or lon is None:
+        return None
+
+    return {
+        "protocol": "NMEA_GPS",
+        "nmea_type": talker_cmd.lstrip("$"),
+        "valid": valid,
+        "utc_time": utc_time,
+        "lat": lat,
+        "lon": lon,
+        "speed_kmh": speed_kmh,
+        "course_deg": course_deg,
+        "maps_url": f"https://www.google.com/maps?q={lat},{lon}",
+    }
+
+
 def extract_ascii_strings(raw_bytes, min_len=3):
     text = "".join(chr(b) if 32 <= b <= 126 else "\x00" for b in raw_bytes)
     parts = [p.strip() for p in text.split("\x00") if len(p.strip()) >= min_len]
@@ -267,6 +391,11 @@ def parse_structured_text(text):
         return None, None
 
     cleaned = text.strip()
+
+    nmea_info = parse_nmea_sentence(cleaned)
+    if nmea_info:
+        return "NMEA_GPS", nmea_info
+
     m_triona = TRIONA_REGEX.match(cleaned)
     if m_triona:
         cmd_code, app_name, app_ver, dev_id = m_triona.groups()
@@ -407,18 +536,29 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
             prefix, tail = body.split(b"\n", 1)
             sds_text = prefix.decode("ascii", errors="replace").strip()
             sds_binary_tail = tail.hex()
+            tail_bytes_raw = tail
         else:
             ascii_str = extract_ascii_strings(body, min_len=2)
             sds_text = ascii_str
             sds_binary_tail = body.hex()
+            tail_bytes_raw = body
+
+        gps_lat, gps_lon = scan_binary_for_nordic_coords(tail_bytes_raw)
+
+        parsed_data = {
+            "avl_prefix": sds_text,
+            "tail_bytes": len(tail_bytes_raw),
+        }
         if sds_text and ":" in sds_text:
             p_parts = sds_text.split(":", 1)
-            parsed_data = {
-                "avl_prefix": sds_text,
-                "line_or_id": int(p_parts[0]) if p_parts[0].isdigit() else p_parts[0],
-                "state_code": p_parts[1],
-                "tail_bytes": len(bytes.fromhex(sds_binary_tail)) if sds_binary_tail else 0,
-            }
+            parsed_data["line_or_id"] = (
+                int(p_parts[0]) if p_parts[0].isdigit() else p_parts[0]
+            )
+            parsed_data["state_code"] = p_parts[1]
+        if gps_lat is not None and gps_lon is not None:
+            parsed_data["lat"] = gps_lat
+            parsed_data["lon"] = gps_lon
+            parsed_data["maps_url"] = f"https://www.google.com/maps?q={gps_lat},{gps_lon}"
     else:
         if infos_text:
             sds_type = "TEXT"
@@ -430,6 +570,15 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
                 sds_text = ascii_str
             else:
                 sds_type = "BINARY"
+                gps_lat, gps_lon = scan_binary_for_nordic_coords(raw_bytes)
+                if gps_lat is not None and gps_lon is not None:
+                    sds_type = "BINARY_GPS"
+                    sds_text = f"GPS {gps_lat:.6f}, {gps_lon:.6f}"
+                    parsed_data = {
+                        "lat": gps_lat,
+                        "lon": gps_lon,
+                        "maps_url": f"https://www.google.com/maps?q={gps_lat},{gps_lon}",
+                    }
 
     if sds_text and sds_type in ("TEXT", "AVL_TELEMETRY"):
         detected_type, struct_dict = parse_structured_text(sds_text)
@@ -440,6 +589,9 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
                 parsed_data = struct_dict
             else:
                 parsed_data.update(struct_dict)
+            if "lat" in struct_dict and "lon" in struct_dict:
+                gps_lat = struct_dict["lat"]
+                gps_lon = struct_dict["lon"]
 
     return {
         "sds_type": sds_type,
@@ -452,12 +604,30 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
     }
 
 
-def format_sds_human_text(ssi, dest_ssi, proto_id, decoded):
+def format_unit_badge(ssi, unit_registry):
+    val = to_int(ssi)
+    if val is None or val not in unit_registry:
+        return ""
+    ctx = unit_registry[val]
+    parts = []
+    if ctx.get("train_or_route_no") is not None:
+        r_str = f"Train/Line {ctx['train_or_route_no']}"
+        if ctx.get("direction") is not None:
+            r_str += f" Dir {ctx['direction']}"
+        parts.append(r_str)
+    if ctx.get("device_mac"):
+        parts.append(f"MAC {ctx['device_mac']}")
+    return f" [{' | '.join(parts)}]" if parts else ""
+
+
+def format_sds_human_text(ssi, dest_ssi, proto_id, decoded, unit_registry):
     sds_type = decoded["sds_type"]
     sds_text = decoded["sds_text"]
     parsed = decoded.get("parsed") or {}
-    src_str = f"SSI {ssi}" if ssi is not None else "Unknown SSI"
-    dst_str = f"SSI {dest_ssi}" if dest_ssi is not None else "Broadcast"
+    src_badge = format_unit_badge(ssi, unit_registry)
+    dst_badge = format_unit_badge(dest_ssi, unit_registry)
+    src_str = f"SSI {ssi}{src_badge}" if ssi is not None else "Unknown SSI"
+    dst_str = f"SSI {dest_ssi}{dst_badge}" if dest_ssi is not None else "Broadcast"
 
     if sds_type == "TRIONA_GATEWAY":
         app = parsed.get("app_name", "TrionaGateway")
@@ -479,18 +649,28 @@ def format_sds_human_text(ssi, dest_ssi, proto_id, decoded):
             f"Consist/TxID {consist_id}, Status {st_code})"
         )
 
-    if sds_type == "LIP_GPS":
+    if sds_type in ("LIP_GPS", "NMEA_GPS", "BINARY_GPS"):
         lat = decoded.get("gps_lat")
         lon = decoded.get("gps_lon")
+        spd = parsed.get("speed_kmh")
+        crs = parsed.get("course_deg")
+        extra = ""
+        if spd is not None:
+            extra += f" Speed {spd} km/h"
+        if crs is not None:
+            extra += f" Course {crs} deg"
         if lat is not None and lon is not None:
-            return f"GPS Position {src_str} -> {dst_str}: {lat:.6f}, {lon:.6f}"
-        return f"LIP GPS packet {src_str} -> {dst_str} ({decoded.get('sds_hex')})"
+            return f"GPS Position ({sds_type}) {src_str} -> {dst_str}: {lat:.6f}, {lon:.6f}{extra}"
+        return f"GPS packet {src_str} -> {dst_str} ({decoded.get('sds_hex')})"
 
     if sds_type == "AVL_TELEMETRY":
         tail = decoded.get("sds_binary_tail")
         tail_len = len(tail) // 2 if tail else 0
         label = sds_text or "Binary AVL"
-        return f"AVL Telemetry {src_str} -> {dst_str}: {label} (+{tail_len}B payload)"
+        lat = decoded.get("gps_lat")
+        lon = decoded.get("gps_lon")
+        coord_str = f" GPS {lat:.6f}, {lon:.6f}" if (lat is not None and lon is not None) else ""
+        return f"AVL Telemetry {src_str} -> {dst_str}: {label} (+{tail_len}B payload){coord_str}"
 
     if sds_type == "CONTROL_FRAME":
         fields_str = ", ".join(str(x) for x in parsed.get("fields", []))
@@ -632,6 +812,7 @@ def main():
     pending_sds = {}
     dedup_cache = {}
     active_tx = {}
+    unit_registry = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
     last_heartbeat = time.time()
     running = True
@@ -642,6 +823,47 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
+
+    def update_unit_registry(ssi, dest_ssi, decoded):
+        parsed = decoded.get("parsed")
+        if not isinstance(parsed, dict):
+            return
+        sds_type = decoded.get("sds_type")
+        target_ids = []
+        if dest_ssi is not None and dest_ssi >= 1000:
+            target_ids.append(dest_ssi)
+        if ssi is not None and ssi >= 1000:
+            target_ids.append(ssi)
+        op_id = to_int(parsed.get("unit_or_op_id"))
+        if op_id is not None and op_id >= 1000:
+            target_ids.append(op_id)
+
+        for tid in target_ids:
+            entry = unit_registry.setdefault(tid, {})
+            if sds_type == "TRAIN_ROUTE_SYNC":
+                if parsed.get("train_or_route_no") is not None:
+                    entry["train_or_route_no"] = parsed["train_or_route_no"]
+                if parsed.get("direction") is not None:
+                    entry["direction"] = parsed["direction"]
+                if parsed.get("consist_or_tx_id") is not None:
+                    entry["consist_or_tx_id"] = parsed["consist_or_tx_id"]
+                if op_id is not None:
+                    entry["unit_or_op_id"] = op_id
+            elif sds_type == "TRIONA_GATEWAY":
+                if parsed.get("device_mac"):
+                    entry["device_mac"] = parsed["device_mac"]
+                if parsed.get("device_id"):
+                    entry["device_id"] = parsed["device_id"]
+            elif sds_type == "AVL_TELEMETRY":
+                if parsed.get("line_or_id") is not None:
+                    entry.setdefault("train_or_route_no", parsed["line_or_id"])
+
+    def get_unit_context(ssi, dest_ssi=None):
+        for cand in (ssi, dest_ssi):
+            val = to_int(cand)
+            if val is not None and val in unit_registry:
+                return dict(unit_registry[val])
+        return None
 
     def is_duplicate(sig_tuple, now_ts, ttl=1.2):
         expired = [k for k, ts in dedup_cache.items() if now_ts - ts > 5.0]
@@ -746,7 +968,8 @@ def main():
         )
 
         decoded = decode_sds_payload(proto_id, hex_str, infos)
-        human_text = format_sds_human_text(ssi, dest_ssi, proto_id, decoded)
+        update_unit_registry(ssi, dest_ssi, decoded)
+        human_text = format_sds_human_text(ssi, dest_ssi, proto_id, decoded, unit_registry)
 
         sig = (
             ch["freq_mhz"],
@@ -772,6 +995,7 @@ def main():
             "ssi_type": classify_ssi(ssi),
             "dest_ssi": dest_ssi,
             "dest_ssi_type": classify_ssi(dest_ssi),
+            "unit_context": get_unit_context(ssi, dest_ssi),
             "protocol_id": proto_id,
             "message_reference": msg_ref,
             "sds_pdu": sds_pdu,
@@ -871,8 +1095,10 @@ def main():
             if is_duplicate(sig, now_ts, ttl=1.5):
                 return
 
-            target_part = f" -> SSI {dst_ssi}" if dst_ssi is not None else ""
-            human_text = f"Status from SSI {src_ssi}{target_part}: {status_text}"
+            src_badge = format_unit_badge(src_ssi, unit_registry)
+            dst_badge = format_unit_badge(dst_ssi, unit_registry)
+            target_part = f" -> SSI {dst_ssi}{dst_badge}" if dst_ssi is not None else ""
+            human_text = f"Status from SSI {src_ssi}{src_badge}{target_part}: {status_text}"
 
             event = {
                 "timestamp": now_iso,
@@ -885,6 +1111,7 @@ def main():
                 "ssi": src_ssi,
                 "ssi_type": classify_ssi(src_ssi),
                 "dest_ssi": dst_ssi,
+                "unit_context": get_unit_context(src_ssi, dst_ssi),
                 "status_code": status_code,
                 "status_hex": status_hex,
                 "status_text": status_text,
@@ -902,7 +1129,15 @@ def main():
             disc_cause_text = DISCONNECT_CAUSE_MAP.get(disc_cause_code)
 
             explicit_gssi = to_int(
-                get_ci(pkt, ["gssi", "group ssi", "called party ssi", "called party address ssi"])
+                get_ci(
+                    pkt,
+                    [
+                        "gssi",
+                        "group ssi",
+                        "called party ssi",
+                        "called party address ssi",
+                    ],
+                )
             )
             if explicit_gssi is not None:
                 gssi = explicit_gssi
@@ -940,9 +1175,14 @@ def main():
                     if call_id is None and prev_tx.get("call_id") is not None:
                         call_id = prev_tx["call_id"]
 
-            grp_label = f"Group {gssi}" if gssi is not None else f"SSI {ssi}"
+            grp_label = (
+                f"Group {gssi}"
+                if gssi is not None
+                else f"SSI {ssi}{format_unit_badge(ssi, unit_registry)}"
+            )
+            speaker_badge = format_unit_badge(caller_ssi, unit_registry)
             speaker_label = (
-                f" by SSI {caller_ssi}"
+                f" by SSI {caller_ssi}{speaker_badge}"
                 if (caller_ssi is not None and caller_ssi != gssi)
                 else ""
             )
@@ -952,13 +1192,21 @@ def main():
                 human_text = f"{grp_label}: Call setup{speaker_label}{cid_label}"
             elif pdu == "D-TX GRANTED":
                 grant_info = f" [{tx_grant_text}]" if tx_grant_text else ""
-                human_text = f"{grp_label}: PTT TX granted{speaker_label}{grant_info}{cid_label}"
+                human_text = (
+                    f"{grp_label}: PTT TX granted{speaker_label}{grant_info}{cid_label}"
+                )
             elif pdu == "D-TX CEASED":
-                dur_info = f" after {tx_duration_s}s" if tx_duration_s is not None else ""
-                human_text = f"{grp_label}: PTT TX ended{speaker_label}{dur_info}{cid_label}"
+                dur_info = (
+                    f" after {tx_duration_s}s" if tx_duration_s is not None else ""
+                )
+                human_text = (
+                    f"{grp_label}: PTT TX ended{speaker_label}{dur_info}{cid_label}"
+                )
             elif pdu == "D-RELEASE":
                 cause_info = f" ({disc_cause_text})" if disc_cause_text else ""
-                dur_info = f" after {tx_duration_s}s" if tx_duration_s is not None else ""
+                dur_info = (
+                    f" after {tx_duration_s}s" if tx_duration_s is not None else ""
+                )
                 human_text = f"{grp_label}: Call released{dur_info}{cause_info}{cid_label}"
             else:
                 human_text = f"{grp_label}: {pdu}{speaker_label}{cid_label}"
@@ -975,6 +1223,7 @@ def main():
                 "ssi_type": classify_ssi(ssi),
                 "caller_ssi": caller_ssi,
                 "gssi": gssi,
+                "unit_context": get_unit_context(caller_ssi, ssi),
                 "call_identifier": call_id,
                 "usage_marker": usage_marker,
                 "tx_grant": tx_grant_text,
@@ -1002,10 +1251,9 @@ def main():
             if is_duplicate(sig, now_ts, ttl=1.5):
                 return
 
+            badge = format_unit_badge(ssi, unit_registry)
             gssi_part = f" (Group {gssi})" if gssi is not None else ""
-            human_text = (
-                f"Roaming: SSI {ssi}{gssi_part} registered on LA {ch['la']} ({freq_str} MHz) [{pdu}]"
-            )
+            human_text = f"Roaming: SSI {ssi}{badge}{gssi_part} registered on LA {ch['la']} ({freq_str} MHz) [{pdu}]"
             event = {
                 "timestamp": now_iso,
                 "host": HOST_NAME,
@@ -1017,6 +1265,7 @@ def main():
                 "ssi": ssi,
                 "ssi_type": classify_ssi(ssi),
                 "gssi": gssi,
+                "unit_context": get_unit_context(ssi),
                 "human_text": human_text,
             }
             emit_event(event, raw_pkt=pkt)
@@ -1027,7 +1276,8 @@ def main():
         if is_duplicate(sig, now_ts, ttl=1.2):
             return
 
-        human_text = f"{service} {pdu} on LA {ch['la']} (SSI {ssi})"
+        badge = format_unit_badge(ssi, unit_registry)
+        human_text = f"{service} {pdu} on LA {ch['la']} (SSI {ssi}{badge})"
         event = {
             "timestamp": now_iso,
             "host": HOST_NAME,
@@ -1038,6 +1288,7 @@ def main():
             "la": ch["la"],
             "ssi": ssi,
             "ssi_type": classify_ssi(ssi),
+            "unit_context": get_unit_context(ssi),
             "human_text": human_text,
         }
         emit_event(event, raw_pkt=pkt)
@@ -1074,6 +1325,7 @@ def main():
                 "category": "HEARTBEAT",
                 "version": APP_VERSION,
                 "total_packets_60s": total_60s,
+                "known_units": len(unit_registry),
                 "channels_60s": dict(stats_60s),
             }
             if mqtt_client is not None:
@@ -1085,7 +1337,7 @@ def main():
                 )
             send_udp_json(hb_payload)
             print(
-                f"[heartbeat] 60s total packets: {total_60s} | per channel: {stats_60s}",
+                f"[heartbeat] 60s total packets: {total_60s} | known units: {len(unit_registry)} | per channel: {stats_60s}",
                 flush=True,
             )
             for k in stats_60s:
