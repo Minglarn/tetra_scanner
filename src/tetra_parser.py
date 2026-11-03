@@ -15,7 +15,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.03.1")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.03.2")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -58,13 +58,56 @@ CALL_PDUS = {
     "D-CONNECT ACK",
     "D-TX GRANTED",
     "D-TX CEASED",
+    "D-TX WAIT",
+    "D-TX INTERRUPT",
     "D-RELEASE",
+    "D-CALL RESTORE",
 }
 
 STATUS_MAP = {
+    0: "NÖDLARM / Emergency (0)",
     65024: "Heartbeat / ACK (65024)",
-    0: "NÖDLARM / Emergency",
+    65025: "Status ACK (65025)",
+    65535: "System Status (65535)",
 }
+
+TX_GRANT_MAP = {
+    0: "Granted",
+    1: "Not granted",
+    2: "Request queued",
+    3: "Granted to another unit",
+}
+
+DISCONNECT_CAUSE_MAP = {
+    0: "Not defined",
+    1: "User requested disconnect",
+    2: "Called party busy",
+    3: "Called party not reachable",
+    4: "Called party does not support encryption",
+    5: "Congestion in infrastructure",
+    6: "Not allowed traffic",
+    7: "Incompatible traffic",
+    8: "Service not available",
+    9: "Pre-emption",
+    10: "Invalid call identifier",
+    11: "Called party rejection",
+    12: "No idle CCK",
+    13: "Expiry of timer",
+    14: "SwMI requested disconnection",
+    15: "Acknowledged service not completed",
+}
+
+TRIONA_CMD_MAP = {
+    "900": "Session Init",
+    "901": "Gateway Handshake / Poll",
+    "902": "Gateway ACK / Keepalive",
+    "903": "Configuration Update",
+    "904": "Status Report",
+    "905": "Disconnect / Reset",
+}
+
+TRIONA_REGEX = re.compile(r"^\*(\d+)\*([^*]+)\*([^*]+)\*([0-9A-Fa-f]{6,24})#$")
+STAR_FRAME_REGEX = re.compile(r"^\*(.+)#$")
 
 
 def parse_channels(channels_str):
@@ -73,7 +116,13 @@ def parse_channels(channels_str):
     for idx, entry in enumerate(entries, start=1):
         parts = entry.split(":")
         freq_hz = int(parts[0])
-        la = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else parts[1] if len(parts) > 1 else idx
+        la = (
+            int(parts[1])
+            if len(parts) > 1 and parts[1].isdigit()
+            else parts[1]
+            if len(parts) > 1
+            else idx
+        )
         freq_mhz = f"{freq_hz / 1e6:.4f}"
         channels.append(
             {
@@ -103,6 +152,46 @@ def parse_udp_targets(targets_str):
     return targets
 
 
+def get_ci(pkt, candidate_keys, default=None):
+    if not isinstance(pkt, dict):
+        return default
+    lower_map = {str(k).lower().strip(): v for k, v in pkt.items() if v is not None}
+    for key in candidate_keys:
+        k_low = key.lower().strip()
+        if k_low in lower_map:
+            return lower_map[k_low]
+    return default
+
+
+def to_int(val, default=None):
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def classify_ssi(ssi):
+    val = to_int(ssi)
+    if val is None:
+        return None
+    if 1 <= val <= 999:
+        return "Gateway/Dispatch"
+    if 3000000 <= val <= 3999999:
+        return "Talkgroup (GSSI)"
+    if 4500000 <= val <= 4599999:
+        return "Vehicle/Mobile (ISSI)"
+    return "Radio/Group"
+
+
+def format_mac(hex_id):
+    clean = re.sub(r"[^0-9A-Fa-f]", "", str(hex_id)).upper()
+    if len(clean) == 12:
+        return ":".join(clean[i : i + 2] for i in range(0, 12, 2))
+    return None
+
+
 def extract_bits_signed(data_bytes, bit_offset, num_bits):
     total_bits = len(data_bytes) * 8
     if bit_offset + num_bits > total_bits:
@@ -121,7 +210,9 @@ def extract_bits_signed(data_bytes, bit_offset, num_bits):
 def decode_lip_gps(raw_bytes):
     if not raw_bytes:
         return None, None
-    payload = raw_bytes[1:] if len(raw_bytes) >= 8 and raw_bytes[0] == 0x0A else raw_bytes
+    payload = (
+        raw_bytes[1:] if len(raw_bytes) >= 8 and raw_bytes[0] == 0x0A else raw_bytes
+    )
     if len(payload) < 7:
         return None, None
 
@@ -152,20 +243,89 @@ def extract_ascii_strings(raw_bytes, min_len=3):
     return " ".join(parts) if parts else None
 
 
+def decode_sds_tl_hex(raw_bytes):
+    if not raw_bytes:
+        return None
+    candidates = [raw_bytes]
+    if len(raw_bytes) > 2:
+        candidates.append(raw_bytes[2:])
+    if len(raw_bytes) > 3:
+        candidates.append(raw_bytes[3:])
+    for cand in candidates:
+        printable = sum(1 for b in cand if 32 <= b <= 126 or b in (10, 13))
+        if len(cand) >= 3 and printable / float(len(cand)) >= 0.75:
+            return "".join(chr(b) for b in cand if 32 <= b <= 126).strip()
+    return extract_ascii_strings(raw_bytes, min_len=3)
+
+
+def parse_structured_text(text):
+    if not text:
+        return None, None
+
+    cleaned = text.strip()
+    m_triona = TRIONA_REGEX.match(cleaned)
+    if m_triona:
+        cmd_code, app_name, app_ver, dev_id = m_triona.groups()
+        dev_id_up = dev_id.upper()
+        mac = format_mac(dev_id_up)
+        cmd_desc = TRIONA_CMD_MAP.get(cmd_code, f"Command {cmd_code}")
+        parsed = {
+            "protocol": "Triona",
+            "command_code": int(cmd_code),
+            "command_name": cmd_desc,
+            "app_name": app_name,
+            "app_version": app_ver,
+            "device_id": dev_id_up,
+            "device_mac": mac,
+        }
+        return "TRIONA_GATEWAY", parsed
+
+    m_star = STAR_FRAME_REGEX.match(cleaned)
+    if m_star:
+        fields = [f.strip() for f in m_star.group(1).split("*")]
+        if len(fields) >= 2:
+            parsed = {
+                "protocol": "StarFrame",
+                "fields": fields,
+            }
+            if fields[0].isdigit():
+                parsed["command_code"] = int(fields[0])
+            for f in fields:
+                mac = format_mac(f)
+                if mac:
+                    parsed["device_mac"] = mac
+                    parsed["device_id"] = f.upper()
+            return "CONTROL_FRAME", parsed
+
+    if ":" in cleaned and len(cleaned) <= 32:
+        parts = cleaned.split(":", 1)
+        if parts[0].isdigit():
+            return "AVL_TELEMETRY", {
+                "line_or_unit": int(parts[0]),
+                "telemetry_code": parts[1],
+            }
+
+    return None, None
+
+
 def decode_sds_payload(proto_id, hex_str, infos_list):
     sds_type = "BINARY"
     sds_text = None
     sds_binary_tail = None
     gps_lat = None
     gps_lon = None
+    parsed_data = None
 
     infos_text = None
     if isinstance(infos_list, list) and infos_list:
         extracted = []
         for item in infos_list:
             if isinstance(item, dict):
-                for k, v in item.items():
-                    extracted.append(f"{k}: {v}" if k != "text" else str(v))
+                if "text" in item and item["text"] is not None:
+                    extracted.append(str(item["text"]))
+                else:
+                    for k, v in item.items():
+                        extracted.append(f"{k}: {v}")
             elif isinstance(item, str):
                 extracted.append(item)
         if extracted:
@@ -176,7 +336,7 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
     raw_bytes = b""
     clean_hex = ""
     if hex_str:
-        clean_hex = re.sub(r"[^0-9a-fA-F]", "", str(hex_str))
+        clean_hex = re.sub(r"[^0-9a-fA-F]", "", str(hex_str)).lower()
         if len(clean_hex) % 2 == 1:
             clean_hex = clean_hex[:-1]
         try:
@@ -189,6 +349,11 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
         gps_lat, gps_lon = decode_lip_gps(raw_bytes)
         if gps_lat is not None and gps_lon is not None:
             sds_text = f"GPS {gps_lat:.6f}, {gps_lon:.6f}"
+            parsed_data = {
+                "lat": gps_lat,
+                "lon": gps_lon,
+                "maps_url": f"https://www.google.com/maps?q={gps_lat},{gps_lon}",
+            }
         elif infos_text:
             sds_text = infos_text
     elif proto_id == 130:
@@ -196,8 +361,7 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
         if infos_text:
             sds_text = infos_text
         elif raw_bytes:
-            ascii_str = extract_ascii_strings(raw_bytes, min_len=3)
-            sds_text = ascii_str if ascii_str else clean_hex
+            sds_text = decode_sds_tl_hex(raw_bytes) or clean_hex
     elif proto_id == 245:
         sds_type = "AVL_TELEMETRY"
         body = raw_bytes[3:] if len(raw_bytes) > 3 else raw_bytes
@@ -209,17 +373,35 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
             ascii_str = extract_ascii_strings(body, min_len=2)
             sds_text = ascii_str
             sds_binary_tail = body.hex()
+        if sds_text and ":" in sds_text:
+            p_parts = sds_text.split(":", 1)
+            parsed_data = {
+                "avl_prefix": sds_text,
+                "line_or_id": int(p_parts[0]) if p_parts[0].isdigit() else p_parts[0],
+                "state_code": p_parts[1],
+                "tail_bytes": len(bytes.fromhex(sds_binary_tail)) if sds_binary_tail else 0,
+            }
     else:
         if infos_text:
             sds_type = "TEXT"
             sds_text = infos_text
         elif raw_bytes:
-            ascii_str = extract_ascii_strings(raw_bytes, min_len=3)
+            ascii_str = decode_sds_tl_hex(raw_bytes)
             if ascii_str:
                 sds_type = "TEXT"
                 sds_text = ascii_str
             else:
                 sds_type = "BINARY"
+
+    if sds_text and sds_type in ("TEXT", "AVL_TELEMETRY"):
+        detected_type, struct_dict = parse_structured_text(sds_text)
+        if detected_type and struct_dict:
+            if sds_type == "TEXT":
+                sds_type = detected_type
+            if parsed_data is None:
+                parsed_data = struct_dict
+            else:
+                parsed_data.update(struct_dict)
 
     return {
         "sds_type": sds_type,
@@ -228,7 +410,45 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
         "sds_binary_tail": sds_binary_tail,
         "gps_lat": gps_lat,
         "gps_lon": gps_lon,
+        "parsed": parsed_data,
     }
+
+
+def format_sds_human_text(ssi, dest_ssi, proto_id, decoded):
+    sds_type = decoded["sds_type"]
+    sds_text = decoded["sds_text"]
+    parsed = decoded.get("parsed") or {}
+    src_str = f"SSI {ssi}" if ssi is not None else "Unknown SSI"
+    dst_str = f"SSI {dest_ssi}" if dest_ssi is not None else "Broadcast"
+
+    if sds_type == "TRIONA_GATEWAY":
+        app = parsed.get("app_name", "TrionaGateway")
+        ver = parsed.get("app_version", "?")
+        cmd_name = parsed.get("command_name", f"Cmd {parsed.get('command_code')}")
+        mac = parsed.get("device_mac") or parsed.get("device_id") or "?"
+        return f"{app} v{ver} [{cmd_name}] {src_str} -> {dst_str} (Device {mac})"
+
+    if sds_type == "LIP_GPS":
+        lat = decoded.get("gps_lat")
+        lon = decoded.get("gps_lon")
+        if lat is not None and lon is not None:
+            return f"GPS Position {src_str} -> {dst_str}: {lat:.6f}, {lon:.6f}"
+        return f"LIP GPS packet {src_str} -> {dst_str} ({decoded.get('sds_hex')})"
+
+    if sds_type == "AVL_TELEMETRY":
+        tail = decoded.get("sds_binary_tail")
+        tail_len = len(tail) // 2 if tail else 0
+        label = sds_text or "Binary AVL"
+        return f"AVL Telemetry {src_str} -> {dst_str}: {label} (+{tail_len}B payload)"
+
+    if sds_type == "CONTROL_FRAME":
+        fields_str = ", ".join(str(x) for x in parsed.get("fields", []))
+        return f"Control Frame {src_str} -> {dst_str}: [{fields_str}]"
+
+    if sds_text:
+        return f"SDS Text {src_str} -> {dst_str} (Proto {proto_id}): {sds_text}"
+
+    return f"SDS Binary {src_str} -> {dst_str} (Proto {proto_id}): {decoded.get('sds_hex') or 'empty'}"
 
 
 def publish_ha_discovery(client):
@@ -249,25 +469,25 @@ def publish_ha_discovery(client):
             "id": "last_sds",
             "name": "Last SDS",
             "state_topic": f"{MQTT_BASE_TOPIC}/SDS",
-            "value_template": "{{ value_json.sds_text | default(value_json.sds_hex) }}",
+            "value_template": "{{ value_json.human_text | default(value_json.sds_text) | default(value_json.sds_hex) }}",
         },
         {
             "id": "last_call",
             "name": "Last Call",
             "state_topic": f"{MQTT_BASE_TOPIC}/CALL",
-            "value_template": "{{ value_json.pdu }} | SSI {{ value_json.ssi }}",
+            "value_template": "{{ value_json.human_text | default(value_json.pdu ~ ' | SSI ' ~ value_json.ssi) }}",
         },
         {
             "id": "last_status",
             "name": "Last Status",
             "state_topic": f"{MQTT_BASE_TOPIC}/STATUS",
-            "value_template": "{{ value_json.status_text }}",
+            "value_template": "{{ value_json.human_text | default(value_json.status_text) }}",
         },
         {
             "id": "last_roaming",
             "name": "Last Roaming",
             "state_topic": f"{MQTT_BASE_TOPIC}/ROAMING",
-            "value_template": "SSI {{ value_json.ssi }} (LA{{ value_json.la }})",
+            "value_template": "{{ value_json.human_text | default('SSI ' ~ value_json.ssi ~ ' (LA' ~ value_json.la ~ ')') }}",
         },
         {
             "id": "packets_per_min",
@@ -331,13 +551,6 @@ def setup_mqtt():
     return client
 
 
-def get_first(pkt, keys, default=None):
-    for k in keys:
-        if k in pkt and pkt[k] is not None:
-            return pkt[k]
-    return default
-
-
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
     channels = parse_channels(TETRA_CHANNELS_STR)
@@ -366,6 +579,8 @@ def main():
         )
 
     pending_sds = {}
+    dedup_cache = {}
+    active_tx = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
     last_heartbeat = time.time()
     running = True
@@ -376,6 +591,16 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
+
+    def is_duplicate(sig_tuple, now_ts, ttl=1.2):
+        expired = [k for k, ts in dedup_cache.items() if now_ts - ts > 5.0]
+        for k in expired:
+            dedup_cache.pop(k, None)
+        prev_ts = dedup_cache.get(sig_tuple)
+        if prev_ts is not None and (now_ts - prev_ts) <= ttl:
+            return True
+        dedup_cache[sig_tuple] = now_ts
+        return False
 
     def send_udp_json(payload_dict):
         if not udp_out_sock or not udp_targets:
@@ -403,62 +628,99 @@ def main():
         if mqtt_client is not None:
             payload_str = json.dumps(event_dict, ensure_ascii=False)
             cat = event_dict.get("category", "OTHER")
-            mqtt_client.publish(f"{MQTT_BASE_TOPIC}/event", payload_str, qos=0, retain=False)
-            mqtt_client.publish(f"{MQTT_BASE_TOPIC}/{cat}", payload_str, qos=0, retain=True)
+            mqtt_client.publish(
+                f"{MQTT_BASE_TOPIC}/event", payload_str, qos=0, retain=False
+            )
+            mqtt_client.publish(
+                f"{MQTT_BASE_TOPIC}/{cat}", payload_str, qos=0, retain=True
+            )
 
         send_udp_json(event_with_opt_raw)
 
         cat = event_dict.get("category", "OTHER")
         freq = event_dict.get("freq_mhz", "?")
         la = event_dict.get("la", "?")
-        pdu = event_dict.get("pdu", "?")
-        ssi = event_dict.get("ssi")
-        summary = f"[{cat}] {freq} MHz (LA{la}) | PDU={pdu} | SSI={ssi}"
-        if cat == "SDS":
-            summary += (
-                f" -> Dst={event_dict.get('dest_ssi')} Proto={event_dict.get('protocol_id')} "
-                f"Type={event_dict.get('sds_type')} Text={event_dict.get('sds_text') or event_dict.get('sds_hex')}"
-            )
-        elif cat == "STATUS":
-            summary += f" | Status={event_dict.get('status_text')}"
-        elif cat == "ROAMING":
-            summary += f" | GSSI={event_dict.get('gssi')}"
-        print(summary, flush=True)
+        human = event_dict.get("human_text") or event_dict.get("pdu", "?")
+        print(f"[{cat}] {freq} MHz (LA{la}) | {human}", flush=True)
 
     def build_and_emit_sds(ch, pkt1, pkt2=None):
+        now_ts = time.time()
         now_iso = datetime.now(timezone.utc).isoformat()
         merged_raw = dict(pkt1)
         if pkt2:
             merged_raw.update(pkt2)
 
-        ssi = get_first(pkt1, ["calling party ssi", "ssi", "issi", "calling_ssi"])
-        if ssi is None and pkt2:
-            ssi = get_first(pkt2, ["calling party ssi", "ssi", "issi", "calling_ssi"])
+        mac_ssi = to_int(get_ci(pkt1, ["ssi"]))
+        if mac_ssi is None and pkt2:
+            mac_ssi = to_int(get_ci(pkt2, ["ssi"]))
 
-        dest_ssi = get_first(pkt1, ["forward address ssi", "called party ssi", "dest_ssi", "gssi"])
-        proto_id = get_first(pkt1, ["protocol id", "protocol_id"], default=0)
-        try:
-            proto_id = int(proto_id)
-        except (ValueError, TypeError):
-            proto_id = 0
+        caller_ssi = to_int(
+            get_ci(
+                merged_raw,
+                [
+                    "calling party ssi",
+                    "calling party address ssi",
+                    "calling_ssi",
+                    "source ssi",
+                ],
+            )
+        )
+        forward_ssi = to_int(
+            get_ci(
+                merged_raw,
+                [
+                    "forward address ssi",
+                    "called party ssi",
+                    "called party address ssi",
+                    "dest_ssi",
+                ],
+            )
+        )
 
-        msg_ref = get_first(pkt1, ["message reference", "message_reference"])
-        sds_pdu = get_first(pkt1, ["sds-pdu", "sds_pdu"])
-        infos = get_first(pkt1, ["infos"])
-        hex_str = pkt2.get("hex") if pkt2 and "hex" in pkt2 else pkt1.get("hex")
+        if caller_ssi is not None:
+            ssi = caller_ssi
+            dest_ssi = forward_ssi if forward_ssi is not None else mac_ssi
+        else:
+            ssi = mac_ssi
+            dest_ssi = forward_ssi
+
+        proto_id = to_int(get_ci(merged_raw, ["protocol id", "protocol_id"]), default=0)
+        msg_ref = to_int(get_ci(merged_raw, ["message reference", "message_reference"]))
+        sds_pdu = get_ci(merged_raw, ["sds-pdu", "sds_pdu", "message type"])
+        infos = get_ci(pkt1, ["infos"]) or (get_ci(pkt2, ["infos"]) if pkt2 else None)
+        hex_str = (
+            get_ci(pkt2, ["hex"])
+            if pkt2 and get_ci(pkt2, ["hex"]) is not None
+            else get_ci(pkt1, ["hex"])
+        )
 
         decoded = decode_sds_payload(proto_id, hex_str, infos)
+        human_text = format_sds_human_text(ssi, dest_ssi, proto_id, decoded)
+
+        sig = (
+            ch["freq_mhz"],
+            "D-SDS-DATA",
+            ssi,
+            dest_ssi,
+            proto_id,
+            decoded["sds_hex"],
+            decoded["sds_text"],
+        )
+        if is_duplicate(sig, now_ts, ttl=1.2):
+            return
 
         event = {
             "timestamp": now_iso,
             "host": HOST_NAME,
             "category": "SDS",
-            "service": get_first(pkt1, ["service"], "MLE"),
-            "pdu": get_first(pkt1, ["pdu"], "D-SDS-DATA"),
+            "service": str(get_ci(pkt1, ["service"], "CMCE")).upper(),
+            "pdu": str(get_ci(pkt1, ["pdu"], "D-SDS-DATA")).upper(),
             "freq_mhz": ch["freq_mhz"],
             "la": ch["la"],
             "ssi": ssi,
+            "ssi_type": classify_ssi(ssi),
             "dest_ssi": dest_ssi,
+            "dest_ssi_type": classify_ssi(dest_ssi),
             "protocol_id": proto_id,
             "message_reference": msg_ref,
             "sds_pdu": sds_pdu,
@@ -468,14 +730,14 @@ def main():
             "sds_binary_tail": decoded["sds_binary_tail"],
             "gps_lat": decoded["gps_lat"],
             "gps_lon": decoded["gps_lon"],
+            "parsed": decoded["parsed"],
+            "human_text": human_text,
         }
         emit_event(event, raw_pkt=merged_raw)
 
     def flush_expired_sds(now_ts, force=False):
         expired_keys = [
-            k
-            for k, val in pending_sds.items()
-            if force or (now_ts - val["ts"] > 2.0)
+            k for k, val in pending_sds.items() if force or (now_ts - val["ts"] > 2.0)
         ]
         for k in expired_keys:
             entry = pending_sds.pop(k)
@@ -485,8 +747,8 @@ def main():
         freq_str = ch["freq_mhz"]
         stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
 
-        service = str(pkt.get("service", "")).upper()
-        pdu = str(pkt.get("pdu", "")).upper()
+        service = str(get_ci(pkt, ["service"], "")).upper()
+        pdu = str(get_ci(pkt, ["pdu"], "")).upper()
 
         if service == "UPLANE":
             return
@@ -496,11 +758,23 @@ def main():
         now_ts = time.time()
         flush_expired_sds(now_ts)
 
-        ssi = get_first(pkt, ["calling party ssi", "ssi", "issi", "called party ssi"])
+        mac_ssi = to_int(get_ci(pkt, ["ssi"]))
+        caller_ssi = to_int(
+            get_ci(
+                pkt,
+                [
+                    "calling party ssi",
+                    "calling party address ssi",
+                    "transmitting party ssi",
+                    "transmitting party address ssi",
+                    "source ssi",
+                ],
+            )
+        )
 
         if pdu == "D-SDS-DATA":
-            has_hex = "hex" in pkt and pkt["hex"] is not None
-            key = (freq_str, ssi)
+            has_hex = get_ci(pkt, ["hex"]) is not None
+            key = (freq_str, mac_ssi if mac_ssi is not None else caller_ssi)
             if not has_hex:
                 if key in pending_sds:
                     prev = pending_sds.pop(key)
@@ -513,7 +787,9 @@ def main():
                     build_and_emit_sds(ch, prev["pkt"], pkt)
                     return
                 for pend_key in list(pending_sds.keys()):
-                    if pend_key[0] == freq_str and (now_ts - pending_sds[pend_key]["ts"] <= 2.0):
+                    if pend_key[0] == freq_str and (
+                        now_ts - pending_sds[pend_key]["ts"] <= 2.0
+                    ):
                         prev = pending_sds.pop(pend_key)
                         build_and_emit_sds(ch, prev["pkt"], pkt)
                         return
@@ -523,14 +799,30 @@ def main():
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if pdu == "D-STATUS":
-            status_code = get_first(
-                pkt, ["pre-coded status", "status", "status_code"], default=-1
+            status_code = to_int(
+                get_ci(pkt, ["pre-coded status", "status", "status_code"]), default=-1
             )
-            try:
-                status_code = int(status_code)
-            except (ValueError, TypeError):
-                pass
-            status_text = STATUS_MAP.get(status_code, f"Status ({status_code})")
+            status_hex = f"0x{status_code:04X}" if status_code >= 0 else None
+            status_text = STATUS_MAP.get(
+                status_code,
+                f"Status {status_code} ({status_hex})"
+                if status_hex
+                else f"Status ({status_code})",
+            )
+            src_ssi = caller_ssi if caller_ssi is not None else mac_ssi
+            dst_ssi = (
+                mac_ssi
+                if (caller_ssi is not None and mac_ssi != caller_ssi)
+                else to_int(get_ci(pkt, ["called party ssi", "forward address ssi"]))
+            )
+
+            sig = (freq_str, pdu, src_ssi, dst_ssi, status_code)
+            if is_duplicate(sig, now_ts, ttl=1.5):
+                return
+
+            target_part = f" -> SSI {dst_ssi}" if dst_ssi is not None else ""
+            human_text = f"Status from SSI {src_ssi}{target_part}: {status_text}"
+
             event = {
                 "timestamp": now_iso,
                 "host": HOST_NAME,
@@ -539,15 +831,87 @@ def main():
                 "pdu": pdu,
                 "freq_mhz": freq_str,
                 "la": ch["la"],
-                "ssi": ssi,
-                "dest_ssi": get_first(pkt, ["called party ssi", "forward address ssi", "gssi"]),
+                "ssi": src_ssi,
+                "ssi_type": classify_ssi(src_ssi),
+                "dest_ssi": dst_ssi,
                 "status_code": status_code,
+                "status_hex": status_hex,
                 "status_text": status_text,
+                "human_text": human_text,
             }
             emit_event(event, raw_pkt=pkt)
             return
 
         if pdu in CALL_PDUS:
+            call_id = to_int(get_ci(pkt, ["call identifier", "call_identifier"]))
+            usage_marker = to_int(get_ci(pkt, ["usage marker", "usage_marker"]))
+            tx_grant_code = to_int(get_ci(pkt, ["transmission grant"]))
+            tx_grant_text = TX_GRANT_MAP.get(tx_grant_code)
+            disc_cause_code = to_int(get_ci(pkt, ["disconnect cause"]))
+            disc_cause_text = DISCONNECT_CAUSE_MAP.get(disc_cause_code)
+
+            explicit_gssi = to_int(
+                get_ci(pkt, ["gssi", "group ssi", "called party ssi", "called party address ssi"])
+            )
+            if explicit_gssi is not None:
+                gssi = explicit_gssi
+            elif mac_ssi is not None and (
+                3000000 <= mac_ssi <= 3999999 or caller_ssi is not None
+            ):
+                gssi = mac_ssi
+            else:
+                gssi = None
+
+            ssi = caller_ssi if caller_ssi is not None else mac_ssi
+
+            sig = (freq_str, pdu, ssi, gssi, call_id, tx_grant_code)
+            if is_duplicate(sig, now_ts, ttl=1.2):
+                return
+
+            tx_key = (freq_str, gssi or ssi)
+            tx_duration_s = None
+
+            if pdu == "D-TX GRANTED":
+                active_tx[tx_key] = {
+                    "ts": now_ts,
+                    "speaker_ssi": caller_ssi,
+                    "call_id": call_id,
+                }
+            elif pdu in ("D-TX CEASED", "D-RELEASE"):
+                prev_tx = active_tx.pop(tx_key, None)
+                if prev_tx is not None:
+                    dur = round(now_ts - prev_tx["ts"], 1)
+                    if 0.1 <= dur <= 300.0:
+                        tx_duration_s = dur
+                    if caller_ssi is None and prev_tx.get("speaker_ssi") is not None:
+                        caller_ssi = prev_tx["speaker_ssi"]
+                        ssi = caller_ssi
+                    if call_id is None and prev_tx.get("call_id") is not None:
+                        call_id = prev_tx["call_id"]
+
+            grp_label = f"Group {gssi}" if gssi is not None else f"SSI {ssi}"
+            speaker_label = (
+                f" by SSI {caller_ssi}"
+                if (caller_ssi is not None and caller_ssi != gssi)
+                else ""
+            )
+            cid_label = f" (Call ID {call_id})" if call_id is not None else ""
+
+            if pdu == "D-SETUP":
+                human_text = f"{grp_label}: Call setup{speaker_label}{cid_label}"
+            elif pdu == "D-TX GRANTED":
+                grant_info = f" [{tx_grant_text}]" if tx_grant_text else ""
+                human_text = f"{grp_label}: PTT TX granted{speaker_label}{grant_info}{cid_label}"
+            elif pdu == "D-TX CEASED":
+                dur_info = f" after {tx_duration_s}s" if tx_duration_s is not None else ""
+                human_text = f"{grp_label}: PTT TX ended{speaker_label}{dur_info}{cid_label}"
+            elif pdu == "D-RELEASE":
+                cause_info = f" ({disc_cause_text})" if disc_cause_text else ""
+                dur_info = f" after {tx_duration_s}s" if tx_duration_s is not None else ""
+                human_text = f"{grp_label}: Call released{dur_info}{cause_info}{cid_label}"
+            else:
+                human_text = f"{grp_label}: {pdu}{speaker_label}{cid_label}"
+
             event = {
                 "timestamp": now_iso,
                 "host": HOST_NAME,
@@ -557,14 +921,40 @@ def main():
                 "freq_mhz": freq_str,
                 "la": ch["la"],
                 "ssi": ssi,
-                "gssi": get_first(pkt, ["gssi", "called party ssi", "group ssi"]),
-                "call_identifier": get_first(pkt, ["call identifier", "call_identifier"]),
-                "usage_marker": get_first(pkt, ["usage marker", "usage_marker"]),
+                "ssi_type": classify_ssi(ssi),
+                "caller_ssi": caller_ssi,
+                "gssi": gssi,
+                "call_identifier": call_id,
+                "usage_marker": usage_marker,
+                "tx_grant": tx_grant_text,
+                "tx_duration_s": tx_duration_s,
+                "disconnect_cause": disc_cause_text,
+                "human_text": human_text,
             }
             emit_event(event, raw_pkt=pkt)
             return
 
         if "LOCATION UPDATE" in pdu:
+            gssi = to_int(
+                get_ci(
+                    pkt,
+                    [
+                        "gssi",
+                        "group identity",
+                        "group ssi",
+                        "group identity location accept",
+                    ],
+                )
+            )
+            ssi = caller_ssi if caller_ssi is not None else mac_ssi
+            sig = (freq_str, pdu, ssi, gssi)
+            if is_duplicate(sig, now_ts, ttl=1.5):
+                return
+
+            gssi_part = f" (Group {gssi})" if gssi is not None else ""
+            human_text = (
+                f"Roaming: SSI {ssi}{gssi_part} registered on LA {ch['la']} ({freq_str} MHz) [{pdu}]"
+            )
             event = {
                 "timestamp": now_iso,
                 "host": HOST_NAME,
@@ -574,11 +964,19 @@ def main():
                 "freq_mhz": freq_str,
                 "la": ch["la"],
                 "ssi": ssi,
-                "gssi": get_first(pkt, ["gssi", "group identity", "group ssi"]),
+                "ssi_type": classify_ssi(ssi),
+                "gssi": gssi,
+                "human_text": human_text,
             }
             emit_event(event, raw_pkt=pkt)
             return
 
+        ssi = caller_ssi if caller_ssi is not None else mac_ssi
+        sig = (freq_str, service, pdu, ssi)
+        if is_duplicate(sig, now_ts, ttl=1.2):
+            return
+
+        human_text = f"{service} {pdu} on LA {ch['la']} (SSI {ssi})"
         event = {
             "timestamp": now_iso,
             "host": HOST_NAME,
@@ -588,6 +986,8 @@ def main():
             "freq_mhz": freq_str,
             "la": ch["la"],
             "ssi": ssi,
+            "ssi_type": classify_ssi(ssi),
+            "human_text": human_text,
         }
         emit_event(event, raw_pkt=pkt)
 
@@ -643,7 +1043,9 @@ def main():
 
     flush_expired_sds(time.time(), force=True)
     if mqtt_client is not None:
-        mqtt_client.publish(f"{MQTT_BASE_TOPIC}/status", payload="offline", qos=1, retain=True)
+        mqtt_client.publish(
+            f"{MQTT_BASE_TOPIC}/status", payload="offline", qos=1, retain=True
+        )
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
     for s in rx_sockets:

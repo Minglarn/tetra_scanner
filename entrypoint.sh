@@ -3,7 +3,7 @@ set -e
 
 TETRA_CHANNELS="${TETRA_CHANNELS:-427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7}"
 
-echo "[entrypoint] Starting tetra_scanner (version ${APP_VERSION:-2026.11.03.1})"
+echo "[entrypoint] Starting tetra_scanner (version ${APP_VERSION:-2026.11.03.2})"
 echo "[entrypoint] Configured channels: ${TETRA_CHANNELS}"
 
 PIDS=()
@@ -44,3 +44,4 @@ PIDS+=($PARSER_PID)
 
 wait "$PARSER_PID"
 cleanup
+

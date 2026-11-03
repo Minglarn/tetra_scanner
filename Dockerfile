@@ -2,12 +2,12 @@ FROM ubuntu:20.04
 
 LABEL org.opencontainers.image.title="tetra_scanner"
 LABEL org.opencontainers.image.description="Multi-channel TETRA data and signaling decoder for MCC 240 / MNC 11"
-LABEL org.opencontainers.image.version="2026.11.03.1"
+LABEL org.opencontainers.image.version="2026.11.03.2"
 LABEL org.opencontainers.image.source="https://github.com/Minglarn/tetra_scanner"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV APP_VERSION=2026.11.03.1
+ENV APP_VERSION=2026.11.03.2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -46,3 +46,4 @@ RUN dos2unix /app/entrypoint.sh /app/src/*.py \
 WORKDIR /app
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
