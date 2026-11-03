@@ -1,0 +1,13 @@
+version: "3.8"
+
+services:
+  tetra_scanner:
+    image: ghcr.io/minglarn/tetra_scanner:latest
+    container_name: tetra_scanner
+    restart: unless-stopped
+    env_file:
+      - .env
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      - ./logs:/app/logs
