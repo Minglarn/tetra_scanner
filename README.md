@@ -2,7 +2,7 @@
 
 Realtidsavkodare för 6 parallella TETRA-basstationer (nätverk MCC 240 / MNC 11 inom bandet 427.000-428.500 MHz) med en enda RTL-SDR-mottagare.
 
-Version (CalVer): `2026.11.03.2`
+Version (CalVer): `2026.11.03.3`
 
 ---
 
