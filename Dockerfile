@@ -38,7 +38,7 @@ RUN mkdir -p /app/src /app/logs
 
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
-ENV APP_VERSION=2026.11.03.3
+ENV APP_VERSION=2026.11.03.4
 ENV APP_RELEASE_DATE=2026-11-03
 
 COPY src/tetra_multi_rtl.py /app/src/tetra_multi_rtl.py

@@ -15,7 +15,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.03.3")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.03.4")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -108,6 +108,10 @@ TRIONA_CMD_MAP = {
 
 TRIONA_REGEX = re.compile(r"^\*(\d+)\*([^*]+)\*([^*]+)\*([0-9A-Fa-f]{6,24})#$")
 STAR_FRAME_REGEX = re.compile(r"^\*(.+)#$")
+ROUTE_SYNC_REGEX = re.compile(
+    r"^([A-Za-z0-9_]+),(\d+),(\d+)-(\d+)-(\d+),(\d+)$"
+)
+GENERIC_CSV_SYNC_REGEX = re.compile(r"^([A-Z]_[A-Z]_),(.+)$")
 
 
 def parse_channels(channels_str):
@@ -280,6 +284,40 @@ def parse_structured_text(text):
         }
         return "TRIONA_GATEWAY", parsed
 
+    m_route = ROUTE_SYNC_REGEX.match(cleaned)
+    if m_route:
+        flag, consist_id, unit_id, direction, route_no, status_code = m_route.groups()
+        parsed = {
+            "protocol": "TrainRouteSync",
+            "control_flag": flag,
+            "consist_or_tx_id": consist_id,
+            "assignment_raw": f"{unit_id}-{direction}-{route_no}",
+            "unit_or_op_id": int(unit_id) if unit_id.isdigit() else unit_id,
+            "direction": int(direction) if direction.isdigit() else direction,
+            "train_or_route_no": int(route_no) if route_no.isdigit() else route_no,
+            "status_code": int(status_code) if status_code.isdigit() else status_code,
+        }
+        return "TRAIN_ROUTE_SYNC", parsed
+
+    m_csv_sync = GENERIC_CSV_SYNC_REGEX.match(cleaned)
+    if m_csv_sync:
+        flag, rest = m_csv_sync.groups()
+        csv_fields = [f.strip() for f in rest.split(",")]
+        parsed = {
+            "protocol": "TrainRouteSync",
+            "control_flag": flag,
+            "fields": csv_fields,
+        }
+        for f in csv_fields:
+            if "-" in f:
+                sub = f.split("-")
+                if len(sub) == 3:
+                    parsed["assignment_raw"] = f
+                    parsed["unit_or_op_id"] = int(sub[0]) if sub[0].isdigit() else sub[0]
+                    parsed["direction"] = int(sub[1]) if sub[1].isdigit() else sub[1]
+                    parsed["train_or_route_no"] = int(sub[2]) if sub[2].isdigit() else sub[2]
+        return "TRAIN_ROUTE_SYNC", parsed
+
     m_star = STAR_FRAME_REGEX.match(cleaned)
     if m_star:
         fields = [f.strip() for f in m_star.group(1).split("*")]
@@ -427,6 +465,19 @@ def format_sds_human_text(ssi, dest_ssi, proto_id, decoded):
         cmd_name = parsed.get("command_name", f"Cmd {parsed.get('command_code')}")
         mac = parsed.get("device_mac") or parsed.get("device_id") or "?"
         return f"{app} v{ver} [{cmd_name}] {src_str} -> {dst_str} (Device {mac})"
+
+    if sds_type == "TRAIN_ROUTE_SYNC":
+        flag = parsed.get("control_flag", "SYNC")
+        train_no = parsed.get("train_or_route_no", "?")
+        direction = parsed.get("direction", "?")
+        unit_id = parsed.get("unit_or_op_id", "?")
+        consist_id = parsed.get("consist_or_tx_id", "?")
+        st_code = parsed.get("status_code", "?")
+        return (
+            f"Train/Route Sync [{flag}] {src_str} -> {dst_str}: "
+            f"Train/Line {train_no} (Dir {direction}, Unit/Op {unit_id}, "
+            f"Consist/TxID {consist_id}, Status {st_code})"
+        )
 
     if sds_type == "LIP_GPS":
         lat = decoded.get("gps_lat")
