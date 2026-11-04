@@ -4,13 +4,14 @@ import json
 import time
 import asyncio
 from collections import deque
+from datetime import datetime, timezone
 import aiofiles
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.8")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.9")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
@@ -155,8 +156,35 @@ async def update_config(request: Request):
     except Exception:
         pass
 
+    try:
+        iso_ts = datetime.now(timezone.utc).isoformat()
+        action_str = (
+            "restarting radio/sweep pipeline"
+            if needs_pipeline_restart
+            else "applied live in memory"
+        )
+        sys_event = {
+            "time": iso_ts,
+            "timestamp": iso_ts,
+            "category": "SYSTEM",
+            "freq_mhz": "SYS",
+            "human_text": (
+                f"Settings updated ({action_str}): Mode={new_cfg['MODE']}, "
+                f"Band={new_cfg['SCAN_START_MHZ']}-{new_cfg['SCAN_END_MHZ']} MHz, "
+                f"Gain={new_cfg['RTL_GAIN']} dB, IdleTimeout={new_cfg['IDLE_TIMEOUT_SEC']}s, "
+                f"Strikes={new_cfg['BLACKLIST_STRIKES']}."
+            ),
+        }
+        async with aiofiles.open(EVENTS_FILE, mode="a", encoding="utf-8") as ef:
+            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
+            await ef.flush()
+    except Exception:
+        pass
+
     return {
+        "ok": True,
         "status": "ok",
+        "hard_reload": needs_pipeline_restart,
         "restarted_pipeline": needs_pipeline_restart,
         "config": new_cfg,
     }

@@ -10,6 +10,7 @@ import atexit
 import threading
 import subprocess
 import statistics
+from datetime import datetime, timezone
 
 
 def parse_env_int(key, default):
@@ -36,6 +37,7 @@ def parse_env_str(key, default):
 
 
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
+EVENTS_LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
 WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
 RUNTIME_CONFIG_FILE = os.path.join(LOG_DIR, "runtime_config.json")
@@ -661,7 +663,25 @@ def stdout_reader_worker(proc, line_queue):
         pass
 
 
-def run_receiver_pipeline(center_hz, channels_str, cfg, is_scanner_mode=True, active_frequencies=None):
+def emit_system_event(human_text):
+    iso_ts = datetime.now(timezone.utc).isoformat()
+    event_obj = {
+        "time": iso_ts,
+        "timestamp": iso_ts,
+        "category": "SYSTEM",
+        "freq_mhz": "SYS",
+        "human_text": human_text,
+    }
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open("/app/logs/tetra_events.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(event_obj, ensure_ascii=False) + "\n")
+            f.flush()
+    except Exception as exc:
+        print(f"[scanner] Warning: failed writing system event: {exc}", flush=True)
+
+
+def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, active_frequencies=None):
     global ACTIVE_PROCS, RUNNING
 
     os.environ["RTL_DEVICE_INDEX"] = str(cfg["RTL_DEVICE_INDEX"])
@@ -674,13 +694,25 @@ def run_receiver_pipeline(center_hz, channels_str, cfg, is_scanner_mode=True, ac
     raw_chans = [c.strip() for c in channels_str.split(",") if c.strip()]
     num_channels = len(raw_chans)
 
+    if active_frequencies:
+        freq_mhz_list = [f"{int(f) / 1e6:.4f}" for f in active_frequencies]
+    else:
+        freq_mhz_list = []
+        for entry in raw_chans:
+            try:
+                hz_val = int(entry.split(":", 1)[0])
+                freq_mhz_list.append(f"{hz_val / 1e6:.4f}")
+            except ValueError:
+                pass
+
+    center_freq_mhz = f"{center_hz / 1e6:.4f}"
     idle_timeout_sec = cfg["IDLE_TIMEOUT_SEC"]
     blacklist_strikes = cfg["BLACKLIST_STRIKES"]
     blacklist_time_sec = cfg["BLACKLIST_TIME_SEC"]
 
     mode_tag = "PHASE 3: MONITOR" if is_scanner_mode else "STATIC MODE"
     print(
-        f"[scanner] [{mode_tag}] Tuning CENTER_FREQ={center_hz / 1e6:.4f} MHz ({center_hz} Hz) | "
+        f"[scanner] [{mode_tag}] Tuning CENTER_FREQ={center_freq_mhz} MHz ({center_hz} Hz) | "
         f"Gain={cfg['RTL_GAIN']} dB | PPM={cfg['RTL_PPM']}",
         flush=True,
     )
@@ -736,6 +768,20 @@ def run_receiver_pipeline(center_hz, channels_str, cfg, is_scanner_mode=True, ac
             daemon=True,
         )
         reader_thread.start()
+
+        freqs_joined = ", ".join(freq_mhz_list)
+        if is_scanner_mode:
+            sys_msg = (
+                f"Sweep complete. Locked on center {center_freq_mhz} MHz. "
+                f"Monitoring {len(freq_mhz_list)} active channels ({freqs_joined}) "
+                f"for {idle_timeout_sec}s idle timeout."
+            )
+        else:
+            sys_msg = (
+                f"Static mode active. Locked on center {center_freq_mhz} MHz. "
+                f"Monitoring {len(freq_mhz_list)} channels ({freqs_joined})."
+            )
+        emit_system_event(sys_msg)
 
         last_activity = time.time()
 
@@ -847,7 +893,7 @@ def main():
                     f"GAIN={cfg['RTL_GAIN']} dB, PPM={cfg['RTL_PPM']}) ===",
                     flush=True,
                 )
-                run_receiver_pipeline(
+                phase3_monitor_channels(
                     center_hz=cfg["CENTER_FREQ"],
                     channels_str=cfg["TETRA_CHANNELS"],
                     cfg=cfg,
@@ -893,7 +939,7 @@ def main():
             ]
             channels_str = ",".join(channels_list)
 
-            run_receiver_pipeline(
+            phase3_monitor_channels(
                 center_hz=center_hz,
                 channels_str=channels_str,
                 cfg=cfg,
