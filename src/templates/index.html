@@ -72,14 +72,19 @@
 
         <!-- Discovered Networks -->
         <section class="bg-gray-900 border border-gray-800 rounded-lg flex flex-col flex-1 min-h-0">
-          <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+          <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between gap-2">
             <div>
               <h2 class="text-sm font-bold uppercase tracking-wider text-gray-200">Discovered Networks</h2>
               <p class="text-[11px] text-gray-500">Decoded via SYSINFO / Broadcast</p>
             </div>
-            <button id="refresh-networks-btn" class="text-xs px-2.5 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
-              Refresh
-            </button>
+            <div class="flex items-center gap-1.5">
+              <button id="clear-networks-btn" title="Clear all discovered networks history" class="text-xs px-2 py-1 bg-red-950/70 hover:bg-red-900/80 text-red-200 border border-red-800/70 rounded transition">
+                Clear All
+              </button>
+              <button id="refresh-networks-btn" class="text-xs px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
+                Refresh
+              </button>
+            </div>
           </div>
 
           <div id="networks-container" class="p-3 space-y-2 overflow-y-auto flex-1 text-xs">
@@ -95,8 +100,11 @@
               <p class="text-[11px] text-gray-500">Select &amp; Lock to Static Mode</p>
             </div>
             <div class="flex items-center gap-1.5">
-              <button id="lock-whitelist-btn" title="Switch to STATIC mode and monitor only selected whitelisted frequencies" class="text-xs px-2.5 py-1 bg-emerald-900/80 hover:bg-emerald-800 text-emerald-100 border border-emerald-600/80 font-bold rounded transition">
+              <button id="lock-whitelist-btn" title="Switch to STATIC mode and monitor only selected whitelisted frequencies" class="text-xs px-2 py-1 bg-emerald-900/80 hover:bg-emerald-800 text-emerald-100 border border-emerald-600/80 font-bold rounded transition">
                 Lock Static
+              </button>
+              <button id="clear-whitelist-btn" title="Clear all whitelisted frequencies" class="text-xs px-2 py-1 bg-red-950/70 hover:bg-red-900/80 text-red-200 border border-red-800/70 rounded transition">
+                Clear All
               </button>
               <button id="refresh-whitelist-btn" class="text-xs px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
                 Refresh
@@ -256,7 +264,18 @@
             <button type="submit" class="w-full py-2 px-3 bg-emerald-700 hover:bg-emerald-600 text-white font-bold uppercase tracking-wider rounded border border-emerald-500 transition">
               Save &amp; Apply Live
             </button>
+            <button id="reset-all-btn" type="button" class="w-full py-1.5 px-3 bg-red-950/80 hover:bg-red-900 text-red-200 font-bold uppercase tracking-wider rounded border border-red-800/80 transition text-[11px]">
+              Reset All Discovery &amp; Start Fresh
+            </button>
             <div id="settings-status-msg" class="text-[11px] text-center text-gray-400 min-h-[1.25rem]"></div>
+          </div>
+
+          <!-- 3-Phase Scanner Architecture Guide -->
+          <div class="bg-gray-950/90 border border-gray-800 rounded p-3 space-y-1.5 text-[11px] text-gray-400 leading-relaxed">
+            <div class="font-bold uppercase tracking-wider text-cyan-400">How 3-Phase Auto-Scanner Works</div>
+            <div><span class="text-blue-300 font-semibold">PHASE 1 (RF Spectrum Sweep):</span> Measures raw RF signal power (dBm &amp; SNR above noise floor) in 2.0 MHz blocks across the band, snapping peaks to the 25 kHz TETRA grid.</div>
+            <div><span class="text-emerald-300 font-semibold">PHASE 2 (Window Selection):</span> Evaluates all 1.8 MHz capture windows and selects up to 8 strongest candidate carriers (prioritizing verified Whitelisted cells and ignoring Blacklisted noise).</div>
+            <div><span class="text-amber-300 font-semibold">PHASE 3 (Live TETRA Decoding):</span> Tunes GNU Radio + 8 parallel tetra-kit decoders. Frequencies broadcasting valid TETRA control frames (SYSINFO) are added to the Whitelist; silent/unmodulated RF noise carriers are Blacklisted after the 60s health check.</div>
           </div>
 
         </form>
@@ -341,11 +360,14 @@
     const clearLogBtn = document.getElementById("clear-log-btn");
     const networksContainer = document.getElementById("networks-container");
     const refreshNetworksBtn = document.getElementById("refresh-networks-btn");
+    const clearNetworksBtn = document.getElementById("clear-networks-btn");
     const whitelistContainer = document.getElementById("whitelist-container");
     const refreshWhitelistBtn = document.getElementById("refresh-whitelist-btn");
+    const clearWhitelistBtn = document.getElementById("clear-whitelist-btn");
     const blacklistContainer = document.getElementById("blacklist-container");
     const refreshBlacklistBtn = document.getElementById("refresh-blacklist-btn");
     const clearBlacklistBtn = document.getElementById("clear-blacklist-btn");
+    const resetAllBtn = document.getElementById("reset-all-btn");
 
     let totalEvents = 0;
     let wsInitialLoadDone = false;
@@ -957,9 +979,63 @@
       }
     }
 
+    async function clearAllWhitelist() {
+      try {
+        await fetch("/api/whitelist", {
+          method: "DELETE"
+        });
+        uncheckedWhitelistHz.clear();
+        fetchWhitelist();
+      } catch (e) {
+        // Ignore transient network errors
+      }
+    }
+
+    async function clearAllNetworks() {
+      try {
+        await fetch("/api/networks", {
+          method: "DELETE"
+        });
+        loadNetworks();
+      } catch (e) {
+        // Ignore transient network errors
+      }
+    }
+
+    async function resetAllDiscovery() {
+      try {
+        settingsStatusMsg.textContent = "Resetting all discovery lists and restarting scanner...";
+        settingsStatusMsg.className = "text-[11px] text-center text-amber-300 min-h-[1.25rem]";
+        const res = await fetch("/api/reset-all", { method: "POST" });
+        if (res.ok) {
+          uncheckedWhitelistHz.clear();
+          const rows = logStream.querySelectorAll(".event-row");
+          rows.forEach((r) => r.remove());
+          totalEvents = 0;
+          eventCounterEl.textContent = "0";
+          emptyPlaceholder.classList.remove("hidden");
+          await Promise.all([loadRuntimeConfig(), loadNetworks(), fetchWhitelist(), fetchBlacklist()]);
+          settingsStatusMsg.textContent = "Reset complete. Starting fresh Phase 1 -> Phase 2 -> Phase 3 scan.";
+          settingsStatusMsg.className = "text-[11px] text-center text-emerald-400 min-h-[1.25rem]";
+        }
+      } catch (e) {
+        settingsStatusMsg.textContent = "Failed to reset discovery state.";
+        settingsStatusMsg.className = "text-[11px] text-center text-red-400 min-h-[1.25rem]";
+      }
+    }
+
     const lockWhitelistBtn = document.getElementById("lock-whitelist-btn");
     if (lockWhitelistBtn) {
       lockWhitelistBtn.addEventListener("click", lockSelectedWhitelist);
+    }
+    if (clearWhitelistBtn) {
+      clearWhitelistBtn.addEventListener("click", clearAllWhitelist);
+    }
+    if (clearNetworksBtn) {
+      clearNetworksBtn.addEventListener("click", clearAllNetworks);
+    }
+    if (resetAllBtn) {
+      resetAllBtn.addEventListener("click", resetAllDiscovery);
     }
 
     refreshNetworksBtn.addEventListener("click", loadNetworks);

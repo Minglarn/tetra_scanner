@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.23")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.24")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -323,6 +323,19 @@ async def get_networks():
     return result
 
 
+@app.delete("/api/networks", response_class=JSONResponse)
+async def clear_networks():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp_path = f"{NETWORKS_FILE}.tmp"
+        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+            await f.write("")
+        os.replace(tmp_path, NETWORKS_FILE)
+    except Exception:
+        pass
+    return {"status": "ok", "cleared": True}
+
+
 @app.get("/api/blacklist", response_class=JSONResponse)
 async def get_blacklist():
     if not os.path.exists(BLACKLIST_FILE):
@@ -466,6 +479,65 @@ async def remove_from_whitelist(freq_hz: str):
             pass
 
     return {"status": "ok", "removed": freq_hz}
+
+
+@app.delete("/api/whitelist", response_class=JSONResponse)
+async def clear_whitelist():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp_path = f"{WHITELIST_FILE}.tmp"
+        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+            await f.write("{}\n")
+        os.replace(tmp_path, WHITELIST_FILE)
+    except Exception:
+        pass
+    return {"status": "ok", "cleared": True}
+
+
+@app.post("/api/reset-all", response_class=JSONResponse)
+async def reset_all_discovery():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        for jf in (WHITELIST_FILE, BLACKLIST_FILE):
+            tmp_p = f"{jf}.tmp"
+            async with aiofiles.open(tmp_p, mode="w", encoding="utf-8") as f:
+                await f.write("{}\n")
+            os.replace(tmp_p, jf)
+
+        tmp_net = f"{NETWORKS_FILE}.tmp"
+        async with aiofiles.open(tmp_net, mode="w", encoding="utf-8") as f:
+            await f.write("")
+        os.replace(tmp_net, NETWORKS_FILE)
+
+        cfg = await read_runtime_config()
+        cfg["MODE"] = "scanner"
+        tmp_cfg = f"{RUNTIME_CONFIG_FILE}.tmp"
+        async with aiofiles.open(tmp_cfg, mode="w", encoding="utf-8") as f:
+            await f.write(json.dumps(cfg, indent=2, sort_keys=True))
+        os.replace(tmp_cfg, RUNTIME_CONFIG_FILE)
+
+        iso_ts = datetime.now(timezone.utc).isoformat()
+        sys_event = {
+            "time": iso_ts,
+            "timestamp": iso_ts,
+            "category": "SYSTEM",
+            "freq_mhz": "SYS",
+            "human_text": "Factory discovery reset executed: Cleared whitelist, blacklist, and discovered networks. Restarting in Auto-Scanner mode.",
+        }
+        tmp_ev = f"{EVENTS_FILE}.tmp"
+        async with aiofiles.open(tmp_ev, mode="w", encoding="utf-8") as ef:
+            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
+        os.replace(tmp_ev, EVENTS_FILE)
+
+        for flag_p in (RELOAD_CONFIG_FLAG, FORCE_SWEEP_FLAG):
+            async with aiofiles.open(flag_p, mode="w", encoding="utf-8") as ff:
+                await ff.write(str(time.time()))
+    except Exception as exc:
+        return JSONResponse(
+            {"status": "error", "message": f"Reset failed: {exc}"}, status_code=500
+        )
+
+    return {"status": "ok", "reset": True, "config": cfg}
 
 
 @app.post("/api/whitelist/lock", response_class=JSONResponse)

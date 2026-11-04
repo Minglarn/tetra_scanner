@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.23")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.24")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -899,6 +899,9 @@ def main():
     if len(whitelist_data) != len(raw_whitelist_data):
         save_json_dict(WHITELIST_FILE, whitelist_data)
     whitelist_last_save = {}
+    whitelist_disk_mtime = (
+        os.path.getmtime(WHITELIST_FILE) if os.path.exists(WHITELIST_FILE) else 0.0
+    )
     channel_net_cache = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
     last_heartbeat = time.time()
@@ -913,11 +916,26 @@ def main():
     signal.signal(signal.SIGTERM, handle_sig)
 
     def register_whitelisted_carrier(ch, category, mcc=None, mnc=None, la=None):
+        nonlocal whitelist_data, whitelist_disk_mtime
         freq_hz = int(ch["freq_hz"])
         freq_key = str(freq_hz)
         freq_mhz = ch["freq_mhz"]
         now_ts = time.time()
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        cur_mtime = (
+            os.path.getmtime(WHITELIST_FILE) if os.path.exists(WHITELIST_FILE) else 0.0
+        )
+        if cur_mtime != whitelist_disk_mtime:
+            raw_disk = load_json_dict(WHITELIST_FILE)
+            whitelist_data = {
+                k: v
+                for k, v in raw_disk.items()
+                if isinstance(v, dict)
+                and str(v.get("last_category", "")).upper() in valid_wl_categories
+            }
+            whitelist_last_save.clear()
+            whitelist_disk_mtime = cur_mtime
 
         net_state = channel_net_cache.get(freq_mhz, {})
         eff_mcc = mcc if mcc is not None else net_state.get("mcc")
@@ -961,7 +979,15 @@ def main():
 
         last_saved = whitelist_last_save.get(freq_key, 0.0)
         if is_new or (now_ts - last_saved) >= 10.0:
-            save_json_dict(WHITELIST_FILE, whitelist_data)
+            disk_wl = load_json_dict(WHITELIST_FILE)
+            disk_wl[freq_key] = entry
+            save_json_dict(WHITELIST_FILE, disk_wl)
+            whitelist_data = disk_wl
+            whitelist_disk_mtime = (
+                os.path.getmtime(WHITELIST_FILE)
+                if os.path.exists(WHITELIST_FILE)
+                else 0.0
+            )
             whitelist_last_save[freq_key] = now_ts
 
     def update_unit_registry(ssi, dest_ssi, decoded):
@@ -2496,8 +2522,6 @@ def main():
 
     flush_expired_sds(time.time(), force=True)
     flush_expired_voice_buffers(time.time(), force=True)
-    if whitelist_data:
-        save_json_dict(WHITELIST_FILE, whitelist_data)
     if mqtt_client is not None:
         mqtt_client.publish(
             f"{MQTT_BASE_TOPIC}/status", payload="offline", qos=1, retain=True

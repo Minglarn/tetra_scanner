@@ -529,20 +529,18 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
 
     block_peaks = list(snapped_peaks.values())
     block_peaks.sort(key=lambda x: x["dbm"], reverse=True)
+    top_str = ", ".join(
+        f"{pk['freq_hz'] / 1e6:.4f} MHz ({pk['dbm']:.1f} dBm, +{pk['snr_db']:.1f} dB SNR)"
+        for pk in block_peaks[:5]
+    )
     block_summary = (
-        f"Block {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz | "
-        f"Noise floor: {noise_floor:.1f} dBm | Threshold (+{MIN_SNR_ABOVE_FLOOR_DB:.1f} dB): "
-        f"{min_threshold:.1f} dBm | Peaks found: {len(block_peaks)}"
+        f"[PHASE 1: RF BLOCK] Swept {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz | "
+        f"Noise floor: {noise_floor:.1f} dBm | Detection threshold (+{MIN_SNR_ABOVE_FLOOR_DB:.1f} dB): "
+        f"{min_threshold:.1f} dBm | RF peaks detected: {len(block_peaks)}"
+        + (f" (Strongest: {top_str})" if top_str else " (No RF peaks above threshold)")
     )
     print(f"[scanner]   {block_summary}", flush=True)
     emit_system_event(block_summary)
-    for pk in block_peaks[:8]:
-        cand_msg = (
-            f"Candidate: {pk['freq_hz'] / 1e6:.4f} MHz "
-            f"({pk['dbm']:.1f} dBm, +{pk['snr_db']:.1f} dB SNR)"
-        )
-        print(f"[scanner]     {cand_msg}", flush=True)
-        emit_system_event(cand_msg)
     return block_peaks, block_grid
 
 
@@ -552,8 +550,9 @@ def phase1_sweep_band(centers, cfg):
         flush=True,
     )
     sweep_start_msg = (
-        f"[PHASE 1: SWEEP] Starting high-resolution full-band hunt across "
-        f"{cfg['SCAN_START_MHZ']:.3f}-{cfg['SCAN_END_MHZ']:.3f} MHz (2 kHz step -> 25 kHz PTS grid)"
+        f"[PHASE 1: RF SPECTRUM SWEEP] Measuring raw RF signal strength across "
+        f"{cfg['SCAN_START_MHZ']:.3f}-{cfg['SCAN_END_MHZ']:.3f} MHz in {len(centers)}x 2.0 MHz blocks "
+        f"(2 kHz resolution snapped to 25 kHz TETRA grid). Note: Phase 1 detects RF energy peaks before TETRA protocol verification."
     )
     print(f"[scanner] {sweep_start_msg}", flush=True)
     emit_system_event(sweep_start_msg)
@@ -591,6 +590,17 @@ def phase1_sweep_band(centers, cfg):
 
     all_peaks = list(merged_peaks.values())
     all_peaks.sort(key=lambda x: x["dbm"], reverse=True)
+    top_overall = ", ".join(
+        f"{p['freq_hz'] / 1e6:.4f} MHz ({p['dbm']:.1f} dBm / +{p['snr_db']:.1f} dB SNR)"
+        for p in all_peaks[:6]
+    )
+    p1_done_msg = (
+        f"[PHASE 1 COMPLETE] Found {len(all_peaks)} unique 25 kHz RF candidate frequencies across "
+        f"{cfg['SCAN_START_MHZ']:.1f}-{cfg['SCAN_END_MHZ']:.1f} MHz"
+        + (f". Top RF peaks: {top_overall}." if top_overall else ".")
+    )
+    print(f"[scanner] {p1_done_msg}", flush=True)
+    emit_system_event(p1_done_msg)
     return all_peaks, merged_grid
 
 
@@ -835,7 +845,10 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
         flush=True,
     )
     emit_system_event(
-        f"[PHASE 2: TOP LIST] Winning 1.8 MHz Window (Center {center_hz / 1e6:.4f} MHz): "
+        f"[PHASE 2: WINDOW SELECTION] Evaluated {len(filtered_peaks)} candidates "
+        f"(Whitelisted known TETRA cells: {len(whitelist)}). "
+        f"Selected optimal 1.8 MHz SDR window around Center {center_hz / 1e6:.4f} MHz "
+        f"(Score: {best_score[0]} | Verified Whitelisted in window: {best_score[1]} | Strong RF peaks >=6 dB SNR: {best_score[2]}): "
         + " | ".join(win_parts)
     )
 
@@ -943,14 +956,15 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
         freqs_joined = ", ".join(freq_mhz_list)
         if is_scanner_mode:
             sys_msg = (
-                f"Sweep complete. Locked on center {center_freq_mhz} MHz. "
-                f"Monitoring {len(freq_mhz_list)} active channels ({freqs_joined}) "
-                f"for {idle_timeout_sec}s idle timeout."
+                f"[PHASE 3: LIVE TETRA DECODING] Tuned SDR to Center {center_freq_mhz} MHz and launched "
+                f"{len(freq_mhz_list)} parallel tetra-kit decoders on ({freqs_joined}) MHz. "
+                f"Verifying which RF peaks broadcast real TETRA sync/SYSINFO vs unmodulated RF noise "
+                f"(60s health check & {idle_timeout_sec}s idle timeout)..."
             )
         else:
             sys_msg = (
-                f"Static mode active. Locked on center {center_freq_mhz} MHz. "
-                f"Monitoring {len(freq_mhz_list)} channels ({freqs_joined})."
+                f"[STATIC MODE: LIVE TETRA DECODING] Locked on Center {center_freq_mhz} MHz. "
+                f"Continuously decoding {len(freq_mhz_list)} fixed TETRA channels ({freqs_joined}) MHz."
             )
         emit_system_event(sys_msg)
 
@@ -1169,11 +1183,23 @@ def main():
             centers = build_center_frequencies(
                 cfg["SCAN_START_MHZ"], cfg["SCAN_END_MHZ"]
             )
+            wl_now = load_whitelist()
+            bl_now = load_blacklist()
+            if cycle == 1:
+                intro_msg = (
+                    f"[STARTUP] TETRA Smart Auto-Scanner started. How it works: "
+                    f"PHASE 1 sweeps {cfg['SCAN_START_MHZ']:.1f}-{cfg['SCAN_END_MHZ']:.1f} MHz for raw RF signal peaks -> "
+                    f"PHASE 2 picks the best 1.8 MHz window (up to 8 frequencies, prioritizing verified Whitelisted cells) -> "
+                    f"PHASE 3 runs live TETRA decoders to confirm real base stations (SYSINFO), decode SDS/Calls/Voice, and auto-blacklist dead noise frequencies."
+                )
+                print(f"[scanner] {intro_msg}", flush=True)
+                emit_system_event(intro_msg)
+
             cycle_msg = (
                 f"=== Smart Auto-Tune Cycle #{cycle} | "
-                f"{cfg['SCAN_START_MHZ']:.1f}-{cfg['SCAN_END_MHZ']:.1f} MHz | "
-                f"GAIN={cfg['RTL_GAIN']} dB | IDLE_TIMEOUT={cfg['IDLE_TIMEOUT_SEC']}s | "
-                f"STRIKES={cfg['BLACKLIST_STRIKES']} ==="
+                f"Band: {cfg['SCAN_START_MHZ']:.1f}-{cfg['SCAN_END_MHZ']:.1f} MHz | "
+                f"Gain: {cfg['RTL_GAIN']} dB | Known Whitelisted Cells: {len(wl_now)} | "
+                f"Tracked Blacklist/Strike Entries: {len(bl_now)} | Idle Timeout: {cfg['IDLE_TIMEOUT_SEC']}s ==="
             )
             print(f"[scanner] {cycle_msg}", flush=True)
             emit_system_event(cycle_msg)
