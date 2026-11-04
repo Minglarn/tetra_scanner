@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.28")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.29")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -307,6 +307,7 @@ async def get_networks():
         for net in networks_by_freq.values()
         if not (
             str(net.get("pdu") or "").upper() == "TCH_S"
+            and int(net.get("packet_count") or 0) < 3
             and net.get("mcc") is None
             and net.get("mnc") is None
             and net.get("cell_id") is None

@@ -50,11 +50,11 @@ FORCE_SWEEP_PENALTY_SEC = 900
 MAX_PEAKS = 8
 PTS_GRID_HZ = 25000
 MIN_PEAK_SEPARATION_HZ = 25000
-LOCAL_PEAK_RADIUS_HZ = 16000
-DC_SPIKE_GUARD_HZ = 8000
+LOCAL_PEAK_RADIUS_HZ = 25000
+DC_SPIKE_GUARD_HZ = 10000
 EDGE_GUARD_HZ = 15000
 MAX_WINDOW_SPAN_HZ = 1800000
-MIN_SNR_ABOVE_FLOOR_DB = parse_env_float("SCAN_MIN_SNR_DB", 2.5)
+MIN_SNR_ABOVE_FLOOR_DB = parse_env_float("SCAN_MIN_SNR_DB", 1.8)
 ABSOLUTE_MIN_DBM = parse_env_float("SCAN_MIN_DBM", -65.0)
 
 PAYLOAD_TAGS = ("[SDS]", "[CALL]", "[VOICE]", "[STATUS]", "[ROAMING]")
@@ -369,14 +369,12 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
     except OSError:
         pass
 
-    sweep_start = start_hz - 12500
-    sweep_end = end_hz - 12500
     cmd = [
         "rtl_power",
         "-d",
         str(cfg["RTL_DEVICE_INDEX"]),
         "-f",
-        f"{sweep_start}:{sweep_end}:2k",
+        f"{start_hz}:{end_hz}:2k",
         "-g",
         str(cfg["RTL_GAIN"]),
         "-p",
@@ -446,12 +444,11 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
                 if not dbm_values or hz_step <= 0:
                     continue
 
-                dc_center_hz = center_hz - 12500
                 for i, dbm in enumerate(dbm_values):
                     raw_freq = hz_low + i * hz_step
                     if raw_freq > hz_high + hz_step:
                         break
-                    if abs(raw_freq - dc_center_hz) <= DC_SPIKE_GUARD_HZ:
+                    if abs(raw_freq - center_hz) <= DC_SPIKE_GUARD_HZ:
                         continue
                     if (
                         raw_freq < (start_hz + EDGE_GUARD_HZ)
@@ -475,10 +472,7 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
     min_threshold = max(noise_floor + MIN_SNR_ABOVE_FLOOR_DB, ABSOLUTE_MIN_DBM)
 
     block_grid = {}
-    snapped_peaks = {}
-    num_bins = len(avg_spectrum)
-
-    for idx, (freq_hz, dbm) in enumerate(avg_spectrum):
+    for freq_hz, dbm in avg_spectrum:
         snapped_25k = int(round(freq_hz / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
         snr_db = round(dbm - noise_floor, 1)
         grid_entry = {
@@ -493,42 +487,24 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
         ):
             block_grid[snapped_25k] = grid_entry
 
+    snapped_peaks = {}
+    sorted_grid_freqs = sorted(block_grid.keys())
+    for snapped_25k in sorted_grid_freqs:
+        g_entry = block_grid[snapped_25k]
+        dbm = g_entry["dbm"]
         if dbm < min_threshold:
             continue
 
-        is_local_max = True
-        j = idx - 1
-        while j >= 0 and (freq_hz - avg_spectrum[j][0]) <= LOCAL_PEAK_RADIUS_HZ:
-            if avg_spectrum[j][1] > dbm:
-                is_local_max = False
-                break
-            j -= 1
-
-        if not is_local_max:
+        left_nb = block_grid.get(snapped_25k - PTS_GRID_HZ)
+        right_nb = block_grid.get(snapped_25k + PTS_GRID_HZ)
+        if left_nb and left_nb["dbm"] > dbm:
+            continue
+        if right_nb and right_nb["dbm"] >= dbm and right_nb["dbm"] >= min_threshold:
             continue
 
-        j = idx + 1
-        while j < num_bins and (avg_spectrum[j][0] - freq_hz) <= LOCAL_PEAK_RADIUS_HZ:
-            if avg_spectrum[j][1] > dbm:
-                is_local_max = False
-                break
-            j += 1
-
-        if not is_local_max:
-            continue
-
-        entry = {
-            "freq_hz": snapped_25k,
-            "dbm": round(dbm, 2),
-            "snr_db": snr_db,
-            "noise_floor": round(noise_floor, 2),
-            "measured_peak": True,
-        }
-        if (
-            snapped_25k not in snapped_peaks
-            or entry["dbm"] > snapped_peaks[snapped_25k]["dbm"]
-        ):
-            snapped_peaks[snapped_25k] = entry
+        entry = dict(g_entry)
+        entry["measured_peak"] = True
+        snapped_peaks[snapped_25k] = entry
 
     block_peaks = list(snapped_peaks.values())
     block_peaks.sort(key=lambda x: x["dbm"], reverse=True)
@@ -644,6 +620,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
                     "noise_floor": grid_meas["noise_floor"],
                     "measured_peak": grid_meas["snr_db"] >= MIN_SNR_ABOVE_FLOOR_DB,
                     "whitelisted": True,
+                    "seed_channel": False,
                     "source": "MEASURED+WHITELIST",
                     "la": wl_la,
                 }
@@ -655,9 +632,57 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
                     "noise_floor": None,
                     "measured_peak": False,
                     "whitelisted": True,
+                    "seed_channel": False,
                     "source": "WHITELIST",
                     "la": wl_la,
                 }
+
+    seed_channels_str = str(cfg.get("TETRA_CHANNELS", "") or "").strip()
+    if seed_channels_str:
+        for raw_entry in seed_channels_str.split(","):
+            raw_entry = raw_entry.strip()
+            if not raw_entry:
+                continue
+            parts = raw_entry.split(":")
+            try:
+                f_hz = int(float(parts[0].strip()))
+            except ValueError:
+                continue
+            if not (start_limit_hz <= f_hz <= end_limit_hz):
+                continue
+            seed_la = None
+            if len(parts) > 1 and parts[1].strip().isdigit():
+                seed_la = int(parts[1].strip())
+            if f_hz in peaks_by_hz:
+                peaks_by_hz[f_hz]["seed_channel"] = True
+                if peaks_by_hz[f_hz].get("la") is None and seed_la is not None:
+                    peaks_by_hz[f_hz]["la"] = seed_la
+            else:
+                grid_meas = measured_grid.get(f_hz)
+                if grid_meas:
+                    peaks_by_hz[f_hz] = {
+                        "freq_hz": f_hz,
+                        "dbm": grid_meas["dbm"],
+                        "snr_db": grid_meas["snr_db"],
+                        "noise_floor": grid_meas["noise_floor"],
+                        "measured_peak": grid_meas["snr_db"] >= MIN_SNR_ABOVE_FLOOR_DB,
+                        "whitelisted": False,
+                        "seed_channel": True,
+                        "source": "SEED",
+                        "la": seed_la,
+                    }
+                else:
+                    peaks_by_hz[f_hz] = {
+                        "freq_hz": f_hz,
+                        "dbm": None,
+                        "snr_db": None,
+                        "noise_floor": None,
+                        "measured_peak": False,
+                        "whitelisted": False,
+                        "seed_channel": True,
+                        "source": "SEED",
+                        "la": seed_la,
+                    }
 
     if not peaks_by_hz:
         return None, []
@@ -727,6 +752,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
                 in_window,
                 key=lambda x: (
                     1 if x.get("whitelisted") else 0,
+                    1 if x.get("seed_channel") else 0,
                     -int(x.get("strikes") or 0),
                     x["snr_db"] if x.get("snr_db") is not None else -999.0,
                     x["dbm"] if x.get("dbm") is not None else -999.0,
@@ -743,7 +769,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
             if p.get("whitelisted")
         )
         strong_peaks = sum(
-            1 for p in selected if (p.get("snr_db") or 0.0) >= 6.0
+            1 for p in selected if (p.get("snr_db") or 0.0) >= 4.0
         )
         total_snr = round(
             sum(max(0.0, p["snr_db"]) for p in selected if p.get("snr_db") is not None),
@@ -761,15 +787,15 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
         for p in selected:
             snr = max(0.0, float(p.get("snr_db") or 0.0))
             dbm = float(p.get("dbm") if p.get("dbm") is not None else -65.0)
-            dbm_bonus = max(0.0, (dbm + 45.0) * 0.4) if snr >= 5.0 else 0.0
+            dbm_bonus = max(0.0, (dbm + 45.0) * 0.4) if snr >= 3.0 else 0.0
             strikes = int(p.get("strikes") or 0)
-            strike_factor = 0.25 ** strikes
+            strike_factor = 0.12 ** strikes
             if p.get("whitelisted"):
-                weighted_score += 25.0 + (snr * 2.5) + dbm_bonus
-            elif snr >= 6.0:
-                weighted_score += (8.0 + (snr * 2.0) + dbm_bonus) * strike_factor
+                weighted_score += (25.0 + (snr * 2.5) + dbm_bonus) * strike_factor
+            elif p.get("seed_channel"):
+                weighted_score += (12.0 + (snr * 2.0) + dbm_bonus) * strike_factor
             else:
-                weighted_score += max(0.1, snr * 0.6) * strike_factor
+                weighted_score += (4.0 + (snr * 1.8) + dbm_bonus) * strike_factor
 
         score = (
             round(weighted_score, 2),
@@ -806,6 +832,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
                 extra_candidates,
                 key=lambda x: (
                     1 if x.get("whitelisted") else 0,
+                    1 if x.get("seed_channel") else 0,
                     -int(x.get("strikes") or 0),
                     x["snr_db"] if x.get("snr_db") is not None else -999.0,
                 ),
@@ -833,7 +860,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
         f_mhz = f_hz / 1e6
         dbm_val = pk.get("dbm")
         snr_val = pk.get("snr_db")
-        wl_tag = " [WHITELIST]" if pk.get("whitelisted") else ""
+        wl_tag = " [WHITELIST]" if pk.get("whitelisted") else (" [SEED]" if pk.get("seed_channel") else "")
         la_tag = f" (LA {pk['la']})" if pk.get("la") is not None else ""
         strike_tag = f" [Strike {pk['strikes']}/{cfg['BLACKLIST_STRIKES']}]" if pk.get("strikes") else ""
         if dbm_val is not None and snr_val is not None:

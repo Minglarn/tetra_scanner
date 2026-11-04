@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.28")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.29")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1321,16 +1321,13 @@ def main():
         state = get_or_init_net_state(
             freq_str, ch["freq_hz"], default_la=ch.get("la"), role="ACTIVE CELL"
         )
-        if is_uplane and not state.get("control_verified"):
-            return
-
+        state["packet_count"] = int(state.get("packet_count", 0)) + 1
         if not is_uplane:
             state["control_verified"] = True
-            state["packet_count"] = int(state.get("packet_count", 0)) + 1
-            if pdu:
-                state["last_pdu"] = pdu
-            elif service:
-                state["last_pdu"] = service
+        if pdu:
+            state["last_pdu"] = pdu
+        elif service:
+            state["last_pdu"] = service
 
         tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
         if tn is not None and 1 <= tn <= 4:
@@ -1348,7 +1345,7 @@ def main():
         if enc_mode is not None:
             state["encryption_mode"] = enc_mode
 
-        if state.get("control_verified") and state["packet_count"] >= 3 and (pdu or service):
+        if (state.get("control_verified") or state["packet_count"] >= 3) and (pdu or service):
             register_whitelisted_carrier(
                 ch,
                 "NETWORK",
@@ -1356,8 +1353,6 @@ def main():
                 mnc=state.get("mnc"),
                 la=state.get("la"),
             )
-
-        if state.get("control_verified"):
             persist_net_state(state, pdu or service, now_ts, emit_log_event=False)
 
     def handle_network_discovery(ch, pkt, pdu, now_ts):
@@ -1457,6 +1452,18 @@ def main():
                 if nb_state.get("mnc") is None and state.get("mnc") is not None:
                     nb_state["mnc"] = state["mnc"]
                 nb_state["reported_by"] = freq_str
+                nb_ch_proxy = {
+                    "freq_hz": nb_freq_hz,
+                    "freq_mhz": nb_freq_mhz,
+                    "la": nb.get("la"),
+                }
+                register_whitelisted_carrier(
+                    nb_ch_proxy,
+                    "NEIGHBOUR_BROADCAST",
+                    mcc=nb_state.get("mcc"),
+                    mnc=nb_state.get("mnc"),
+                    la=nb.get("la"),
+                )
 
                 persist_net_state(
                     nb_state,
@@ -1999,13 +2006,11 @@ def main():
         pdu = str(get_ci(pkt, ["pdu"], "")).upper()
         now_ts = time.time()
 
-        if pdu != "TCH_S" and service != "UPLANE":
-            stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
+        stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
 
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
-            chan_verified = bool(channel_net_cache.get(freq_str, {}).get("control_verified"))
             raw_pkt_ssi = to_int(
                 get_ci(
                     pkt,
@@ -2023,8 +2028,7 @@ def main():
                     (freq_str, "dummy_16777215"),
                     f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Dummy broadcast SSI 16777215",
                 )
-                if chan_verified:
-                    emit_raw_mac_event(ch, pkt)
+                emit_raw_mac_event(ch, pkt)
                 return
 
             pkt_ssi = None if raw_pkt_ssi in (0, 16777215) else raw_pkt_ssi
@@ -2039,11 +2043,9 @@ def main():
                     (freq_str, f"enc_{enc_mode}"),
                     f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Encrypted (enc_mode={enc_mode})",
                 )
-                if chan_verified:
-                    emit_raw_mac_event(ch, pkt)
+                emit_raw_mac_event(ch, pkt)
                 return
 
-            emit_this_uplane_raw = chan_verified
             if isinstance(frame_b64, str) and frame_b64.strip():
                 tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
                 dl_um = to_int(get_ci(pkt, ["downlink usage marker"]), default=0) or 0
@@ -2079,8 +2081,7 @@ def main():
                         (freq_str, f"no_ctx_tn_{tn}"),
                         f"[DEBUG] Dropped TCH_S on {freq_str} MHz (TN {tn}): No call context and usage_marker=0 (raw_ssi={raw_pkt_ssi})",
                     )
-                    if chan_verified:
-                        emit_raw_mac_event(ch, pkt)
+                    emit_raw_mac_event(ch, pkt)
                     return
 
                 buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or eff_gssi or 1))
@@ -2132,7 +2133,6 @@ def main():
                         or buf.get("ssi") is not None
                         or buf.get("gssi") is not None
                     ):
-                        emit_this_uplane_raw = True
                         if not buf.get("logged_start"):
                             buf["logged_start"] = True
                             logging.info(
@@ -2143,16 +2143,12 @@ def main():
                                 buf.get("ssi"),
                                 buf.get("gssi"),
                             )
-                    if len(buf["frames"]) >= 3:
-                        stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
 
-            if emit_this_uplane_raw:
-                emit_raw_mac_event(ch, pkt)
+            emit_raw_mac_event(ch, pkt)
             return
 
         if service == "UPLANE":
-            if channel_net_cache.get(freq_str, {}).get("control_verified"):
-                emit_raw_mac_event(ch, pkt)
+            emit_raw_mac_event(ch, pkt)
             return
         if pdu in IGNORED_PDUS:
             emit_raw_mac_event(ch, pkt)
