@@ -16,7 +16,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.03.5")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.1")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -51,8 +51,11 @@ UDP_OUT_INCLUDE_RAW = os.environ.get("UDP_OUT_INCLUDE_RAW", "false").lower() in 
 HOST_NAME = os.environ.get("HOST_NAME", "iridium")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
+DISCOVERED_NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
+NETWORK_LOG_COOLDOWN_S = 3600.0
 
-IGNORED_PDUS = {"D-NWRK-BROADCAST", "SYSINFO", "D-CK CHANGE DEMAND"}
+IGNORED_PDUS = {"D-CK CHANGE DEMAND"}
+NETWORK_PDUS = {"SYSINFO", "D-NWRK-BROADCAST"}
 CALL_PDUS = {
     "D-SETUP",
     "D-CONNECT",
@@ -682,6 +685,29 @@ def format_sds_human_text(ssi, dest_ssi, proto_id, decoded, unit_registry):
     return f"SDS Binary {src_str} -> {dst_str} (Proto {proto_id}): {decoded.get('sds_hex') or 'empty'}"
 
 
+def load_seen_networks(filepath):
+    seen = {}
+    if not os.path.exists(filepath):
+        return seen
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    net_id = obj.get("network_id")
+                    ts_epoch = obj.get("seen_epoch")
+                    if net_id and isinstance(ts_epoch, (int, float)):
+                        seen[net_id] = float(ts_epoch)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return seen
+
+
 def publish_ha_discovery(client):
     if not HA_DISCOVERY_ENABLED or client is None:
         return
@@ -756,7 +782,7 @@ def setup_mqtt():
         print("[parser] Warning: paho-mqtt not installed, MQTT disabled.", flush=True)
         return None
 
-    client = mqtt.Client(client_id=f"tetra_scanner_{HOST_NAME}")
+    client = mqtt.Client(client_id=f"tetra_scanner_{HOST_NAME}_{os.getpid()}")
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
 
@@ -813,6 +839,8 @@ def main():
     dedup_cache = {}
     active_tx = {}
     unit_registry = {}
+    seen_networks = load_seen_networks(DISCOVERED_NETWORKS_FILE)
+    channel_net_cache = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
     last_heartbeat = time.time()
     running = True
@@ -916,6 +944,84 @@ def main():
         human = event_dict.get("human_text") or event_dict.get("pdu", "?")
         print(f"[{cat}] {freq} MHz (LA{la}) | {human}", flush=True)
 
+    def handle_network_discovery(ch, pkt, pdu, now_ts):
+        freq_str = ch["freq_mhz"]
+        state = channel_net_cache.setdefault(
+            freq_str, {"mcc": None, "mnc": None, "la": None}
+        )
+
+        pkt_mcc = to_int(
+            get_ci(pkt, ["mcc", "mobile country code", "country code"])
+        )
+        pkt_mnc = to_int(
+            get_ci(pkt, ["mnc", "mobile network code", "network code"])
+        )
+        pkt_la = to_int(
+            get_ci(pkt, ["la", "location area", "cell la"])
+        )
+
+        if pkt_mcc is not None:
+            state["mcc"] = pkt_mcc
+        if pkt_mnc is not None:
+            state["mnc"] = pkt_mnc
+        if pkt_la is not None:
+            state["la"] = pkt_la
+            ch["la"] = pkt_la
+
+        mcc = state["mcc"]
+        mnc = state["mnc"]
+        la = state["la"] if state["la"] is not None else ch["la"]
+
+        if mcc is None and mnc is None and pkt_la is None:
+            return
+
+        net_id = f"{freq_str}_{mcc}_{mnc}_{la}"
+        last_seen = seen_networks.get(net_id)
+        if last_seen is not None and (now_ts - last_seen) < NETWORK_LOG_COOLDOWN_S:
+            return
+
+        seen_networks[net_id] = now_ts
+        now_iso = datetime.now(timezone.utc).isoformat()
+        human_text = (
+            f"Discovered TETRA Network on {freq_str} MHz: "
+            f"MCC={mcc} MNC={mnc} LA={la} (via {pdu})"
+        )
+
+        net_event = {
+            "timestamp": now_iso,
+            "seen_epoch": round(now_ts, 3),
+            "host": HOST_NAME,
+            "category": "NETWORK",
+            "pdu": pdu,
+            "network_id": net_id,
+            "freq_mhz": freq_str,
+            "freq_hz": ch["freq_hz"],
+            "mcc": mcc,
+            "mnc": mnc,
+            "la": la,
+            "dl_freq": get_ci(pkt, ["dl_freq", "downlink frequency"]),
+            "ul_freq": get_ci(pkt, ["ul_freq", "uplink frequency"]),
+            "human_text": human_text,
+        }
+
+        try:
+            with open(DISCOVERED_NETWORKS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(net_event, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f"[parser] Failed writing {DISCOVERED_NETWORKS_FILE}: {exc}", flush=True)
+
+        if mqtt_client is not None:
+            payload_str = json.dumps(net_event, ensure_ascii=False)
+            mqtt_client.publish(
+                f"{MQTT_BASE_TOPIC}/NETWORK", payload_str, qos=0, retain=True
+            )
+            mqtt_client.publish(
+                f"{MQTT_BASE_TOPIC}/event", payload_str, qos=0, retain=False
+            )
+
+        send_udp_json(net_event)
+        print(f"[NETWORK] {freq_str} MHz (LA{la}) | {human_text}", flush=True)
+
     def build_and_emit_sds(ch, pkt1, pkt2=None):
         now_ts = time.time()
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -969,7 +1075,9 @@ def main():
 
         decoded = decode_sds_payload(proto_id, hex_str, infos)
         update_unit_registry(ssi, dest_ssi, decoded)
-        human_text = format_sds_human_text(ssi, dest_ssi, proto_id, decoded, unit_registry)
+        human_text = format_sds_human_text(
+            ssi, dest_ssi, proto_id, decoded, unit_registry
+        )
 
         sig = (
             ch["freq_mhz"],
@@ -1032,6 +1140,10 @@ def main():
 
         now_ts = time.time()
         flush_expired_sds(now_ts)
+
+        if pdu in NETWORK_PDUS:
+            handle_network_discovery(ch, pkt, pdu, now_ts)
+            return
 
         mac_ssi = to_int(get_ci(pkt, ["ssi"]))
         caller_ssi = to_int(
@@ -1098,7 +1210,9 @@ def main():
             src_badge = format_unit_badge(src_ssi, unit_registry)
             dst_badge = format_unit_badge(dst_ssi, unit_registry)
             target_part = f" -> SSI {dst_ssi}{dst_badge}" if dst_ssi is not None else ""
-            human_text = f"Status from SSI {src_ssi}{src_badge}{target_part}: {status_text}"
+            human_text = (
+                f"Status from SSI {src_ssi}{src_badge}{target_part}: {status_text}"
+            )
 
             event = {
                 "timestamp": now_iso,
@@ -1326,6 +1440,7 @@ def main():
                 "version": APP_VERSION,
                 "total_packets_60s": total_60s,
                 "known_units": len(unit_registry),
+                "discovered_networks": len(seen_networks),
                 "channels_60s": dict(stats_60s),
             }
             if mqtt_client is not None:
@@ -1337,7 +1452,7 @@ def main():
                 )
             send_udp_json(hb_payload)
             print(
-                f"[heartbeat] 60s total packets: {total_60s} | known units: {len(unit_registry)} | per channel: {stats_60s}",
+                f"[heartbeat] 60s total packets: {total_60s} | known units: {len(unit_registry)} | networks: {len(seen_networks)} | per channel: {stats_60s}",
                 flush=True,
             )
             for k in stats_60s:
