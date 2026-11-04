@@ -54,7 +54,7 @@ MIN_PEAK_SEPARATION_HZ = 25000
 LOCAL_PEAK_RADIUS_HZ = 16000
 DC_SPIKE_GUARD_HZ = 15000
 EDGE_GUARD_HZ = 15000
-MAX_WINDOW_SPAN_HZ = 1900000
+MAX_WINDOW_SPAN_HZ = 1800000
 MIN_SNR_ABOVE_FLOOR_DB = parse_env_float("SCAN_MIN_SNR_DB", 3.0)
 ABSOLUTE_MIN_DBM = parse_env_float("SCAN_MIN_DBM", -65.0)
 
@@ -487,47 +487,56 @@ def phase2_select_best_window(all_peaks):
     if not filtered_peaks:
         return None, []
 
+    # 1. Sort all non-blacklisted candidate frequencies in ascending order
     sorted_by_freq = sorted(filtered_peaks, key=lambda x: x["freq_hz"])
-    candidate_starts = [p["freq_hz"] for p in sorted_by_freq]
 
+    # Deduplicate/enforce 25 kHz minimum spacing across the sorted list (keep strongest at each step)
+    unique_sorted = []
+    for cand in sorted_by_freq:
+        if not unique_sorted:
+            unique_sorted.append(cand)
+            continue
+        prev = unique_sorted[-1]
+        if abs(cand["freq_hz"] - prev["freq_hz"]) < MIN_PEAK_SEPARATION_HZ:
+            if cand["dbm"] > prev["dbm"]:
+                unique_sorted[-1] = cand
+        else:
+            unique_sorted.append(cand)
+
+    # 2. Sliding Window (max_bandwidth = 1.8 MHz = 1,800,000 Hz)
+    max_bandwidth_hz = MAX_WINDOW_SPAN_HZ
     best_window_peaks = []
-    best_score = (-1, -1, -1e9)
+    best_score = (-1, -1e9, -1e9)
 
-    for w_start in candidate_starts:
-        w_end = w_start + MAX_WINDOW_SPAN_HZ
+    for freq_a_obj in unique_sorted:
+        freq_a = freq_a_obj["freq_hz"]
+        window_limit = freq_a + max_bandwidth_hz
+
+        # All frequencies within [freq_a, freq_a + 1.8 MHz]
         in_window = [
-            p for p in filtered_peaks if w_start <= p["freq_hz"] <= w_end
+            p for p in unique_sorted if freq_a <= p["freq_hz"] <= window_limit
         ]
-        in_window.sort(
-            key=lambda x: (
-                1 if x.get("whitelisted") else 0,
-                -int(x.get("strikes", 0)),
-                x["dbm"],
-            ),
-            reverse=True,
-        )
-
-        selected = []
-        for cand in in_window:
-            if any(
-                abs(cand["freq_hz"] - sel["freq_hz"]) < MIN_PEAK_SEPARATION_HZ
-                for sel in selected
-            ):
-                continue
-            selected.append(cand)
-            if len(selected) >= MAX_PEAKS:
-                break
-
-        if not selected:
+        if not in_window:
             continue
 
-        wl_count = sum(1 for p in selected if p.get("whitelisted"))
-        unpenalized_count = sum(1 for p in selected if int(p.get("strikes", 0)) == 0)
-        count = len(selected)
-        total_snr = sum(
-            p["snr_db"] - (int(p.get("strikes", 0)) * 4.0) for p in selected
-        )
-        score = (wl_count, unpenalized_count, count, round(total_snr, 2))
+        # If a 1.8 MHz cluster has more than 6 carriers, pick the 6 with highest SNR/dBm
+        if len(in_window) > MAX_PEAKS:
+            in_window_strongest = sorted(
+                in_window,
+                key=lambda x: (x["snr_db"], x["dbm"]),
+                reverse=True,
+            )[:MAX_PEAKS]
+            selected = sorted(in_window_strongest, key=lambda x: x["freq_hz"])
+        else:
+            selected = in_window
+
+        density = len(selected)
+        total_snr = round(sum(p["snr_db"] for p in selected), 2)
+        total_dbm = round(sum(p["dbm"] for p in selected), 2)
+
+        # Primary: highest channel count (density)
+        # Secondary (tie-breaker): highest total SNR sum, then highest total dBm sum
+        score = (density, total_snr, total_dbm)
         if score > best_score:
             best_score = score
             best_window_peaks = selected

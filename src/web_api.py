@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.6")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.7")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
