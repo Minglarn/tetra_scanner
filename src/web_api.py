@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.25")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.26")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -529,9 +529,13 @@ async def reset_all_discovery():
             await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
         os.replace(tmp_ev, EVENTS_FILE)
 
-        for flag_p in (RELOAD_CONFIG_FLAG, FORCE_SWEEP_FLAG):
-            async with aiofiles.open(flag_p, mode="w", encoding="utf-8") as ff:
-                await ff.write(str(time.time()))
+        if os.path.exists(FORCE_SWEEP_FLAG):
+            try:
+                os.remove(FORCE_SWEEP_FLAG)
+            except Exception:
+                pass
+        async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as ff:
+            await ff.write(str(time.time()))
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "message": f"Reset failed: {exc}"}, status_code=500

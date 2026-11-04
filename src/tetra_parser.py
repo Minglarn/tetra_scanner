@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.25")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.26")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -2499,7 +2499,7 @@ def main():
         flush_expired_sds(now_ts)
 
         total_60s = sum(stats_60s.values())
-        hb_interval = 45.0 if (not first_hb_sent and total_60s == 0) else 60.0
+        hb_interval = 60.0
         if now_ts - last_heartbeat >= hb_interval:
             first_hb_sent = True
             hb_payload = {

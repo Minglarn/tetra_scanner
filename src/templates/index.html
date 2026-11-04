@@ -564,7 +564,7 @@
       contentCol.className = "flex-1 min-w-[200px]";
 
       const msgSpan = document.createElement("span");
-      msgSpan.className = `break-all block ${style.text}`;
+      msgSpan.className = `whitespace-pre-line break-words block leading-relaxed ${style.text}`;
       msgSpan.textContent = humanText;
       contentCol.appendChild(msgSpan);
 
