@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.21")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.22")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1581,22 +1581,70 @@ def main():
 
     def decode_and_emit_voice(buf):
         frames = buf.get("frames") or []
-        if len(frames) < MIN_VOICE_FRAMES:
-            return
-
         freq_mhz = buf.get("freq_mhz", "?.????")
         la = buf.get("la")
         tn = buf.get("tn")
+        usage_marker = to_int(buf.get("usage_marker"))
+        if len(frames) < MIN_VOICE_FRAMES:
+            logging.info(
+                "[DEBUG] Dropped Voice on %s MHz (TN %s, UM %s): Too few frames (%d < %d)",
+                freq_mhz,
+                tn,
+                usage_marker,
+                len(frames),
+                MIN_VOICE_FRAMES,
+            )
+            return
+
         ssi = to_int(buf.get("ssi"))
         if ssi in (0, 16777215):
             ssi = None
         gssi = to_int(buf.get("gssi"))
         if gssi in (0, 16777215):
             gssi = None
+
         if ssi is None and gssi is None:
+            now_check = time.time()
+            late_ctx = (
+                (channel_call_context.get((freq_mhz, f"tn:{tn}")) if tn is not None else None)
+                or (
+                    channel_call_context.get((freq_mhz, usage_marker))
+                    if usage_marker
+                    else None
+                )
+                or channel_call_context.get(freq_mhz)
+                or (
+                    channel_call_context.get(("GLOBAL_UM", usage_marker))
+                    if usage_marker
+                    else None
+                )
+                or channel_call_context.get("GLOBAL_LAST_CALL")
+            )
+            if late_ctx and (now_check - late_ctx.get("ts", 0) <= 120.0):
+                c_ssi = to_int(late_ctx.get("ssi"))
+                if c_ssi not in (None, 0, 16777215):
+                    ssi = c_ssi
+                c_gssi = to_int(late_ctx.get("gssi"))
+                if c_gssi not in (None, 0, 16777215):
+                    gssi = c_gssi
+
+        if ssi is None and gssi is None and not (usage_marker and usage_marker > 0):
+            logging.info(
+                "[DEBUG] Dropped Voice on %s MHz (TN %s): No valid SSI, GSSI, or Usage Marker (%d frames)",
+                freq_mhz,
+                tn,
+                len(frames),
+            )
             return
 
-        ssi_label = str(ssi) if ssi is not None else str(gssi)
+        if ssi is not None:
+            ssi_label = str(ssi)
+        elif gssi is not None:
+            ssi_label = str(gssi)
+        elif usage_marker and usage_marker > 0:
+            ssi_label = f"UM{usage_marker}-TN{tn}" if tn is not None else f"UM{usage_marker}"
+        else:
+            ssi_label = f"TN{tn}" if tn is not None else "UNKNOWN"
         safe_ssi = re.sub(r"[^A-Za-z0-9_-]", "", ssi_label) or "UNKNOWN"
 
         now_ts = time.time()
@@ -1619,6 +1667,13 @@ def main():
                 continue
 
         if len(raw_chunks) < MIN_VOICE_FRAMES:
+            logging.info(
+                "[DEBUG] Dropped Voice on %s MHz (SSI %s): Too few decoded payload chunks (%d < %d)",
+                freq_mhz,
+                ssi_label,
+                len(raw_chunks),
+                MIN_VOICE_FRAMES,
+            )
             return
 
         out_bytes = b"".join(raw_chunks)
@@ -1708,6 +1763,15 @@ def main():
             pcm_bytes_len = len(pcm_source)
             actual_duration_s = pcm_bytes_len / 16000.0
             if actual_duration_s < MIN_AUDIO_DURATION_SEC:
+                logging.info(
+                    "[DEBUG] Dropped Voice on %s MHz (SSI %s): Duration %.2fs < %.2fs (%d frames, %d PCM bytes)",
+                    freq_mhz,
+                    ssi_label,
+                    actual_duration_s,
+                    MIN_AUDIO_DURATION_SEC,
+                    len(frames),
+                    pcm_bytes_len,
+                )
                 return
 
             if pcm_bytes_len % 2 == 1:
@@ -1731,6 +1795,13 @@ def main():
 
         min_wav_bytes = int(MIN_AUDIO_DURATION_SEC * 16000) + 44
         if not os.path.exists(wav_path) or os.path.getsize(wav_path) < min_wav_bytes:
+            logging.info(
+                "[DEBUG] Dropped Voice on %s MHz (SSI %s): WAV file size %d < %d bytes",
+                freq_mhz,
+                ssi_label,
+                os.path.getsize(wav_path) if os.path.exists(wav_path) else 0,
+                min_wav_bytes,
+            )
             try:
                 if os.path.exists(wav_path):
                     os.remove(wav_path)
@@ -1741,6 +1812,17 @@ def main():
         cleanup_old_audio_files(MAX_AUDIO_FILES)
 
         duration_s = round(pcm_bytes_len / 16000.0, 1)
+        logging.info(
+            "[DEBUG] Emitting VOICE on %s MHz: file=%s duration=%.1fs frames=%d SSI=%s GSSI=%s UM=%s TN=%s",
+            freq_mhz,
+            wav_filename,
+            duration_s,
+            len(frames),
+            ssi,
+            gssi,
+            usage_marker,
+            tn,
+        )
         badge = format_unit_badge(ssi, unit_registry) if ssi is not None else ""
         extra_parts = []
         if gssi is not None:
@@ -1853,6 +1935,14 @@ def main():
         except Exception:
             pass
 
+    debug_drop_log_ts = {}
+
+    def log_throttled_debug(key, msg, interval_s=5.0):
+        now_t = time.time()
+        if now_t - debug_drop_log_ts.get(key, 0.0) >= interval_s:
+            debug_drop_log_ts[key] = now_t
+            logging.info(msg)
+
     def process_packet(ch, pkt):
         freq_str = ch["freq_mhz"]
         stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
@@ -1863,7 +1953,7 @@ def main():
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
-            pkt_ssi = to_int(
+            raw_pkt_ssi = to_int(
                 get_ci(
                     pkt,
                     [
@@ -1875,29 +1965,47 @@ def main():
                     ],
                 )
             )
-            if pkt_ssi in (0, 16777215):
+            if raw_pkt_ssi == 16777215:
+                log_throttled_debug(
+                    (freq_str, "dummy_16777215"),
+                    f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Dummy broadcast SSI 16777215",
+                )
                 emit_raw_mac_event(ch, pkt)
                 return
+
+            pkt_ssi = None if raw_pkt_ssi in (0, 16777215) else raw_pkt_ssi
 
             enc_mode = to_int(
                 get_ci(pkt, ["encryption mode", "encryption_mode", "encrypted"]),
                 default=0,
             )
             frame_b64 = get_ci(pkt, ["frame"])
-            if enc_mode == 0 and isinstance(frame_b64, str) and frame_b64.strip():
-                tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
-                usage_marker = to_int(
-                    get_ci(pkt, ["downlink usage marker", "usage marker", "usage_marker"])
+            if enc_mode != 0:
+                log_throttled_debug(
+                    (freq_str, f"enc_{enc_mode}"),
+                    f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Encrypted (enc_mode={enc_mode})",
                 )
+                emit_raw_mac_event(ch, pkt)
+                return
+
+            if isinstance(frame_b64, str) and frame_b64.strip():
+                tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
+                dl_um = to_int(get_ci(pkt, ["downlink usage marker"]), default=0) or 0
+                ul_um = to_int(get_ci(pkt, ["usage marker", "usage_marker"]), default=0) or 0
+                usage_marker = max(dl_um, ul_um)
 
                 ctx = None
                 if tn is not None:
                     ctx = channel_call_context.get((freq_str, f"tn:{tn}"))
-                if not ctx and usage_marker is not None and usage_marker > 0:
+                if not ctx and usage_marker > 0:
                     ctx = channel_call_context.get((freq_str, usage_marker))
                 if not ctx:
                     ctx = channel_call_context.get(freq_str)
-                if ctx and (now_ts - ctx.get("ts", 0) > 60.0):
+                if not ctx and usage_marker > 0:
+                    ctx = channel_call_context.get(("GLOBAL_UM", usage_marker))
+                if not ctx:
+                    ctx = channel_call_context.get("GLOBAL_LAST_CALL")
+                if ctx and (now_ts - ctx.get("ts", 0) > 120.0):
                     ctx = None
 
                 ctx_ssi = to_int(ctx.get("ssi")) if ctx else None
@@ -1907,13 +2015,14 @@ def main():
                 if ctx_gssi in (0, 16777215):
                     ctx_gssi = None
 
-                if pkt_ssi is None and (ctx is None or (ctx_ssi is None and ctx_gssi is None)):
-                    emit_raw_mac_event(ch, pkt)
-                    return
-
                 eff_ssi = pkt_ssi if pkt_ssi is not None else ctx_ssi
                 eff_gssi = ctx_gssi
-                if eff_ssi is None and eff_gssi is None:
+
+                if eff_ssi is None and eff_gssi is None and usage_marker <= 0:
+                    log_throttled_debug(
+                        (freq_str, f"no_ctx_tn_{tn}"),
+                        f"[DEBUG] Dropped TCH_S on {freq_str} MHz (TN {tn}): No call context and usage_marker=0 (raw_ssi={raw_pkt_ssi})",
+                    )
                     emit_raw_mac_event(ch, pkt)
                     return
 
@@ -1931,6 +2040,14 @@ def main():
                         buf = None
 
                     if buf is None:
+                        logging.info(
+                            "[DEBUG] Started TCH_S voice buffer on %s MHz (TN %s, UM %s, SSI %s, GSSI %s)",
+                            freq_str,
+                            tn,
+                            usage_marker,
+                            eff_ssi,
+                            eff_gssi,
+                        )
                         buf = {
                             "freq_mhz": freq_str,
                             "la": ch.get("la"),
@@ -1949,6 +2066,8 @@ def main():
                             buf["ssi"] = eff_ssi
                         if buf.get("gssi") is None and eff_gssi is not None:
                             buf["gssi"] = eff_gssi
+                        if not buf.get("usage_marker") and usage_marker > 0:
+                            buf["usage_marker"] = usage_marker
                     buf["frames"].append(frame_b64.strip())
 
             emit_raw_mac_event(ch, pkt)
@@ -1981,6 +2100,32 @@ def main():
                 ],
             )
         )
+
+        if mac_ssi not in (None, 0, 16777215) or caller_ssi not in (None, 0, 16777215):
+            pkt_tn = to_int(get_ci(pkt, ["tn", "timeslot", "allocated timeslot"]))
+            pkt_dl_um = to_int(get_ci(pkt, ["downlink usage marker"]), default=0) or 0
+            pkt_ul_um = to_int(get_ci(pkt, ["usage marker", "usage_marker"]), default=0) or 0
+            pkt_um = max(pkt_dl_um, pkt_ul_um)
+            eff_mac_ssi = caller_ssi if caller_ssi not in (None, 0, 16777215) else mac_ssi
+            eff_mac_gssi = (
+                mac_ssi
+                if (mac_ssi not in (None, 0, 16777215) and 3000000 <= mac_ssi <= 3999999)
+                else None
+            )
+            mac_ctx_obj = {
+                "ssi": eff_mac_ssi,
+                "gssi": eff_mac_gssi,
+                "usage_marker": pkt_um if pkt_um > 0 else None,
+                "tn": pkt_tn,
+                "ts": now_ts,
+            }
+            if pkt_um > 0:
+                channel_call_context[(freq_str, pkt_um)] = mac_ctx_obj
+                channel_call_context[("GLOBAL_UM", pkt_um)] = mac_ctx_obj
+            if pkt_tn is not None:
+                existing_tn_ctx = channel_call_context.get((freq_str, f"tn:{pkt_tn}"))
+                if not existing_tn_ctx or (now_ts - existing_tn_ctx.get("ts", 0) > 15.0):
+                    channel_call_context[(freq_str, f"tn:{pkt_tn}")] = mac_ctx_obj
 
         if pdu == "D-SDS-DATA":
             has_hex = get_ci(pkt, ["hex"]) is not None
@@ -2106,13 +2251,17 @@ def main():
                     "ts": now_ts,
                 }
                 channel_call_context[freq_str] = call_ctx_obj
+                channel_call_context["GLOBAL_LAST_CALL"] = call_ctx_obj
                 if usage_marker is not None and usage_marker > 0:
                     channel_call_context[(freq_str, usage_marker)] = call_ctx_obj
+                    channel_call_context[("GLOBAL_UM", usage_marker)] = call_ctx_obj
                 if call_tn is not None:
                     channel_call_context[(freq_str, f"tn:{call_tn}")] = call_ctx_obj
                 with voice_lock:
                     for b_key, b_val in voice_buffers.items():
-                        if b_key[0] == freq_str:
+                        if b_key[0] == freq_str or (
+                            usage_marker and b_val.get("usage_marker") == usage_marker
+                        ):
                             if b_val.get("ssi") is None and call_ctx_obj["ssi"] is not None:
                                 b_val["ssi"] = call_ctx_obj["ssi"]
                             if b_val.get("gssi") is None and gssi is not None:
@@ -2207,12 +2356,6 @@ def main():
                     ssi=ssi,
                     gssi=gssi,
                 )
-                if pdu == "D-RELEASE":
-                    channel_call_context.pop(freq_str, None)
-                    if usage_marker is not None:
-                        channel_call_context.pop((freq_str, usage_marker), None)
-                    if call_tn is not None:
-                        channel_call_context.pop((freq_str, f"tn:{call_tn}"), None)
             return
 
         if "LOCATION UPDATE" in pdu:

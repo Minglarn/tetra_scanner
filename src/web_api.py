@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.21")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.22")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -561,9 +561,14 @@ async def read_recent_lines(filepath: str, max_lines: int = 100):
         return []
     important_buf = deque(maxlen=max_lines)
     try:
+        file_size = os.path.getsize(filepath)
+        seek_pos = max(0, file_size - 524288)
         async with aiofiles.open(
             filepath, mode="r", encoding="utf-8", errors="replace"
         ) as f:
+            if seek_pos > 0:
+                await f.seek(seek_pos)
+                await f.readline()
             async for line in f:
                 s = line.strip()
                 if not s:

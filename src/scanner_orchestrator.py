@@ -630,7 +630,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
                 peaks_by_hz[f_hz]["la"] = wl_la
         else:
             grid_meas = measured_grid.get(f_hz)
-            if grid_meas and grid_meas["dbm"] >= ABSOLUTE_MIN_DBM and grid_meas["snr_db"] >= 1.5:
+            if grid_meas:
                 peaks_by_hz[f_hz] = {
                     "freq_hz": f_hz,
                     "dbm": grid_meas["dbm"],
@@ -641,12 +641,12 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
                     "source": "MEASURED+WHITELIST",
                     "la": wl_la,
                 }
-            elif not all_peaks:
+            else:
                 peaks_by_hz[f_hz] = {
                     "freq_hz": f_hz,
-                    "dbm": grid_meas["dbm"] if grid_meas else None,
-                    "snr_db": grid_meas["snr_db"] if grid_meas else None,
-                    "noise_floor": grid_meas["noise_floor"] if grid_meas else None,
+                    "dbm": None,
+                    "snr_db": None,
+                    "noise_floor": None,
                     "measured_peak": False,
                     "whitelisted": True,
                     "source": "WHITELIST",
@@ -720,7 +720,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
             in_window_strongest = sorted(
                 in_window,
                 key=lambda x: (
-                    1 if (x.get("whitelisted") and (x.get("snr_db") or 0.0) >= 1.5) else 0,
+                    1 if x.get("whitelisted") else 0,
                     x["snr_db"] if x.get("snr_db") is not None else -999.0,
                     x["dbm"] if x.get("dbm") is not None else -999.0,
                 ),
@@ -733,7 +733,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
         wl_count = sum(
             1
             for p in selected
-            if p.get("whitelisted") and (p.get("snr_db") is None or p["snr_db"] >= 1.5)
+            if p.get("whitelisted")
         )
         strong_peaks = sum(
             1 for p in selected if (p.get("snr_db") or 0.0) >= 6.0
@@ -755,7 +755,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
             snr = max(0.0, float(p.get("snr_db") or 0.0))
             dbm = float(p.get("dbm") if p.get("dbm") is not None else -65.0)
             dbm_bonus = max(0.0, (dbm + 45.0) * 0.4) if snr >= 5.0 else 0.0
-            if p.get("whitelisted") and (p.get("snr_db") is None or snr >= 1.5):
+            if p.get("whitelisted"):
                 weighted_score += 25.0 + (snr * 2.5) + dbm_bonus
             elif snr >= 6.0:
                 weighted_score += 8.0 + (snr * 2.0) + dbm_bonus
@@ -1015,7 +1015,7 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                                     blacklist_strikes,
                                     "No TETRA sync (0 pkt/min)",
                                     immediate=True,
-                                    force_even_if_whitelisted=True,
+                                    force_even_if_whitelisted=False,
                                 )
                                 dead_blacklisted_hz.update(dead_in_hb)
                                 abort_msg = (
@@ -1039,7 +1039,7 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                                     blacklist_strikes,
                                     "No TETRA sync (0 pkt/min)",
                                     immediate=True,
-                                    force_even_if_whitelisted=True,
+                                    force_even_if_whitelisted=False,
                                 )
                                 dead_blacklisted_hz.update(isolated_dead)
             except queue.Empty:
