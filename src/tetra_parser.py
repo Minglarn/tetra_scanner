@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.24")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.25")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1636,14 +1636,15 @@ def main():
         tn = buf.get("tn")
         usage_marker = to_int(buf.get("usage_marker"))
         if len(frames) < MIN_VOICE_FRAMES:
-            logging.info(
-                "[DEBUG] Dropped Voice on %s MHz (TN %s, UM %s): Too few frames (%d < %d)",
-                freq_mhz,
-                tn,
-                usage_marker,
-                len(frames),
-                MIN_VOICE_FRAMES,
-            )
+            if len(frames) >= 3 or buf.get("ssi") is not None or buf.get("gssi") is not None:
+                logging.info(
+                    "[DEBUG] Dropped Voice on %s MHz (TN %s, UM %s): Too few frames (%d < %d)",
+                    freq_mhz,
+                    tn,
+                    usage_marker,
+                    len(frames),
+                    MIN_VOICE_FRAMES,
+                )
             return
 
         ssi = to_int(buf.get("ssi"))
@@ -2100,14 +2101,6 @@ def main():
                             buf = None
 
                     if buf is None:
-                        logging.info(
-                            "[DEBUG] Started TCH_S voice buffer on %s MHz (TN %s, UM %s, SSI %s, GSSI %s)",
-                            freq_str,
-                            tn,
-                            usage_marker,
-                            eff_ssi,
-                            eff_gssi,
-                        )
                         buf = {
                             "freq_mhz": freq_str,
                             "la": ch.get("la"),
@@ -2118,6 +2111,7 @@ def main():
                             "frames": [],
                             "first_seen": now_ts,
                             "last_seen": now_ts,
+                            "logged_start": False,
                         }
                         voice_buffers[buf_key] = buf
                     else:
@@ -2129,6 +2123,20 @@ def main():
                         if not buf.get("usage_marker") and usage_marker > 0:
                             buf["usage_marker"] = usage_marker
                     buf["frames"].append(frame_b64.strip())
+                    if not buf.get("logged_start") and (
+                        len(buf["frames"]) >= 3
+                        or buf.get("ssi") is not None
+                        or buf.get("gssi") is not None
+                    ):
+                        buf["logged_start"] = True
+                        logging.info(
+                            "[DEBUG] Started TCH_S voice buffer on %s MHz (TN %s, UM %s, SSI %s, GSSI %s)",
+                            freq_str,
+                            tn,
+                            buf.get("usage_marker"),
+                            buf.get("ssi"),
+                            buf.get("gssi"),
+                        )
                     if len(buf["frames"]) >= 3:
                         stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
 
