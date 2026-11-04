@@ -2,6 +2,7 @@
 import os
 import sys
 import csv
+import json
 import time
 import queue
 import signal
@@ -34,6 +35,12 @@ SCAN_END_MHZ = parse_env_float("SCAN_END_MHZ", 430.0)
 IDLE_TIMEOUT_SEC = parse_env_int(
     "IDLE_TIMEOUT_SEC", parse_env_int("SCAN_DWELL_TIME", 900)
 )
+BLACKLIST_TIME_SEC = parse_env_int("BLACKLIST_TIME_SEC", 3600)
+FORCE_SWEEP_PENALTY_SEC = 900
+
+LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
+BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
+FORCE_SWEEP_FLAG = "/tmp/force_sweep.flag"
 
 RTL_DEVICE_INDEX = parse_env_int("RTL_DEVICE_INDEX", 1)
 RTL_GAIN = parse_env_float("RTL_GAIN", 24.0)
@@ -53,6 +60,47 @@ PAYLOAD_TAGS = ("[SDS]", "[CALL]", "[STATUS]", "[ROAMING]")
 
 ACTIVE_PROCS = []
 RUNNING = True
+
+
+def load_blacklist():
+    if not os.path.exists(BLACKLIST_FILE):
+        return {}
+    try:
+        with open(BLACKLIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:
+        print(f"[scanner] Warning: failed reading {BLACKLIST_FILE}: {exc}", flush=True)
+    return {}
+
+
+def save_blacklist(data):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp_path = f"{BLACKLIST_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, BLACKLIST_FILE)
+    except Exception as exc:
+        print(f"[scanner] Warning: failed saving {BLACKLIST_FILE}: {exc}", flush=True)
+
+
+def add_frequencies_to_blacklist(freq_list_hz, duration_sec, reason):
+    bl = load_blacklist()
+    now_ts = time.time()
+    expire_at = round(now_ts + float(duration_sec), 2)
+    for f_hz in freq_list_hz:
+        key = str(int(f_hz))
+        bl[key] = {
+            "expire_at": expire_at,
+            "reason": reason,
+        }
+        print(
+            f"[scanner] Blacklisted {int(f_hz) / 1e6:.4f} MHz for {duration_sec}s (reason: {reason})",
+            flush=True,
+        )
+    save_blacklist(bl)
 
 
 def terminate_children():
@@ -325,7 +373,34 @@ def phase2_select_best_window(all_peaks):
     if not all_peaks:
         return None, []
 
-    sorted_by_freq = sorted(all_peaks, key=lambda x: x["freq_hz"])
+    blacklist = load_blacklist()
+    now_ts = time.time()
+    blacklist_modified = False
+    filtered_peaks = []
+
+    for pk in all_peaks:
+        f_key = str(int(pk["freq_hz"]))
+        if f_key in blacklist:
+            entry = blacklist[f_key]
+            expire_at = float(entry.get("expire_at", 0))
+            if now_ts < expire_at:
+                print(
+                    f"[scanner] Ignoring blacklisted frequency {pk['freq_hz'] / 1e6:.4f} MHz",
+                    flush=True,
+                )
+                continue
+            else:
+                del blacklist[f_key]
+                blacklist_modified = True
+        filtered_peaks.append(pk)
+
+    if blacklist_modified:
+        save_blacklist(blacklist)
+
+    if not filtered_peaks:
+        return None, []
+
+    sorted_by_freq = sorted(filtered_peaks, key=lambda x: x["freq_hz"])
     candidate_starts = [p["freq_hz"] for p in sorted_by_freq]
 
     best_window_peaks = []
@@ -334,7 +409,7 @@ def phase2_select_best_window(all_peaks):
     for w_start in candidate_starts:
         w_end = w_start + MAX_WINDOW_SPAN_HZ
         in_window = [
-            p for p in all_peaks if w_start <= p["freq_hz"] <= w_end
+            p for p in filtered_peaks if w_start <= p["freq_hz"] <= w_end
         ]
         in_window.sort(key=lambda x: x["dbm"], reverse=True)
 
@@ -423,6 +498,7 @@ def stdout_reader_worker(proc, line_queue):
 def phase3_monitor_channels(center_hz, selected_peaks):
     global ACTIVE_PROCS, RUNNING
 
+    active_frequencies = [int(pk["freq_hz"]) for pk in selected_peaks]
     channels_list = [
         f"{pk['freq_hz']}:{idx}"
         for idx, pk in enumerate(selected_peaks, start=1)
@@ -442,7 +518,8 @@ def phase3_monitor_channels(center_hz, selected_peaks):
         flush=True,
     )
     print(
-        f"[scanner] [PHASE 3: MONITOR] Idle payload timeout set to {IDLE_TIMEOUT_SEC}s",
+        f"[scanner] [PHASE 3: MONITOR] Idle payload timeout set to {IDLE_TIMEOUT_SEC}s "
+        f"(blacklist penalty={BLACKLIST_TIME_SEC}s)",
         flush=True,
     )
 
@@ -500,6 +577,20 @@ def phase3_monitor_channels(center_hz, selected_peaks):
             except queue.Empty:
                 pass
 
+            if os.path.exists(FORCE_SWEEP_FLAG):
+                try:
+                    os.remove(FORCE_SWEEP_FLAG)
+                except OSError:
+                    pass
+                print(
+                    "[scanner] Manual Force Sweep flag detected. Blacklisting current frequencies for 900s...",
+                    flush=True,
+                )
+                add_frequencies_to_blacklist(
+                    active_frequencies, FORCE_SWEEP_PENALTY_SEC, "Manual Force"
+                )
+                break
+
             if gr_proc.poll() is not None:
                 print(
                     "[scanner] Warning: tetra_multi_rtl.py exited unexpectedly. Restarting scan...",
@@ -519,6 +610,9 @@ def phase3_monitor_channels(center_hz, selected_peaks):
                     "IDLE TIMEOUT REACHED - No active payload data. Restarting scan...",
                     flush=True,
                 )
+                add_frequencies_to_blacklist(
+                    active_frequencies, BLACKLIST_TIME_SEC, "Idle Timeout"
+                )
                 break
     finally:
         terminate_children()
@@ -531,7 +625,7 @@ def main():
         f"[scanner] Smart Auto-Tune Scanner initialized: "
         f"{SCAN_START_MHZ:.1f}-{SCAN_END_MHZ:.1f} MHz | "
         f"2 MHz centers={[round(c, 3) for c in centers]} | "
-        f"IDLE_TIMEOUT_SEC={IDLE_TIMEOUT_SEC}s",
+        f"IDLE_TIMEOUT_SEC={IDLE_TIMEOUT_SEC}s | BLACKLIST_TIME_SEC={BLACKLIST_TIME_SEC}s",
         flush=True,
     )
 
@@ -546,7 +640,7 @@ def main():
             center_hz, best_peaks = phase2_select_best_window(all_peaks)
             if not best_peaks or center_hz is None:
                 print(
-                    "[scanner] No active TETRA carriers detected across the band. Retrying in 10s...",
+                    "[scanner] No non-blacklisted TETRA carriers available. Retrying in 10s...",
                     flush=True,
                 )
                 for _ in range(20):

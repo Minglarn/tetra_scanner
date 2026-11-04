@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import json
+import time
 import asyncio
 from collections import deque
 import aiofiles
@@ -9,10 +10,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.4")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.5")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
+BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -61,6 +63,38 @@ async def get_networks():
     result = list(networks_by_id.values())
     result.sort(key=lambda x: x.get("seen_epoch") or 0, reverse=True)
     return result
+
+
+@app.get("/api/blacklist", response_class=JSONResponse)
+async def get_blacklist():
+    if not os.path.exists(BLACKLIST_FILE):
+        return {}
+
+    try:
+        async with aiofiles.open(
+            BLACKLIST_FILE, mode="r", encoding="utf-8", errors="replace"
+        ) as f:
+            content = await f.read()
+            if not content.strip():
+                return {}
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                return {}
+    except Exception:
+        return {}
+
+    now_ts = time.time()
+    active = {}
+    for freq_str, info in data.items():
+        if not isinstance(info, dict):
+            continue
+        expire_at = float(info.get("expire_at", 0))
+        if expire_at > now_ts:
+            active[freq_str] = {
+                "expire_at": expire_at,
+                "reason": info.get("reason", "Unknown"),
+            }
+    return active
 
 
 async def read_recent_lines(filepath: str, max_lines: int = 100):

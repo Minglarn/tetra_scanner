@@ -54,24 +54,46 @@
   <!-- Main Content Grid -->
   <main class="flex-1 grid grid-cols-1 lg:grid-cols-4 gap-4 p-4 max-w-[1920px] w-full mx-auto overflow-hidden">
 
-    <!-- Sidebar: Discovered Networks -->
-    <section class="lg:col-span-1 bg-gray-900 border border-gray-800 rounded-lg flex flex-col max-h-[85vh]">
-      <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-        <div>
-          <h2 class="text-sm font-bold uppercase tracking-wider text-gray-200">Discovered Networks</h2>
-          <p class="text-[11px] text-gray-500">Decoded via SYSINFO / Broadcast</p>
+    <!-- Left Sidebar: Discovered Networks & Blacklisted Frequencies -->
+    <aside class="lg:col-span-1 flex flex-col gap-4 max-h-[85vh]">
+
+      <!-- Discovered Networks -->
+      <section class="bg-gray-900 border border-gray-800 rounded-lg flex flex-col flex-1 min-h-0">
+        <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+          <div>
+            <h2 class="text-sm font-bold uppercase tracking-wider text-gray-200">Discovered Networks</h2>
+            <p class="text-[11px] text-gray-500">Decoded via SYSINFO / Broadcast</p>
+          </div>
+          <button id="refresh-networks-btn" class="text-xs px-2.5 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
+            Refresh
+          </button>
         </div>
-        <button id="refresh-networks-btn" class="text-xs px-2.5 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
-          Refresh
-        </button>
-      </div>
 
-      <div id="networks-container" class="p-3 space-y-2.5 overflow-y-auto flex-1 text-xs">
-        <div class="text-gray-500 italic py-4 text-center">Loading networks...</div>
-      </div>
-    </section>
+        <div id="networks-container" class="p-3 space-y-2 overflow-y-auto flex-1 text-xs">
+          <div class="text-gray-500 italic py-4 text-center">Loading networks...</div>
+        </div>
+      </section>
 
-    <!-- Main Panel: Real-time Event Stream -->
+      <!-- Ignored / Blacklisted Frequencies -->
+      <section class="bg-gray-900 border border-gray-800 rounded-lg flex flex-col flex-1 min-h-0">
+        <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+          <div>
+            <h2 class="text-sm font-bold uppercase tracking-wider text-amber-300">Ignored / Blacklisted Frequencies</h2>
+            <p class="text-[11px] text-gray-500">Frequency Reputation System</p>
+          </div>
+          <button id="refresh-blacklist-btn" class="text-xs px-2.5 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
+            Refresh
+          </button>
+        </div>
+
+        <div id="blacklist-container" class="p-3 space-y-2 overflow-y-auto flex-1 text-xs">
+          <div class="text-gray-500 italic py-4 text-center">No frequencies currently ignored.</div>
+        </div>
+      </section>
+
+    </aside>
+
+    <!-- Main Panel: Real-time Event Stream (Newest First) -->
     <section class="lg:col-span-3 bg-gray-900 border border-gray-800 rounded-lg flex flex-col h-[85vh]">
       <!-- Filter Bar -->
       <div class="px-4 py-3 border-b border-gray-800 bg-gray-900/90 flex flex-wrap items-center justify-between gap-3">
@@ -88,10 +110,7 @@
             <span class="text-gray-200">Show Control Frames</span>
           </label>
 
-          <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
-            <input type="checkbox" id="autoscroll-toggle" checked class="accent-emerald-500 rounded" />
-            <span class="text-gray-200">Auto-Scroll</span>
-          </label>
+          <span class="text-[11px] text-gray-500 uppercase tracking-wider">Order: Newest First</span>
         </div>
 
         <div class="flex items-center gap-2">
@@ -129,11 +148,12 @@
     const eventCounterEl = document.getElementById("event-counter");
     const filterTrionaEl = document.getElementById("filter-triona");
     const filterControlEl = document.getElementById("filter-control");
-    const autoScrollEl = document.getElementById("autoscroll-toggle");
     const searchInputEl = document.getElementById("search-input");
     const clearLogBtn = document.getElementById("clear-log-btn");
     const networksContainer = document.getElementById("networks-container");
     const refreshNetworksBtn = document.getElementById("refresh-networks-btn");
+    const blacklistContainer = document.getElementById("blacklist-container");
+    const refreshBlacklistBtn = document.getElementById("refresh-blacklist-btn");
 
     let totalEvents = 0;
     const MAX_DOM_ROWS = 500;
@@ -290,17 +310,14 @@
         row.classList.add("hidden");
       }
 
-      logStream.appendChild(row);
+      // Insert at the top so newest event is always first
+      logStream.prepend(row);
       totalEvents += 1;
       eventCounterEl.textContent = String(totalEvents);
 
       const allRows = logStream.querySelectorAll(".event-row");
       if (allRows.length > MAX_DOM_ROWS) {
-        allRows[0].remove();
-      }
-
-      if (autoScrollEl.checked) {
-        logStream.scrollTop = logStream.scrollHeight;
+        allRows[allRows.length - 1].remove();
       }
     }
 
@@ -352,7 +369,65 @@
       }
     }
 
+    async function fetchBlacklist() {
+      try {
+        const res = await fetch("/api/blacklist");
+        if (!res.ok) return;
+        const data = await res.json();
+        blacklistContainer.innerHTML = "";
+
+        const nowSec = Date.now() / 1000;
+        const entries = Object.entries(data || {}).filter(([, info]) => {
+          return info && typeof info.expire_at === "number" && info.expire_at > nowSec;
+        });
+
+        if (entries.length === 0) {
+          blacklistContainer.innerHTML = `<div class="text-gray-500 italic py-4 text-center">No frequencies currently ignored.</div>`;
+          return;
+        }
+
+        entries.sort((a, b) => Number(a[0]) - Number(b[0]));
+
+        entries.forEach(([freqHzStr, info]) => {
+          const freqMhz = (Number(freqHzStr) / 1e6).toFixed(4);
+          const remainingSec = Math.max(0, Math.round(info.expire_at - nowSec));
+          const remainingMin = Math.ceil(remainingSec / 60);
+          const countdownText = remainingSec >= 60
+            ? `Expires in ${remainingMin} min`
+            : `Expires in ${remainingSec} s`;
+
+          const card = document.createElement("div");
+          card.className = "bg-gray-950/80 border border-amber-900/50 rounded p-2.5 space-y-1";
+
+          const topRow = document.createElement("div");
+          topRow.className = "flex items-center justify-between";
+
+          const freqEl = document.createElement("span");
+          freqEl.className = "text-amber-400 font-bold";
+          freqEl.textContent = `${freqMhz} MHz`;
+
+          const reasonBadge = document.createElement("span");
+          reasonBadge.className = "px-1.5 py-0.5 rounded bg-red-950/80 border border-red-800/70 text-red-300 text-[10px] font-semibold";
+          reasonBadge.textContent = info.reason || "Ignored";
+
+          topRow.appendChild(freqEl);
+          topRow.appendChild(reasonBadge);
+
+          const expRow = document.createElement("div");
+          expRow.className = "text-gray-400 text-[11px]";
+          expRow.textContent = countdownText;
+
+          card.appendChild(topRow);
+          card.appendChild(expRow);
+          blacklistContainer.appendChild(card);
+        });
+      } catch (e) {
+        // Ignore transient network errors
+      }
+    }
+
     refreshNetworksBtn.addEventListener("click", loadNetworks);
+    refreshBlacklistBtn.addEventListener("click", fetchBlacklist);
 
     function connectWebSocket() {
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -383,7 +458,9 @@
     }
 
     loadNetworks();
+    fetchBlacklist();
     setInterval(loadNetworks, 15000);
+    setInterval(fetchBlacklist, 10000);
     connectWebSocket();
   </script>
 </body>
