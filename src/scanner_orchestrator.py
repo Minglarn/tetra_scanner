@@ -163,6 +163,24 @@ def load_whitelist():
     return {}
 
 
+def emit_system_event(human_text):
+    iso_ts = datetime.now(timezone.utc).isoformat()
+    event_obj = {
+        "time": iso_ts,
+        "timestamp": iso_ts,
+        "category": "SYSTEM",
+        "freq_mhz": "SYS",
+        "human_text": human_text,
+    }
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open("/app/logs/tetra_events.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(event_obj, ensure_ascii=False) + "\n")
+            f.flush()
+    except Exception as exc:
+        print(f"[scanner] Warning: failed writing system event: {exc}", flush=True)
+
+
 def add_frequencies_to_blacklist(
     freq_list_hz, duration_sec, max_strikes, reason, immediate=False
 ):
@@ -173,10 +191,9 @@ def add_frequencies_to_blacklist(
     for f_hz in freq_list_hz:
         key = str(int(f_hz))
         if key in wl and not immediate:
-            print(
-                f"[scanner] Keeping whitelisted frequency {int(f_hz) / 1e6:.4f} MHz (protected from Idle Timeout blacklist)",
-                flush=True,
-            )
+            msg = f"Keeping whitelisted frequency {int(f_hz) / 1e6:.4f} MHz (protected from Idle Timeout blacklist)"
+            print(f"[scanner] {msg}", flush=True)
+            emit_system_event(msg)
             continue
 
         prev_entry = bl.get(key) if isinstance(bl.get(key), dict) else {}
@@ -200,11 +217,12 @@ def add_frequencies_to_blacklist(
                 "last_strike_at": round(now_ts, 2),
                 "reason": f"{reason} ({strikes}/{max_strikes})",
             }
-            print(
-                f"[scanner] Blacklisted {int(f_hz) / 1e6:.4f} MHz for {duration_sec}s "
-                f"(Strike {strikes}/{max_strikes} - {reason})",
-                flush=True,
+            msg = (
+                f"Blacklisted {int(f_hz) / 1e6:.4f} MHz for {duration_sec}s "
+                f"(Strike {strikes}/{max_strikes} - {reason})"
             )
+            print(f"[scanner] {msg}", flush=True)
+            emit_system_event(msg)
         else:
             bl[key] = {
                 "strikes": strikes,
@@ -213,11 +231,12 @@ def add_frequencies_to_blacklist(
                 "last_strike_at": round(now_ts, 2),
                 "reason": f"Warning {strikes}/{max_strikes} ({reason})",
             }
-            print(
-                f"[scanner] Frequency {int(f_hz) / 1e6:.4f} MHz quiet: recorded Strike "
-                f"{strikes}/{max_strikes} (not blacklisted yet)",
-                flush=True,
+            msg = (
+                f"Frequency {int(f_hz) / 1e6:.4f} MHz quiet: recorded Strike "
+                f"{strikes}/{max_strikes} (not blacklisted yet)"
             )
+            print(f"[scanner] {msg}", flush=True)
+            emit_system_event(msg)
 
     save_blacklist(bl)
 
@@ -304,11 +323,12 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
         "-1",
         csv_path,
     ]
-    print(
-        f"[scanner] [PHASE 1: SWEEP] Scanning {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz "
-        f"(center {center_mhz:.3f} MHz, gain={cfg['RTL_GAIN']} dB, 2k step, 10s) -> {csv_path}",
-        flush=True,
+    scan_msg = (
+        f"[PHASE 1: SWEEP] Scanning {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz "
+        f"(center {center_mhz:.3f} MHz, gain={cfg['RTL_GAIN']} dB, 2k step, 10s)"
     )
+    print(f"[scanner] {scan_msg} -> {csv_path}", flush=True)
+    emit_system_event(scan_msg)
     try:
         res = subprocess.run(
             cmd,
@@ -434,18 +454,20 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
 
     block_peaks = list(snapped_peaks.values())
     block_peaks.sort(key=lambda x: x["dbm"], reverse=True)
-    print(
-        f"[scanner]   Block {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz | "
+    block_summary = (
+        f"Block {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz | "
         f"Noise floor: {noise_floor:.1f} dBm | Threshold (+{MIN_SNR_ABOVE_FLOOR_DB:.1f} dB): "
-        f"{min_threshold:.1f} dBm | Peaks found: {len(block_peaks)}",
-        flush=True,
+        f"{min_threshold:.1f} dBm | Peaks found: {len(block_peaks)}"
     )
+    print(f"[scanner]   {block_summary}", flush=True)
+    emit_system_event(block_summary)
     for pk in block_peaks[:8]:
-        print(
-            f"[scanner]     Candidate: {pk['freq_hz'] / 1e6:.4f} MHz "
-            f"({pk['dbm']:.1f} dBm, +{pk['snr_db']:.1f} dB SNR)",
-            flush=True,
+        cand_msg = (
+            f"Candidate: {pk['freq_hz'] / 1e6:.4f} MHz "
+            f"({pk['dbm']:.1f} dBm, +{pk['snr_db']:.1f} dB SNR)"
         )
+        print(f"[scanner]     {cand_msg}", flush=True)
+        emit_system_event(cand_msg)
     return block_peaks
 
 
@@ -454,11 +476,12 @@ def phase1_sweep_band(centers, cfg):
         "==============================================================================================",
         flush=True,
     )
-    print(
-        f"[scanner] [PHASE 1: SWEEP] Starting high-resolution full-band hunt across "
-        f"{cfg['SCAN_START_MHZ']:.3f}-{cfg['SCAN_END_MHZ']:.3f} MHz (2 kHz step -> 25 kHz PTS grid)",
-        flush=True,
+    sweep_start_msg = (
+        f"[PHASE 1: SWEEP] Starting high-resolution full-band hunt across "
+        f"{cfg['SCAN_START_MHZ']:.3f}-{cfg['SCAN_END_MHZ']:.3f} MHz (2 kHz step -> 25 kHz PTS grid)"
     )
+    print(f"[scanner] {sweep_start_msg}", flush=True)
+    emit_system_event(sweep_start_msg)
     print(
         "==============================================================================================",
         flush=True,
@@ -536,11 +559,12 @@ def phase2_select_best_window(all_peaks, cfg):
             strikes = int(entry.get("strikes", 0))
             if expire_at > 0:
                 if now_ts < expire_at:
-                    print(
-                        f"[scanner] Ignoring blacklisted frequency {f_hz / 1e6:.4f} MHz "
-                        f"({entry.get('reason', 'Blacklisted')})",
-                        flush=True,
+                    ign_msg = (
+                        f"Ignoring blacklisted frequency {f_hz / 1e6:.4f} MHz "
+                        f"({entry.get('reason', 'Blacklisted')})"
                     )
+                    print(f"[scanner] {ign_msg}", flush=True)
+                    emit_system_event(ign_msg)
                     continue
                 else:
                     del blacklist[f_key]
@@ -636,6 +660,7 @@ def phase2_select_best_window(all_peaks, cfg):
         "---------+-----------------+----------------+--------------+----------+-----------------------",
         flush=True,
     )
+    win_parts = []
     for idx, pk in enumerate(best_window_peaks, start=1):
         f_hz = pk["freq_hz"]
         f_mhz = f_hz / 1e6
@@ -645,9 +670,14 @@ def phase2_select_best_window(all_peaks, cfg):
             f"+{pk['snr_db']:>4.1f} dB | {offset_khz:>+8.1f} kHz",
             flush=True,
         )
+        win_parts.append(f"#{idx} {f_mhz:.4f} MHz ({pk['dbm']:.1f} dBm, +{pk['snr_db']:.1f} dB SNR)")
     print(
         "==============================================================================================",
         flush=True,
+    )
+    emit_system_event(
+        f"[PHASE 2: TOP LIST] Winning 1.8 MHz Window (Center {center_hz / 1e6:.4f} MHz): "
+        + " | ".join(win_parts)
     )
 
     return center_hz, best_window_peaks
@@ -661,24 +691,6 @@ def stdout_reader_worker(proc, line_queue):
             line_queue.put(line)
     except Exception:
         pass
-
-
-def emit_system_event(human_text):
-    iso_ts = datetime.now(timezone.utc).isoformat()
-    event_obj = {
-        "time": iso_ts,
-        "timestamp": iso_ts,
-        "category": "SYSTEM",
-        "freq_mhz": "SYS",
-        "human_text": human_text,
-    }
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        with open("/app/logs/tetra_events.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(event_obj, ensure_ascii=False) + "\n")
-            f.flush()
-    except Exception as exc:
-        print(f"[scanner] Warning: failed writing system event: {exc}", flush=True)
 
 
 def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, active_frequencies=None):
@@ -792,6 +804,8 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                 print(clean_line, flush=True)
                 if any(tag in clean_line for tag in PAYLOAD_TAGS):
                     last_activity = time.time()
+                elif clean_line.startswith("[heartbeat]"):
+                    emit_system_event(clean_line)
             except queue.Empty:
                 pass
 
@@ -826,10 +840,9 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                     os.remove(FORCE_SWEEP_FLAG)
                 except OSError:
                     pass
-                print(
-                    "[scanner] Manual Force Sweep flag detected. Blacklisting current frequencies for 900s...",
-                    flush=True,
-                )
+                force_msg = "Manual Force Sweep flag detected. Blacklisting current frequencies for 900s..."
+                print(f"[scanner] {force_msg}", flush=True)
+                emit_system_event(force_msg)
                 if active_frequencies:
                     add_frequencies_to_blacklist(
                         active_frequencies,
@@ -855,10 +868,9 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                 break
 
             if is_scanner_mode and (time.time() - last_activity) > idle_timeout_sec:
-                print(
-                    "IDLE TIMEOUT REACHED - No active payload data. Restarting scan...",
-                    flush=True,
-                )
+                idle_msg = "IDLE TIMEOUT REACHED - No active payload data. Restarting scan..."
+                print(idle_msg, flush=True)
+                emit_system_event(idle_msg)
                 if active_frequencies:
                     add_frequencies_to_blacklist(
                         active_frequencies,
@@ -904,13 +916,14 @@ def main():
             centers = build_center_frequencies(
                 cfg["SCAN_START_MHZ"], cfg["SCAN_END_MHZ"]
             )
-            print(
-                f"[scanner] === Smart Auto-Tune Cycle #{cycle} | "
+            cycle_msg = (
+                f"=== Smart Auto-Tune Cycle #{cycle} | "
                 f"{cfg['SCAN_START_MHZ']:.1f}-{cfg['SCAN_END_MHZ']:.1f} MHz | "
                 f"GAIN={cfg['RTL_GAIN']} dB | IDLE_TIMEOUT={cfg['IDLE_TIMEOUT_SEC']}s | "
-                f"STRIKES={cfg['BLACKLIST_STRIKES']} ===",
-                flush=True,
+                f"STRIKES={cfg['BLACKLIST_STRIKES']} ==="
             )
+            print(f"[scanner] {cycle_msg}", flush=True)
+            emit_system_event(cycle_msg)
 
             all_peaks = phase1_sweep_band(centers, cfg)
             if not RUNNING:
@@ -921,10 +934,9 @@ def main():
             cfg = load_runtime_config()
             center_hz, best_peaks = phase2_select_best_window(all_peaks, cfg)
             if not best_peaks or center_hz is None:
-                print(
-                    "[scanner] No non-blacklisted TETRA carriers available. Retrying in 10s...",
-                    flush=True,
-                )
+                retry_msg = "No non-blacklisted TETRA carriers available. Retrying in 10s..."
+                print(f"[scanner] {retry_msg}", flush=True)
+                emit_system_event(retry_msg)
                 for _ in range(20):
                     if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
                         break
