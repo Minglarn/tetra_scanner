@@ -30,6 +30,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     ca-certificates \
     dos2unix \
+    sox \
+    libsox-fmt-all \
+    wget \
+    curl \
+    unzip \
+    patch \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --no-cache-dir \
@@ -40,13 +46,19 @@ RUN pip3 install --no-cache-dir \
     aiofiles
 
 RUN git clone https://gitlab.com/larryth/tetra-kit.git /opt/tetra-kit \
-    && cd /opt/tetra-kit/decoder \
-    && make
+    && cd /opt/tetra-kit \
+    && chmod +x build.sh \
+    && (./build.sh || true) \
+    && cd /opt/tetra-kit/decoder && make \
+    && (cd /opt/tetra-kit/recorder && make || true) \
+    && find /opt/tetra-kit -type f -name "cdecoder" -exec cp {} /usr/local/bin/cdecoder \; \
+    && find /opt/tetra-kit -type f -name "sdecoder" -exec cp {} /usr/local/bin/sdecoder \; \
+    && chmod +x /usr/local/bin/cdecoder /usr/local/bin/sdecoder 2>/dev/null || true
 
-RUN mkdir -p /app/src/templates /app/logs
+RUN mkdir -p /app/src/templates /app/logs /app/data/audio
 
-LABEL org.opencontainers.image.version="2026.11.04.11"
-ENV APP_VERSION=2026.11.04.11
+LABEL org.opencontainers.image.version="2026.11.04.12"
+ENV APP_VERSION=2026.11.04.12
 ENV APP_RELEASE_DATE=2026-11-04
 
 COPY src/tetra_multi_rtl.py /app/src/tetra_multi_rtl.py

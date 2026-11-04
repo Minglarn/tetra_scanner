@@ -8,6 +8,12 @@ import select
 import signal
 import struct
 import re
+import base64
+import zlib
+import wave
+import shutil
+import threading
+import subprocess
 from datetime import datetime, timezone
 
 try:
@@ -16,7 +22,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.11")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.12")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -50,6 +56,7 @@ UDP_OUT_INCLUDE_RAW = os.environ.get("UDP_OUT_INCLUDE_RAW", "false").lower() in 
 
 HOST_NAME = os.environ.get("HOST_NAME", "iridium")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
+AUDIO_DIR = os.environ.get("AUDIO_DIR", "/app/data/audio")
 LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 DISCOVERED_NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
 WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
@@ -836,6 +843,7 @@ def setup_mqtt():
 
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(AUDIO_DIR, exist_ok=True)
     channels = parse_channels(TETRA_CHANNELS_STR)
     udp_targets = parse_udp_targets(UDP_OUT_TARGETS_STR) if UDP_OUT_ENABLED else []
 
@@ -864,6 +872,9 @@ def main():
     pending_sds = {}
     dedup_cache = {}
     active_tx = {}
+    channel_call_context = {}
+    voice_buffers = {}
+    voice_lock = threading.Lock()
     unit_registry = {}
     seen_networks = load_seen_networks(DISCOVERED_NETWORKS_FILE)
     whitelist_data = load_json_dict(WHITELIST_FILE)
@@ -1212,6 +1223,193 @@ def main():
             entry = pending_sds.pop(k)
             build_and_emit_sds(entry["ch"], entry["pkt"], None)
 
+    def find_codec_binary(name):
+        candidates = [
+            f"/usr/local/bin/{name}",
+            f"/opt/tetra-kit/recorder/wav/{name}",
+            f"/opt/tetra-kit/codec/{name}",
+        ]
+        for path in candidates:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+        return shutil.which(name)
+
+    def decode_and_emit_voice(buf):
+        frames = buf.get("frames") or []
+        if not frames:
+            return
+
+        freq_mhz = buf.get("freq_mhz", "?.????")
+        la = buf.get("la")
+        tn = buf.get("tn")
+        ssi = buf.get("ssi")
+        gssi = buf.get("gssi")
+        ssi_label = str(ssi) if ssi is not None else (f"TN{tn}" if tn else "UNKNOWN")
+        safe_ssi = re.sub(r"[^A-Za-z0-9_-]", "", ssi_label) or "UNKNOWN"
+
+        now_ts = time.time()
+        ts_int = int(now_ts)
+        ts_ms = int(now_ts * 1000)
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        raw_chunks = []
+        for b64_str in frames:
+            try:
+                raw_b64 = base64.b64decode(b64_str)
+                try:
+                    unpacked = zlib.decompress(raw_b64)
+                except Exception:
+                    unpacked = raw_b64
+                if unpacked:
+                    raw_chunks.append(unpacked)
+            except Exception:
+                continue
+
+        if not raw_chunks:
+            return
+
+        out_bytes = b"".join(raw_chunks)
+        tmp_base = f"/tmp/voice_{ts_ms}_{safe_ssi}"
+        out_path = f"{tmp_base}.out"
+        cod_path = f"{tmp_base}.cod"
+        raw_path = f"{tmp_base}.raw"
+
+        wav_filename = f"voice_{ts_int}_{safe_ssi}.wav"
+        wav_path = os.path.join(AUDIO_DIR, wav_filename)
+
+        try:
+            os.makedirs(AUDIO_DIR, exist_ok=True)
+            with open(out_path, "wb") as f:
+                f.write(out_bytes)
+
+            cdecoder_bin = find_codec_binary("cdecoder")
+            sdecoder_bin = find_codec_binary("sdecoder")
+
+            if cdecoder_bin and sdecoder_bin:
+                subprocess.run(
+                    [cdecoder_bin, out_path, cod_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                    check=False,
+                )
+                if os.path.exists(cod_path) and os.path.getsize(cod_path) > 0:
+                    subprocess.run(
+                        [sdecoder_bin, cod_path, raw_path],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=20,
+                        check=False,
+                    )
+
+            sox_bin = shutil.which("sox")
+            if (
+                sox_bin
+                and os.path.exists(raw_path)
+                and os.path.getsize(raw_path) > 0
+            ):
+                subprocess.run(
+                    [
+                        sox_bin,
+                        "-r",
+                        "8k",
+                        "-e",
+                        "signed",
+                        "-b",
+                        "16",
+                        "-c",
+                        "1",
+                        raw_path,
+                        wav_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                    check=False,
+                )
+
+            if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+                pcm_source = (
+                    open(raw_path, "rb").read()
+                    if (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0)
+                    else out_bytes
+                )
+                if len(pcm_source) % 2 == 1:
+                    pcm_source += b"\x00"
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(8000)
+                    wf.writeframes(pcm_source)
+        except Exception as exc:
+            print(f"[parser] Voice WAV conversion error: {exc}", flush=True)
+            return
+        finally:
+            for p in (out_path, cod_path, raw_path):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
+            return
+
+        duration_s = round(
+            max(0.2, float(buf.get("last_seen", now_ts) - buf.get("first_seen", now_ts))),
+            1,
+        )
+        badge = format_unit_badge(ssi, unit_registry) if ssi is not None else ""
+        extra_parts = []
+        if gssi is not None:
+            extra_parts.append(f"Group {gssi}")
+        if tn is not None:
+            extra_parts.append(f"TN {tn}")
+        extra_parts.append(f"{duration_s}s")
+        extra_str = f" ({', '.join(extra_parts)})" if extra_parts else ""
+
+        human_text = f"Voice Call from SSI {ssi_label}{badge}{extra_str}"
+        audio_url = f"/api/audio/{wav_filename}"
+
+        voice_event = {
+            "time": now_iso,
+            "timestamp": now_iso,
+            "host": HOST_NAME,
+            "category": "VOICE",
+            "service": "UPLANE",
+            "pdu": "TCH_S",
+            "freq_mhz": freq_mhz,
+            "la": la,
+            "ssi": ssi,
+            "gssi": gssi,
+            "tn": tn,
+            "frame_count": len(frames),
+            "duration_s": duration_s,
+            "audio_url": audio_url,
+            "human_text": human_text,
+        }
+        emit_event(voice_event)
+
+    def flush_expired_voice_buffers(now_ts, force=False):
+        ready = []
+        with voice_lock:
+            for k, buf in list(voice_buffers.items()):
+                if force or (now_ts - buf["last_seen"] >= 2.0):
+                    ready.append(voice_buffers.pop(k))
+        for buf in ready:
+            decode_and_emit_voice(buf)
+
+    def voice_monitor_worker():
+        while running:
+            time.sleep(0.5)
+            try:
+                flush_expired_voice_buffers(time.time(), force=False)
+            except Exception:
+                pass
+
+    voice_thread = threading.Thread(target=voice_monitor_worker, daemon=True)
+    voice_thread.start()
+
     def emit_raw_mac_event(ch, pkt):
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -1244,6 +1442,65 @@ def main():
 
         service = str(get_ci(pkt, ["service"], "")).upper()
         pdu = str(get_ci(pkt, ["pdu"], "")).upper()
+        now_ts = time.time()
+
+        if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
+            enc_mode = to_int(
+                get_ci(pkt, ["encryption mode", "encryption_mode", "encrypted"]),
+                default=0,
+            )
+            frame_b64 = get_ci(pkt, ["frame"])
+            if enc_mode == 0 and isinstance(frame_b64, str) and frame_b64.strip():
+                tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
+                usage_marker = to_int(get_ci(pkt, ["usage marker", "usage_marker"]))
+                pkt_ssi = to_int(
+                    get_ci(
+                        pkt,
+                        [
+                            "ssi",
+                            "calling party ssi",
+                            "transmitting party ssi",
+                            "source ssi",
+                        ],
+                    )
+                )
+                ctx = None
+                if usage_marker is not None:
+                    ctx = channel_call_context.get((freq_str, usage_marker))
+                if not ctx:
+                    ctx = channel_call_context.get(freq_str)
+                if ctx and (now_ts - ctx.get("ts", 0) > 60.0):
+                    ctx = None
+
+                eff_ssi = pkt_ssi if pkt_ssi is not None else (ctx.get("ssi") if ctx else None)
+                eff_gssi = ctx.get("gssi") if ctx else None
+
+                buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or 1))
+                with voice_lock:
+                    buf = voice_buffers.get(buf_key)
+                    if buf is None:
+                        buf = {
+                            "freq_mhz": freq_str,
+                            "la": ch.get("la"),
+                            "tn": tn,
+                            "usage_marker": usage_marker,
+                            "ssi": eff_ssi,
+                            "gssi": eff_gssi,
+                            "frames": [],
+                            "first_seen": now_ts,
+                            "last_seen": now_ts,
+                        }
+                        voice_buffers[buf_key] = buf
+                    else:
+                        buf["last_seen"] = now_ts
+                        if buf.get("ssi") is None and eff_ssi is not None:
+                            buf["ssi"] = eff_ssi
+                        if buf.get("gssi") is None and eff_gssi is not None:
+                            buf["gssi"] = eff_gssi
+                    buf["frames"].append(frame_b64.strip())
+
+            emit_raw_mac_event(ch, pkt)
+            return
 
         if service == "UPLANE":
             emit_raw_mac_event(ch, pkt)
@@ -1252,7 +1509,6 @@ def main():
             emit_raw_mac_event(ch, pkt)
             return
 
-        now_ts = time.time()
         flush_expired_sds(now_ts)
 
         if pdu in NETWORK_PDUS:
@@ -1378,6 +1634,24 @@ def main():
                 gssi = None
 
             ssi = caller_ssi if caller_ssi is not None else mac_ssi
+
+            call_ctx_obj = {
+                "ssi": caller_ssi if caller_ssi is not None else ssi,
+                "gssi": gssi,
+                "call_id": call_id,
+                "usage_marker": usage_marker,
+                "ts": now_ts,
+            }
+            channel_call_context[freq_str] = call_ctx_obj
+            if usage_marker is not None:
+                channel_call_context[(freq_str, usage_marker)] = call_ctx_obj
+            with voice_lock:
+                for b_key, b_val in voice_buffers.items():
+                    if b_key[0] == freq_str:
+                        if b_val.get("ssi") is None and call_ctx_obj["ssi"] is not None:
+                            b_val["ssi"] = call_ctx_obj["ssi"]
+                        if b_val.get("gssi") is None and gssi is not None:
+                            b_val["gssi"] = gssi
 
             sig = (freq_str, pdu, ssi, gssi, call_id, tx_grant_code)
             if is_duplicate(sig, now_ts, ttl=1.2):
@@ -1555,6 +1829,7 @@ def main():
             last_heartbeat = now_ts
 
     flush_expired_sds(time.time(), force=True)
+    flush_expired_voice_buffers(time.time(), force=True)
     if whitelist_data:
         save_json_dict(WHITELIST_FILE, whitelist_data)
     if mqtt_client is not None:

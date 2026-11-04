@@ -258,6 +258,11 @@
             <span class="text-gray-400">Show Raw Data (TETRA System Noise)</span>
           </label>
 
+          <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-emerald-950/60 border border-emerald-700/70 px-2.5 py-1 rounded hover:border-emerald-500">
+            <input type="checkbox" id="autoplay-voice" checked class="accent-emerald-500 rounded" />
+            <span class="text-emerald-200">Auto-Play Voice</span>
+          </label>
+
           <span class="text-[11px] text-gray-500 uppercase tracking-wider">Order: Newest First</span>
         </div>
 
@@ -298,6 +303,7 @@
     const filterControlEl = document.getElementById("filter-control");
     const filterSystemEl = document.getElementById("filter-system");
     const filterRawMacEl = document.getElementById("filter-raw-mac");
+    const autoplayVoiceEl = document.getElementById("autoplay-voice");
     const searchInputEl = document.getElementById("search-input");
     const clearLogBtn = document.getElementById("clear-log-btn");
     const networksContainer = document.getElementById("networks-container");
@@ -309,6 +315,7 @@
     const clearBlacklistBtn = document.getElementById("clear-blacklist-btn");
 
     let totalEvents = 0;
+    let wsInitialLoadDone = false;
     const MAX_DOM_ROWS = 500;
 
     function setWsStatus(connected) {
@@ -343,6 +350,13 @@
             badge: "bg-emerald-950/80 text-emerald-300 border-emerald-700/70",
             rowBorder: "border-l-2 border-l-emerald-500",
             text: "text-emerald-200"
+          };
+        case "VOICE":
+          return {
+            badge: "bg-emerald-600 text-white border-emerald-400",
+            rowBorder: "border-l-4 border-l-emerald-400",
+            text: "text-emerald-100 font-bold",
+            rowBg: "bg-emerald-950/40 hover:bg-emerald-950/60 border-emerald-700/70 shadow-sm"
           };
         case "STATUS":
           return {
@@ -485,14 +499,29 @@
         freqBadge.textContent = la ? `${freqMhz} MHz (${la})` : `${freqMhz} MHz`;
       }
 
+      const contentCol = document.createElement("div");
+      contentCol.className = "flex-1 min-w-[200px]";
+
       const msgSpan = document.createElement("span");
-      msgSpan.className = `break-all flex-1 ${style.text}`;
+      msgSpan.className = `break-all block ${style.text}`;
       msgSpan.textContent = humanText;
+      contentCol.appendChild(msgSpan);
+
+      if (category === "VOICE" && ev.audio_url) {
+        const audioEl = document.createElement("audio");
+        audioEl.controls = true;
+        audioEl.src = ev.audio_url;
+        audioEl.className = "h-8 w-full mt-2";
+        if (autoplayVoiceEl && autoplayVoiceEl.checked && wsInitialLoadDone) {
+          audioEl.autoplay = true;
+        }
+        contentCol.appendChild(audioEl);
+      }
 
       row.appendChild(timeSpan);
       row.appendChild(catBadge);
       row.appendChild(freqBadge);
-      row.appendChild(msgSpan);
+      row.appendChild(contentCol);
 
       if (ev.gps_lat !== undefined && ev.gps_lat !== null && ev.gps_lon !== undefined && ev.gps_lon !== null) {
         const mapLink = document.createElement("a");
@@ -834,7 +863,11 @@
       const ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
+        wsInitialLoadDone = false;
         setWsStatus(true);
+        setTimeout(() => {
+          wsInitialLoadDone = true;
+        }, 1500);
       };
 
       ws.onmessage = (event) => {

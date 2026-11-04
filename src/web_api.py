@@ -8,11 +8,14 @@ from datetime import datetime, timezone
 import aiofiles
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.11")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.12")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
+AUDIO_DIR = os.environ.get("AUDIO_DIR", "/app/data/audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
 BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
@@ -27,6 +30,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 
 app = FastAPI(title="TETRA Scanner WebUI", version=APP_VERSION)
+app.mount("/api/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 
