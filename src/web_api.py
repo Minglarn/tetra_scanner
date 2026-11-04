@@ -10,12 +10,17 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.7")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.8")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
 BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
 WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
+RUNTIME_CONFIG_FILE = os.path.join(LOG_DIR, "runtime_config.json")
+
+RELOAD_CONFIG_FLAG = "/tmp/reload_config.flag"
+SOFT_CONFIG_FLAG = "/tmp/soft_config.flag"
+FORCE_SWEEP_FLAG = "/tmp/force_sweep.flag"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -24,16 +29,147 @@ app = FastAPI(title="TETRA Scanner WebUI", version=APP_VERSION)
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 
+def get_default_config():
+    def _clean(key, default):
+        raw = os.environ.get(key, str(default))
+        return str(raw).split("#", 1)[0].strip() or str(default)
+
+    return {
+        "RTL_DEVICE_INDEX": int(float(_clean("RTL_DEVICE_INDEX", 1))),
+        "RTL_GAIN": float(_clean("RTL_GAIN", 24.0)),
+        "RTL_PPM": int(float(_clean("RTL_PPM", 0))),
+        "MODE": _clean("MODE", "scanner").lower(),
+        "SCAN_START_MHZ": float(_clean("SCAN_START_MHZ", 420.0)),
+        "SCAN_END_MHZ": float(_clean("SCAN_END_MHZ", 430.0)),
+        "SCAN_DWELL_TIME": int(float(_clean("SCAN_DWELL_TIME", 120))),
+        "IDLE_TIMEOUT_SEC": int(float(_clean("IDLE_TIMEOUT_SEC", 900))),
+        "BLACKLIST_STRIKES": int(float(_clean("BLACKLIST_STRIKES", 3))),
+        "BLACKLIST_TIME_SEC": int(float(_clean("BLACKLIST_TIME_SEC", 3600))),
+        "CENTER_FREQ": int(float(_clean("CENTER_FREQ", 427750000))),
+        "TETRA_CHANNELS": _clean(
+            "TETRA_CHANNELS",
+            "427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7",
+        ),
+    }
+
+
+async def read_runtime_config():
+    cfg = get_default_config()
+    if os.path.exists(RUNTIME_CONFIG_FILE):
+        try:
+            async with aiofiles.open(
+                RUNTIME_CONFIG_FILE, mode="r", encoding="utf-8", errors="replace"
+            ) as f:
+                content = await f.read()
+                if content.strip():
+                    saved = json.loads(content)
+                    if isinstance(saved, dict):
+                        cfg.update(saved)
+        except Exception:
+            pass
+    return cfg
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    cfg = await read_runtime_config()
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
             "version": APP_VERSION,
-            "mode": os.environ.get("MODE", "static"),
+            "mode": cfg.get("MODE", "scanner"),
         },
     )
+
+
+@app.get("/api/config", response_class=JSONResponse)
+async def get_config():
+    cfg = await read_runtime_config()
+    return cfg
+
+
+@app.post("/api/config", response_class=JSONResponse)
+async def update_config(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
+
+    old_cfg = await read_runtime_config()
+    new_cfg = dict(old_cfg)
+
+    try:
+        if "RTL_DEVICE_INDEX" in body:
+            new_cfg["RTL_DEVICE_INDEX"] = int(body["RTL_DEVICE_INDEX"])
+        if "RTL_GAIN" in body:
+            new_cfg["RTL_GAIN"] = float(body["RTL_GAIN"])
+        if "RTL_PPM" in body:
+            new_cfg["RTL_PPM"] = int(body["RTL_PPM"])
+        if "MODE" in body:
+            m = str(body["MODE"]).strip().lower()
+            if m in ("scanner", "static"):
+                new_cfg["MODE"] = m
+        if "SCAN_START_MHZ" in body:
+            new_cfg["SCAN_START_MHZ"] = float(body["SCAN_START_MHZ"])
+        if "SCAN_END_MHZ" in body:
+            new_cfg["SCAN_END_MHZ"] = float(body["SCAN_END_MHZ"])
+        if new_cfg["SCAN_END_MHZ"] <= new_cfg["SCAN_START_MHZ"]:
+            new_cfg["SCAN_END_MHZ"] = new_cfg["SCAN_START_MHZ"] + 2.0
+        if "SCAN_DWELL_TIME" in body:
+            new_cfg["SCAN_DWELL_TIME"] = max(10, int(body["SCAN_DWELL_TIME"]))
+        if "IDLE_TIMEOUT_SEC" in body:
+            new_cfg["IDLE_TIMEOUT_SEC"] = max(15, int(body["IDLE_TIMEOUT_SEC"]))
+        if "BLACKLIST_STRIKES" in body:
+            new_cfg["BLACKLIST_STRIKES"] = max(1, int(body["BLACKLIST_STRIKES"]))
+        if "BLACKLIST_TIME_SEC" in body:
+            new_cfg["BLACKLIST_TIME_SEC"] = max(10, int(body["BLACKLIST_TIME_SEC"]))
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(
+            {"status": "error", "message": f"Invalid parameter value: {exc}"},
+            status_code=400,
+        )
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
+    async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+        await f.write(json.dumps(new_cfg, indent=2, sort_keys=True))
+    os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+
+    hard_keys = (
+        "RTL_DEVICE_INDEX",
+        "RTL_GAIN",
+        "RTL_PPM",
+        "MODE",
+        "SCAN_START_MHZ",
+        "SCAN_END_MHZ",
+    )
+    needs_pipeline_restart = bool(body.get("force_restart")) or any(
+        old_cfg.get(k) != new_cfg.get(k) for k in hard_keys
+    )
+
+    flag_to_touch = RELOAD_CONFIG_FLAG if needs_pipeline_restart else SOFT_CONFIG_FLAG
+    try:
+        async with aiofiles.open(flag_to_touch, mode="w", encoding="utf-8") as f:
+            await f.write(str(time.time()))
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "restarted_pipeline": needs_pipeline_restart,
+        "config": new_cfg,
+    }
+
+
+@app.post("/api/force-sweep", response_class=JSONResponse)
+async def trigger_force_sweep():
+    try:
+        async with aiofiles.open(FORCE_SWEEP_FLAG, mode="w", encoding="utf-8") as f:
+            await f.write(str(time.time()))
+    except Exception:
+        pass
+    return {"status": "ok", "message": "Force sweep triggered"}
 
 
 @app.get("/api/networks", response_class=JSONResponse)

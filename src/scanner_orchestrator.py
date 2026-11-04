@@ -14,7 +14,7 @@ import statistics
 
 def parse_env_int(key, default):
     raw = os.environ.get(key, str(default))
-    clean = raw.split("#", 1)[0].strip()
+    clean = str(raw).split("#", 1)[0].strip()
     try:
         return int(float(clean))
     except ValueError:
@@ -23,31 +23,28 @@ def parse_env_int(key, default):
 
 def parse_env_float(key, default):
     raw = os.environ.get(key, str(default))
-    clean = raw.split("#", 1)[0].strip()
+    clean = str(raw).split("#", 1)[0].strip()
     try:
         return float(clean)
     except ValueError:
         return float(default)
 
 
-SCAN_START_MHZ = parse_env_float("SCAN_START_MHZ", 420.0)
-SCAN_END_MHZ = parse_env_float("SCAN_END_MHZ", 430.0)
-IDLE_TIMEOUT_SEC = parse_env_int(
-    "IDLE_TIMEOUT_SEC", parse_env_int("SCAN_DWELL_TIME", 900)
-)
-BLACKLIST_STRIKES = max(1, parse_env_int("BLACKLIST_STRIKES", 3))
-BLACKLIST_TIME_SEC = parse_env_int("BLACKLIST_TIME_SEC", 3600)
-FORCE_SWEEP_PENALTY_SEC = 900
+def parse_env_str(key, default):
+    raw = os.environ.get(key, str(default))
+    return str(raw).split("#", 1)[0].strip() or str(default)
+
 
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
 WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
+RUNTIME_CONFIG_FILE = os.path.join(LOG_DIR, "runtime_config.json")
+
 FORCE_SWEEP_FLAG = "/tmp/force_sweep.flag"
+RELOAD_CONFIG_FLAG = "/tmp/reload_config.flag"
+SOFT_CONFIG_FLAG = "/tmp/soft_config.flag"
 
-RTL_DEVICE_INDEX = parse_env_int("RTL_DEVICE_INDEX", 1)
-RTL_GAIN = parse_env_float("RTL_GAIN", 24.0)
-RTL_PPM = parse_env_int("RTL_PPM", 0)
-
+FORCE_SWEEP_PENALTY_SEC = 900
 MAX_PEAKS = 6
 PTS_GRID_HZ = 25000
 MIN_PEAK_SEPARATION_HZ = 25000
@@ -62,6 +59,69 @@ PAYLOAD_TAGS = ("[SDS]", "[CALL]", "[STATUS]", "[ROAMING]")
 
 ACTIVE_PROCS = []
 RUNNING = True
+
+
+def get_default_config():
+    return {
+        "RTL_DEVICE_INDEX": parse_env_int("RTL_DEVICE_INDEX", 1),
+        "RTL_GAIN": parse_env_float("RTL_GAIN", 24.0),
+        "RTL_PPM": parse_env_int("RTL_PPM", 0),
+        "MODE": parse_env_str("MODE", "scanner").lower(),
+        "SCAN_START_MHZ": parse_env_float("SCAN_START_MHZ", 420.0),
+        "SCAN_END_MHZ": parse_env_float("SCAN_END_MHZ", 430.0),
+        "SCAN_DWELL_TIME": parse_env_int("SCAN_DWELL_TIME", 120),
+        "IDLE_TIMEOUT_SEC": parse_env_int(
+            "IDLE_TIMEOUT_SEC", parse_env_int("SCAN_DWELL_TIME", 900)
+        ),
+        "BLACKLIST_STRIKES": max(1, parse_env_int("BLACKLIST_STRIKES", 3)),
+        "BLACKLIST_TIME_SEC": parse_env_int("BLACKLIST_TIME_SEC", 3600),
+        "CENTER_FREQ": parse_env_int("CENTER_FREQ", 427750000),
+        "TETRA_CHANNELS": parse_env_str(
+            "TETRA_CHANNELS",
+            "427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7",
+        ),
+    }
+
+
+def load_runtime_config():
+    cfg = get_default_config()
+    if os.path.exists(RUNTIME_CONFIG_FILE):
+        try:
+            with open(RUNTIME_CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, dict):
+                    cfg.update(saved)
+        except Exception as exc:
+            print(f"[scanner] Warning: failed reading {RUNTIME_CONFIG_FILE}: {exc}", flush=True)
+    else:
+        save_runtime_config(cfg)
+
+    cfg["RTL_DEVICE_INDEX"] = int(cfg.get("RTL_DEVICE_INDEX", 1))
+    cfg["RTL_GAIN"] = float(cfg.get("RTL_GAIN", 24.0))
+    cfg["RTL_PPM"] = int(cfg.get("RTL_PPM", 0))
+    cfg["MODE"] = str(cfg.get("MODE", "scanner")).strip().lower()
+    if cfg["MODE"] not in ("scanner", "static"):
+        cfg["MODE"] = "scanner"
+    cfg["SCAN_START_MHZ"] = float(cfg.get("SCAN_START_MHZ", 420.0))
+    cfg["SCAN_END_MHZ"] = float(cfg.get("SCAN_END_MHZ", 430.0))
+    if cfg["SCAN_END_MHZ"] <= cfg["SCAN_START_MHZ"]:
+        cfg["SCAN_END_MHZ"] = cfg["SCAN_START_MHZ"] + 2.0
+    cfg["SCAN_DWELL_TIME"] = max(10, int(cfg.get("SCAN_DWELL_TIME", 120)))
+    cfg["IDLE_TIMEOUT_SEC"] = max(15, int(cfg.get("IDLE_TIMEOUT_SEC", 900)))
+    cfg["BLACKLIST_STRIKES"] = max(1, int(cfg.get("BLACKLIST_STRIKES", 3)))
+    cfg["BLACKLIST_TIME_SEC"] = max(10, int(cfg.get("BLACKLIST_TIME_SEC", 3600)))
+    return cfg
+
+
+def save_runtime_config(cfg):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+    except Exception as exc:
+        print(f"[scanner] Warning: failed saving {RUNTIME_CONFIG_FILE}: {exc}", flush=True)
 
 
 def load_blacklist():
@@ -101,7 +161,9 @@ def load_whitelist():
     return {}
 
 
-def add_frequencies_to_blacklist(freq_list_hz, duration_sec, reason, immediate=False):
+def add_frequencies_to_blacklist(
+    freq_list_hz, duration_sec, max_strikes, reason, immediate=False
+):
     bl = load_blacklist()
     wl = load_whitelist()
     now_ts = time.time()
@@ -123,35 +185,35 @@ def add_frequencies_to_blacklist(freq_list_hz, duration_sec, reason, immediate=F
             prev_strikes = int(prev_entry.get("strikes", 0))
 
         if immediate:
-            strikes = BLACKLIST_STRIKES
+            strikes = max_strikes
         else:
             strikes = prev_strikes + 1
 
-        if strikes >= BLACKLIST_STRIKES:
+        if strikes >= max_strikes:
             expire_at = round(now_ts + float(duration_sec), 2)
             bl[key] = {
                 "strikes": strikes,
-                "max_strikes": BLACKLIST_STRIKES,
+                "max_strikes": max_strikes,
                 "expire_at": expire_at,
                 "last_strike_at": round(now_ts, 2),
-                "reason": f"{reason} ({strikes}/{BLACKLIST_STRIKES})",
+                "reason": f"{reason} ({strikes}/{max_strikes})",
             }
             print(
                 f"[scanner] Blacklisted {int(f_hz) / 1e6:.4f} MHz for {duration_sec}s "
-                f"(Strike {strikes}/{BLACKLIST_STRIKES} - {reason})",
+                f"(Strike {strikes}/{max_strikes} - {reason})",
                 flush=True,
             )
         else:
             bl[key] = {
                 "strikes": strikes,
-                "max_strikes": BLACKLIST_STRIKES,
+                "max_strikes": max_strikes,
                 "expire_at": 0,
                 "last_strike_at": round(now_ts, 2),
-                "reason": f"Warning {strikes}/{BLACKLIST_STRIKES} ({reason})",
+                "reason": f"Warning {strikes}/{max_strikes} ({reason})",
             }
             print(
                 f"[scanner] Frequency {int(f_hz) / 1e6:.4f} MHz quiet: recorded Strike "
-                f"{strikes}/{BLACKLIST_STRIKES} (not blacklisted yet)",
+                f"{strikes}/{max_strikes} (not blacklisted yet)",
                 flush=True,
             )
 
@@ -216,7 +278,7 @@ def build_center_frequencies(start_mhz, end_mhz):
     return centers
 
 
-def run_rtl_power_sweep(center_mhz, start_hz, end_hz):
+def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
     csv_label = f"{center_mhz:g}"
     csv_path = f"/tmp/scan_{csv_label}.csv"
     try:
@@ -228,13 +290,13 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz):
     cmd = [
         "rtl_power",
         "-d",
-        str(RTL_DEVICE_INDEX),
+        str(cfg["RTL_DEVICE_INDEX"]),
         "-f",
         f"{start_hz}:{end_hz}:2k",
         "-g",
-        str(RTL_GAIN),
+        str(cfg["RTL_GAIN"]),
         "-p",
-        str(RTL_PPM),
+        str(cfg["RTL_PPM"]),
         "-i",
         "10",
         "-1",
@@ -242,7 +304,7 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz):
     ]
     print(
         f"[scanner] [PHASE 1: SWEEP] Scanning {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz "
-        f"(center {center_mhz:.3f} MHz, 2k step, 10s integration) -> {csv_path}",
+        f"(center {center_mhz:.3f} MHz, gain={cfg['RTL_GAIN']} dB, 2k step, 10s) -> {csv_path}",
         flush=True,
     )
     try:
@@ -385,14 +447,14 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
     return block_peaks
 
 
-def phase1_sweep_band(centers):
+def phase1_sweep_band(centers, cfg):
     print(
         "==============================================================================================",
         flush=True,
     )
     print(
         f"[scanner] [PHASE 1: SWEEP] Starting high-resolution full-band hunt across "
-        f"{SCAN_START_MHZ:.3f}-{SCAN_END_MHZ:.3f} MHz (2 kHz step -> 25 kHz PTS grid)",
+        f"{cfg['SCAN_START_MHZ']:.3f}-{cfg['SCAN_END_MHZ']:.3f} MHz (2 kHz step -> 25 kHz PTS grid)",
         flush=True,
     )
     print(
@@ -404,11 +466,15 @@ def phase1_sweep_band(centers):
     for center_mhz in centers:
         if not RUNNING:
             break
+        if os.path.exists(RELOAD_CONFIG_FLAG):
+            print("[scanner] Config change detected during sweep, restarting cycle...", flush=True)
+            break
+
         center_hz = int(round(center_mhz * 1_000_000))
         start_hz = int(round((center_mhz - 1.0) * 1_000_000))
         end_hz = int(round((center_mhz + 1.0) * 1_000_000))
 
-        csv_path = run_rtl_power_sweep(center_mhz, start_hz, end_hz)
+        csv_path = run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg)
         if not csv_path or not RUNNING:
             time.sleep(0.5)
             continue
@@ -424,7 +490,7 @@ def phase1_sweep_band(centers):
     return all_peaks
 
 
-def phase2_select_best_window(all_peaks):
+def phase2_select_best_window(all_peaks, cfg):
     whitelist = load_whitelist()
     blacklist = load_blacklist()
     now_ts = time.time()
@@ -432,8 +498,8 @@ def phase2_select_best_window(all_peaks):
 
     peaks_by_hz = {int(p["freq_hz"]): dict(p) for p in (all_peaks or [])}
 
-    start_limit_hz = int(round(SCAN_START_MHZ * 1_000_000))
-    end_limit_hz = int(round(SCAN_END_MHZ * 1_000_000))
+    start_limit_hz = int(round(cfg["SCAN_START_MHZ"] * 1_000_000))
+    end_limit_hz = int(round(cfg["SCAN_END_MHZ"] * 1_000_000))
 
     for wl_key, wl_info in whitelist.items():
         try:
@@ -487,10 +553,8 @@ def phase2_select_best_window(all_peaks):
     if not filtered_peaks:
         return None, []
 
-    # 1. Sort all non-blacklisted candidate frequencies in ascending order
     sorted_by_freq = sorted(filtered_peaks, key=lambda x: x["freq_hz"])
 
-    # Deduplicate/enforce 25 kHz minimum spacing across the sorted list (keep strongest at each step)
     unique_sorted = []
     for cand in sorted_by_freq:
         if not unique_sorted:
@@ -503,7 +567,6 @@ def phase2_select_best_window(all_peaks):
         else:
             unique_sorted.append(cand)
 
-    # 2. Sliding Window (max_bandwidth = 1.8 MHz = 1,800,000 Hz)
     max_bandwidth_hz = MAX_WINDOW_SPAN_HZ
     best_window_peaks = []
     best_score = (-1, -1e9, -1e9)
@@ -512,14 +575,12 @@ def phase2_select_best_window(all_peaks):
         freq_a = freq_a_obj["freq_hz"]
         window_limit = freq_a + max_bandwidth_hz
 
-        # All frequencies within [freq_a, freq_a + 1.8 MHz]
         in_window = [
             p for p in unique_sorted if freq_a <= p["freq_hz"] <= window_limit
         ]
         if not in_window:
             continue
 
-        # If a 1.8 MHz cluster has more than 6 carriers, pick the 6 with highest SNR/dBm
         if len(in_window) > MAX_PEAKS:
             in_window_strongest = sorted(
                 in_window,
@@ -534,8 +595,6 @@ def phase2_select_best_window(all_peaks):
         total_snr = round(sum(p["snr_db"] for p in selected), 2)
         total_dbm = round(sum(p["dbm"] for p in selected), 2)
 
-        # Primary: highest channel count (density)
-        # Secondary (tie-breaker): highest total SNR sum, then highest total dBm sum
         score = (density, total_snr, total_dbm)
         if score > best_score:
             best_score = score
@@ -560,7 +619,7 @@ def phase2_select_best_window(all_peaks):
         flush=True,
     )
     print(
-        "  [PHASE 2: TOP LIST] WINNING 2 MHz TETRA WINDOW",
+        "  [PHASE 2: TOP LIST] WINNING 2 MHz TETRA WINDOW (Sliding Window 1.8 MHz)",
         flush=True,
     )
     print(
@@ -602,36 +661,42 @@ def stdout_reader_worker(proc, line_queue):
         pass
 
 
-def phase3_monitor_channels(center_hz, selected_peaks):
+def run_receiver_pipeline(center_hz, channels_str, cfg, is_scanner_mode=True, active_frequencies=None):
     global ACTIVE_PROCS, RUNNING
 
-    active_frequencies = [int(pk["freq_hz"]) for pk in selected_peaks]
-    channels_list = [
-        f"{pk['freq_hz']}:{idx}"
-        for idx, pk in enumerate(selected_peaks, start=1)
-    ]
-    channels_str = ",".join(channels_list)
-
+    os.environ["RTL_DEVICE_INDEX"] = str(cfg["RTL_DEVICE_INDEX"])
+    os.environ["RTL_GAIN"] = str(cfg["RTL_GAIN"])
+    os.environ["RTL_PPM"] = str(cfg["RTL_PPM"])
     os.environ["CENTER_FREQ"] = str(center_hz)
     os.environ["TETRA_CHANNELS"] = channels_str
     child_env = os.environ.copy()
 
+    raw_chans = [c.strip() for c in channels_str.split(",") if c.strip()]
+    num_channels = len(raw_chans)
+
+    idle_timeout_sec = cfg["IDLE_TIMEOUT_SEC"]
+    blacklist_strikes = cfg["BLACKLIST_STRIKES"]
+    blacklist_time_sec = cfg["BLACKLIST_TIME_SEC"]
+
+    mode_tag = "PHASE 3: MONITOR" if is_scanner_mode else "STATIC MODE"
     print(
-        f"[scanner] [PHASE 3: MONITOR] Tuning CENTER_FREQ={center_hz / 1e6:.4f} MHz ({center_hz} Hz)",
+        f"[scanner] [{mode_tag}] Tuning CENTER_FREQ={center_hz / 1e6:.4f} MHz ({center_hz} Hz) | "
+        f"Gain={cfg['RTL_GAIN']} dB | PPM={cfg['RTL_PPM']}",
         flush=True,
     )
     print(
-        f"[scanner] [PHASE 3: MONITOR] Active TETRA_CHANNELS={channels_str}",
+        f"[scanner] [{mode_tag}] Active TETRA_CHANNELS={channels_str}",
         flush=True,
     )
-    print(
-        f"[scanner] [PHASE 3: MONITOR] Idle payload timeout set to {IDLE_TIMEOUT_SEC}s "
-        f"(blacklist penalty={BLACKLIST_TIME_SEC}s)",
-        flush=True,
-    )
+    if is_scanner_mode:
+        print(
+            f"[scanner] [{mode_tag}] Idle timeout={idle_timeout_sec}s | "
+            f"Strikes={blacklist_strikes} | Blacklist penalty={blacklist_time_sec}s",
+            flush=True,
+        )
 
     try:
-        for idx, _ in enumerate(selected_peaks, start=1):
+        for idx in range(1, num_channels + 1):
             rx_port = 42000 + idx
             tx_port = 42100 + idx
             dec_proc = subprocess.Popen(
@@ -684,7 +749,33 @@ def phase3_monitor_channels(center_hz, selected_peaks):
             except queue.Empty:
                 pass
 
-            if os.path.exists(FORCE_SWEEP_FLAG):
+            if os.path.exists(SOFT_CONFIG_FLAG):
+                try:
+                    os.remove(SOFT_CONFIG_FLAG)
+                except OSError:
+                    pass
+                new_cfg = load_runtime_config()
+                idle_timeout_sec = new_cfg["IDLE_TIMEOUT_SEC"]
+                blacklist_strikes = new_cfg["BLACKLIST_STRIKES"]
+                blacklist_time_sec = new_cfg["BLACKLIST_TIME_SEC"]
+                print(
+                    f"[scanner] Hot-reloaded parameters: IDLE_TIMEOUT_SEC={idle_timeout_sec}s, "
+                    f"BLACKLIST_STRIKES={blacklist_strikes}, BLACKLIST_TIME_SEC={blacklist_time_sec}s",
+                    flush=True,
+                )
+
+            if os.path.exists(RELOAD_CONFIG_FLAG):
+                try:
+                    os.remove(RELOAD_CONFIG_FLAG)
+                except OSError:
+                    pass
+                print(
+                    "[scanner] Hot-reloading receiver pipeline with updated WebUI settings...",
+                    flush=True,
+                )
+                break
+
+            if is_scanner_mode and os.path.exists(FORCE_SWEEP_FLAG):
                 try:
                     os.remove(FORCE_SWEEP_FLAG)
                 except OSError:
@@ -693,36 +784,43 @@ def phase3_monitor_channels(center_hz, selected_peaks):
                     "[scanner] Manual Force Sweep flag detected. Blacklisting current frequencies for 900s...",
                     flush=True,
                 )
-                add_frequencies_to_blacklist(
-                    active_frequencies,
-                    FORCE_SWEEP_PENALTY_SEC,
-                    "Manual Force",
-                    immediate=True,
-                )
+                if active_frequencies:
+                    add_frequencies_to_blacklist(
+                        active_frequencies,
+                        FORCE_SWEEP_PENALTY_SEC,
+                        blacklist_strikes,
+                        "Manual Force",
+                        immediate=True,
+                    )
                 break
 
             if gr_proc.poll() is not None:
                 print(
-                    "[scanner] Warning: tetra_multi_rtl.py exited unexpectedly. Restarting scan...",
+                    "[scanner] Warning: tetra_multi_rtl.py exited unexpectedly. Restarting pipeline...",
                     flush=True,
                 )
                 break
 
             if parser_proc.poll() is not None and line_queue.empty():
                 print(
-                    "[scanner] Warning: tetra_parser.py exited unexpectedly. Restarting scan...",
+                    "[scanner] Warning: tetra_parser.py exited unexpectedly. Restarting pipeline...",
                     flush=True,
                 )
                 break
 
-            if (time.time() - last_activity) > IDLE_TIMEOUT_SEC:
+            if is_scanner_mode and (time.time() - last_activity) > idle_timeout_sec:
                 print(
                     "IDLE TIMEOUT REACHED - No active payload data. Restarting scan...",
                     flush=True,
                 )
-                add_frequencies_to_blacklist(
-                    active_frequencies, BLACKLIST_TIME_SEC, "Idle Timeout"
-                )
+                if active_frequencies:
+                    add_frequencies_to_blacklist(
+                        active_frequencies,
+                        blacklist_time_sec,
+                        blacklist_strikes,
+                        "Idle Timeout",
+                        immediate=False,
+                    )
                 break
     finally:
         terminate_children()
@@ -730,41 +828,82 @@ def phase3_monitor_channels(center_hz, selected_peaks):
 
 
 def main():
-    centers = build_center_frequencies(SCAN_START_MHZ, SCAN_END_MHZ)
-    print(
-        f"[scanner] Smart Auto-Tune Scanner initialized: "
-        f"{SCAN_START_MHZ:.1f}-{SCAN_END_MHZ:.1f} MHz | "
-        f"2 MHz centers={[round(c, 3) for c in centers]} | "
-        f"IDLE_TIMEOUT_SEC={IDLE_TIMEOUT_SEC}s | BLACKLIST_TIME_SEC={BLACKLIST_TIME_SEC}s",
-        flush=True,
-    )
-
     cycle = 1
     try:
         while RUNNING:
-            print(f"[scanner] === Smart Auto-Tune Cycle #{cycle} ===", flush=True)
-            all_peaks = phase1_sweep_band(centers)
+            for flag_path in (RELOAD_CONFIG_FLAG, SOFT_CONFIG_FLAG):
+                if os.path.exists(flag_path):
+                    try:
+                        os.remove(flag_path)
+                    except OSError:
+                        pass
+
+            cfg = load_runtime_config()
+            mode = cfg["MODE"]
+
+            if mode == "static":
+                print(
+                    f"[scanner] === Running in STATIC Mode (CENTER_FREQ={cfg['CENTER_FREQ']} Hz, "
+                    f"GAIN={cfg['RTL_GAIN']} dB, PPM={cfg['RTL_PPM']}) ===",
+                    flush=True,
+                )
+                run_receiver_pipeline(
+                    center_hz=cfg["CENTER_FREQ"],
+                    channels_str=cfg["TETRA_CHANNELS"],
+                    cfg=cfg,
+                    is_scanner_mode=False,
+                )
+                continue
+
+            centers = build_center_frequencies(
+                cfg["SCAN_START_MHZ"], cfg["SCAN_END_MHZ"]
+            )
+            print(
+                f"[scanner] === Smart Auto-Tune Cycle #{cycle} | "
+                f"{cfg['SCAN_START_MHZ']:.1f}-{cfg['SCAN_END_MHZ']:.1f} MHz | "
+                f"GAIN={cfg['RTL_GAIN']} dB | IDLE_TIMEOUT={cfg['IDLE_TIMEOUT_SEC']}s | "
+                f"STRIKES={cfg['BLACKLIST_STRIKES']} ===",
+                flush=True,
+            )
+
+            all_peaks = phase1_sweep_band(centers, cfg)
             if not RUNNING:
                 break
+            if os.path.exists(RELOAD_CONFIG_FLAG):
+                continue
 
-            center_hz, best_peaks = phase2_select_best_window(all_peaks)
+            cfg = load_runtime_config()
+            center_hz, best_peaks = phase2_select_best_window(all_peaks, cfg)
             if not best_peaks or center_hz is None:
                 print(
                     "[scanner] No non-blacklisted TETRA carriers available. Retrying in 10s...",
                     flush=True,
                 )
                 for _ in range(20):
-                    if not RUNNING:
+                    if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
                         break
                     time.sleep(0.5)
                 cycle += 1
                 continue
 
-            phase3_monitor_channels(center_hz, best_peaks)
+            active_frequencies = [int(pk["freq_hz"]) for pk in best_peaks]
+            channels_list = [
+                f"{pk['freq_hz']}:{idx}"
+                for idx, pk in enumerate(best_peaks, start=1)
+            ]
+            channels_str = ",".join(channels_list)
+
+            run_receiver_pipeline(
+                center_hz=center_hz,
+                channels_str=channels_str,
+                cfg=cfg,
+                is_scanner_mode=True,
+                active_frequencies=active_frequencies,
+            )
             cycle += 1
     finally:
         terminate_children()
-        print("[scanner] Smart Auto-Tune Scanner stopped cleanly.", flush=True)
+        print("[scanner] Orchestrator stopped cleanly.", flush=True)
 
 
 if __name__ == "__main__":
