@@ -62,9 +62,10 @@ RUN git clone https://gitlab.com/larryth/tetra-kit.git /opt/tetra-kit \
 RUN mkdir -p /app/src/templates /app/logs/audio /app/data \
     && ln -sfn /app/logs/audio /app/data/audio
 
-LABEL org.opencontainers.image.version="2026.11.04.31"
-ENV APP_VERSION=2026.11.04.31
+LABEL org.opencontainers.image.version="2026.11.04.32"
+ENV APP_VERSION=2026.11.04.32
 ENV APP_RELEASE_DATE=2026-11-04
+ENV PYTHONPATH=/app:/app/src
 
 COPY src/db.py /app/src/db.py
 COPY src/tetra_multi_rtl.py /app/src/tetra_multi_rtl.py

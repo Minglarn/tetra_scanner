@@ -16,6 +16,10 @@ import logging
 import threading
 import subprocess
 from datetime import datetime, timezone
+
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
 import db
 
 logging.basicConfig(
@@ -30,7 +34,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.31")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.32")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",

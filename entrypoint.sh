@@ -3,9 +3,10 @@ set -e
 
 MODE="${MODE:-static}"
 WEB_PORT="${WEB_PORT:-8080}"
-VERSION="${APP_VERSION:-2026.11.04.31}"
+VERSION="${APP_VERSION:-2026.11.04.32}"
 RELEASE_DATE="${APP_RELEASE_DATE:-2026-11-04}"
 LOG_DIR="${LOG_DIR:-/app/logs}"
+export PYTHONPATH="/app:/app/src:${PYTHONPATH:-}"
 
 mkdir -p "${LOG_DIR}"
 ENV_CHECKSUM_FILE="${LOG_DIR}/.env_checksum"
