@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.10")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.11")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
@@ -343,18 +343,21 @@ async def get_whitelist():
 async def read_recent_lines(filepath: str, max_lines: int = 100):
     if not os.path.exists(filepath):
         return []
-    buf = deque(maxlen=max_lines)
+    important_buf = deque(maxlen=max_lines)
     try:
         async with aiofiles.open(
             filepath, mode="r", encoding="utf-8", errors="replace"
         ) as f:
             async for line in f:
                 s = line.strip()
-                if s:
-                    buf.append(s)
+                if not s:
+                    continue
+                if '"category": "RAW_MAC"' in s or '"category":"RAW_MAC"' in s:
+                    continue
+                important_buf.append(s)
     except Exception:
         return []
-    return list(buf)
+    return list(important_buf)
 
 
 @app.websocket("/ws/events")

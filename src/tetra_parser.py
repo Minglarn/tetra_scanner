@@ -16,7 +16,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.10")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.11")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1212,6 +1212,32 @@ def main():
             entry = pending_sds.pop(k)
             build_and_emit_sds(entry["ch"], entry["pkt"], None)
 
+    def emit_raw_mac_event(ch, pkt):
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            pdu_val = str(get_ci(pkt, ["pdu", "type", "burst"], "UNKNOWN") or "UNKNOWN").upper()
+            srv_val = str(get_ci(pkt, ["service", "layer"], "MAC") or "MAC").upper()
+            raw_dump = json.dumps(pkt, ensure_ascii=False, sort_keys=True)
+            if len(raw_dump) > 600:
+                raw_dump = raw_dump[:600] + "..."
+            human_text = f"PDU: {pdu_val} | Service: {srv_val} | Data: {raw_dump}"
+            raw_event = {
+                "time": now_iso,
+                "timestamp": now_iso,
+                "host": HOST_NAME,
+                "category": "RAW_MAC",
+                "pdu": pdu_val,
+                "service": srv_val,
+                "freq_mhz": ch.get("freq_mhz", "?.????"),
+                "la": ch.get("la"),
+                "human_text": human_text,
+            }
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(raw_event, ensure_ascii=False) + "\n")
+                f.flush()
+        except Exception:
+            pass
+
     def process_packet(ch, pkt):
         freq_str = ch["freq_mhz"]
         stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
@@ -1220,8 +1246,10 @@ def main():
         pdu = str(get_ci(pkt, ["pdu"], "")).upper()
 
         if service == "UPLANE":
+            emit_raw_mac_event(ch, pkt)
             return
         if pdu in IGNORED_PDUS:
+            emit_raw_mac_event(ch, pkt)
             return
 
         now_ts = time.time()
@@ -1229,6 +1257,7 @@ def main():
 
         if pdu in NETWORK_PDUS:
             handle_network_discovery(ch, pkt, pdu, now_ts)
+            emit_raw_mac_event(ch, pkt)
             return
 
         mac_ssi = to_int(get_ci(pkt, ["ssi"]))
@@ -1471,27 +1500,7 @@ def main():
             emit_event(event, raw_pkt=pkt)
             return
 
-        ssi = caller_ssi if caller_ssi is not None else mac_ssi
-        sig = (freq_str, service, pdu, ssi)
-        if is_duplicate(sig, now_ts, ttl=1.2):
-            return
-
-        badge = format_unit_badge(ssi, unit_registry)
-        human_text = f"{service} {pdu} on LA {ch['la']} (SSI {ssi}{badge})"
-        event = {
-            "timestamp": now_iso,
-            "host": HOST_NAME,
-            "category": "OTHER",
-            "service": service,
-            "pdu": pdu,
-            "freq_mhz": freq_str,
-            "la": ch["la"],
-            "ssi": ssi,
-            "ssi_type": classify_ssi(ssi),
-            "unit_context": get_unit_context(ssi),
-            "human_text": human_text,
-        }
-        emit_event(event, raw_pkt=pkt)
+        emit_raw_mac_event(ch, pkt)
 
     while running:
         readable, _, _ = select.select(rx_sockets, [], [], 0.5)
