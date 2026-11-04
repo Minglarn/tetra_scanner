@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.15")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.16")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -65,6 +65,7 @@ HOST_NAME = os.environ.get("HOST_NAME", "iridium")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 MIN_VOICE_FRAMES = int(os.environ.get("MIN_VOICE_FRAMES", "6"))
+MIN_AUDIO_DURATION_SEC = float(os.environ.get("MIN_AUDIO_DURATION_SEC", "1.2"))
 VOICE_SPLIT_TIMEOUT_S = float(os.environ.get("VOICE_SPLIT_TIMEOUT_S", "1.5"))
 MAX_AUDIO_FILES = int(os.environ.get("MAX_AUDIO_FILES", "500"))
 LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
@@ -1586,11 +1587,16 @@ def main():
         freq_mhz = buf.get("freq_mhz", "?.????")
         la = buf.get("la")
         tn = buf.get("tn")
-        ssi = buf.get("ssi")
-        if ssi == 16777215:
+        ssi = to_int(buf.get("ssi"))
+        if ssi in (0, 16777215):
             ssi = None
-        gssi = buf.get("gssi")
-        ssi_label = str(ssi) if ssi is not None else (f"TN{tn}" if tn else "UNKNOWN")
+        gssi = to_int(buf.get("gssi"))
+        if gssi in (0, 16777215):
+            gssi = None
+        if ssi is None and gssi is None:
+            return
+
+        ssi_label = str(ssi) if ssi is not None else str(gssi)
         safe_ssi = re.sub(r"[^A-Za-z0-9_-]", "", ssi_label) or "UNKNOWN"
 
         now_ts = time.time()
@@ -1700,6 +1706,10 @@ def main():
                 pcm_source = rf.read()
 
             pcm_bytes_len = len(pcm_source)
+            actual_duration_s = pcm_bytes_len / 16000.0
+            if actual_duration_s < MIN_AUDIO_DURATION_SEC:
+                return
+
             if pcm_bytes_len % 2 == 1:
                 pcm_source += b"\x00"
 
@@ -1719,7 +1729,13 @@ def main():
                 except OSError:
                     pass
 
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1004:
+        min_wav_bytes = int(MIN_AUDIO_DURATION_SEC * 16000) + 44
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < min_wav_bytes:
+            try:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except OSError:
+                pass
             return
 
         cleanup_old_audio_files(MAX_AUDIO_FILES)
@@ -1847,6 +1863,22 @@ def main():
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
+            pkt_ssi = to_int(
+                get_ci(
+                    pkt,
+                    [
+                        "actual ssi",
+                        "ssi",
+                        "calling party ssi",
+                        "transmitting party ssi",
+                        "source ssi",
+                    ],
+                )
+            )
+            if pkt_ssi in (0, 16777215):
+                emit_raw_mac_event(ch, pkt)
+                return
+
             enc_mode = to_int(
                 get_ci(pkt, ["encryption mode", "encryption_mode", "encrypted"]),
                 default=0,
@@ -1857,33 +1889,35 @@ def main():
                 usage_marker = to_int(
                     get_ci(pkt, ["downlink usage marker", "usage marker", "usage_marker"])
                 )
-                pkt_ssi = to_int(
-                    get_ci(
-                        pkt,
-                        [
-                            "actual ssi",
-                            "ssi",
-                            "calling party ssi",
-                            "transmitting party ssi",
-                            "source ssi",
-                        ],
-                    )
-                )
-                if pkt_ssi == 16777215:
-                    pkt_ssi = None
 
                 ctx = None
-                if usage_marker is not None:
+                if tn is not None:
+                    ctx = channel_call_context.get((freq_str, f"tn:{tn}"))
+                if not ctx and usage_marker is not None and usage_marker > 0:
                     ctx = channel_call_context.get((freq_str, usage_marker))
                 if not ctx:
                     ctx = channel_call_context.get(freq_str)
                 if ctx and (now_ts - ctx.get("ts", 0) > 60.0):
                     ctx = None
 
-                eff_ssi = pkt_ssi if pkt_ssi is not None else (ctx.get("ssi") if ctx else None)
-                eff_gssi = ctx.get("gssi") if ctx else None
+                ctx_ssi = to_int(ctx.get("ssi")) if ctx else None
+                if ctx_ssi in (0, 16777215):
+                    ctx_ssi = None
+                ctx_gssi = to_int(ctx.get("gssi")) if ctx else None
+                if ctx_gssi in (0, 16777215):
+                    ctx_gssi = None
 
-                buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or 1))
+                if pkt_ssi is None and (ctx is None or (ctx_ssi is None and ctx_gssi is None)):
+                    emit_raw_mac_event(ch, pkt)
+                    return
+
+                eff_ssi = pkt_ssi if pkt_ssi is not None else ctx_ssi
+                eff_gssi = ctx_gssi
+                if eff_ssi is None and eff_gssi is None:
+                    emit_raw_mac_event(ch, pkt)
+                    return
+
+                buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or eff_gssi or 1))
                 with voice_lock:
                     buf = voice_buffers.get(buf_key)
                     if buf is not None and (now_ts - buf["last_seen"] > VOICE_SPLIT_TIMEOUT_S):
@@ -2026,10 +2060,16 @@ def main():
         if pdu in CALL_PDUS:
             call_id = to_int(get_ci(pkt, ["call identifier", "call_identifier"]))
             usage_marker = to_int(get_ci(pkt, ["usage marker", "usage_marker"]))
+            call_tn = to_int(get_ci(pkt, ["tn", "timeslot", "allocated timeslot"]))
             tx_grant_code = to_int(get_ci(pkt, ["transmission grant"]))
             tx_grant_text = TX_GRANT_MAP.get(tx_grant_code)
             disc_cause_code = to_int(get_ci(pkt, ["disconnect cause"]))
             disc_cause_text = DISCONNECT_CAUSE_MAP.get(disc_cause_code)
+
+            if mac_ssi in (0, 16777215):
+                mac_ssi = None
+            if caller_ssi in (0, 16777215):
+                caller_ssi = None
 
             explicit_gssi = to_int(
                 get_ci(
@@ -2042,6 +2082,9 @@ def main():
                     ],
                 )
             )
+            if explicit_gssi in (0, 16777215):
+                explicit_gssi = None
+
             if explicit_gssi is not None:
                 gssi = explicit_gssi
             elif mac_ssi is not None and (
@@ -2053,23 +2096,27 @@ def main():
 
             ssi = caller_ssi if caller_ssi is not None else mac_ssi
 
-            call_ctx_obj = {
-                "ssi": caller_ssi if caller_ssi is not None else ssi,
-                "gssi": gssi,
-                "call_id": call_id,
-                "usage_marker": usage_marker,
-                "ts": now_ts,
-            }
-            channel_call_context[freq_str] = call_ctx_obj
-            if usage_marker is not None:
-                channel_call_context[(freq_str, usage_marker)] = call_ctx_obj
-            with voice_lock:
-                for b_key, b_val in voice_buffers.items():
-                    if b_key[0] == freq_str:
-                        if b_val.get("ssi") is None and call_ctx_obj["ssi"] is not None:
-                            b_val["ssi"] = call_ctx_obj["ssi"]
-                        if b_val.get("gssi") is None and gssi is not None:
-                            b_val["gssi"] = gssi
+            if ssi is not None or gssi is not None:
+                call_ctx_obj = {
+                    "ssi": caller_ssi if caller_ssi is not None else ssi,
+                    "gssi": gssi,
+                    "call_id": call_id,
+                    "usage_marker": usage_marker,
+                    "tn": call_tn,
+                    "ts": now_ts,
+                }
+                channel_call_context[freq_str] = call_ctx_obj
+                if usage_marker is not None and usage_marker > 0:
+                    channel_call_context[(freq_str, usage_marker)] = call_ctx_obj
+                if call_tn is not None:
+                    channel_call_context[(freq_str, f"tn:{call_tn}")] = call_ctx_obj
+                with voice_lock:
+                    for b_key, b_val in voice_buffers.items():
+                        if b_key[0] == freq_str:
+                            if b_val.get("ssi") is None and call_ctx_obj["ssi"] is not None:
+                                b_val["ssi"] = call_ctx_obj["ssi"]
+                            if b_val.get("gssi") is None and gssi is not None:
+                                b_val["gssi"] = gssi
 
             sig = (freq_str, pdu, ssi, gssi, call_id, tx_grant_code)
             if is_duplicate(sig, now_ts, ttl=1.2):
@@ -2160,6 +2207,12 @@ def main():
                     ssi=ssi,
                     gssi=gssi,
                 )
+                if pdu == "D-RELEASE":
+                    channel_call_context.pop(freq_str, None)
+                    if usage_marker is not None:
+                        channel_call_context.pop((freq_str, usage_marker), None)
+                    if call_tn is not None:
+                        channel_call_context.pop((freq_str, f"tn:{call_tn}"), None)
             return
 
         if "LOCATION UPDATE" in pdu:
