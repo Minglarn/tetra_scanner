@@ -74,16 +74,38 @@
         </div>
       </section>
 
-      <!-- Ignored / Blacklisted Frequencies -->
+      <!-- Whitelisted Frequencies -->
       <section class="bg-gray-900 border border-gray-800 rounded-lg flex flex-col flex-1 min-h-0">
         <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
           <div>
-            <h2 class="text-sm font-bold uppercase tracking-wider text-amber-300">Ignored / Blacklisted Frequencies</h2>
-            <p class="text-[11px] text-gray-500">Frequency Reputation System</p>
+            <h2 class="text-sm font-bold uppercase tracking-wider text-emerald-400">Whitelisted Frequencies</h2>
+            <p class="text-[11px] text-gray-500">Auto-Verified TETRA Carriers</p>
           </div>
-          <button id="refresh-blacklist-btn" class="text-xs px-2.5 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
+          <button id="refresh-whitelist-btn" class="text-xs px-2.5 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
             Refresh
           </button>
+        </div>
+
+        <div id="whitelist-container" class="p-3 space-y-2 overflow-y-auto flex-1 text-xs">
+          <div class="text-gray-500 italic py-4 text-center">No whitelisted frequencies yet.</div>
+        </div>
+      </section>
+
+      <!-- Ignored / Blacklisted Frequencies -->
+      <section class="bg-gray-900 border border-gray-800 rounded-lg flex flex-col flex-1 min-h-0">
+        <div class="px-4 py-3 border-b border-gray-800 flex items-center justify-between gap-2">
+          <div>
+            <h2 class="text-sm font-bold uppercase tracking-wider text-amber-300">Ignored / Blacklisted Frequencies</h2>
+            <p class="text-[11px] text-gray-500">3-Strikes Reputation System</p>
+          </div>
+          <div class="flex items-center gap-1.5">
+            <button id="clear-blacklist-btn" class="text-xs px-2 py-1 bg-red-950/70 hover:bg-red-900/80 text-red-200 border border-red-800/70 rounded transition">
+              Clear All
+            </button>
+            <button id="refresh-blacklist-btn" class="text-xs px-2 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition">
+              Refresh
+            </button>
+          </div>
         </div>
 
         <div id="blacklist-container" class="p-3 space-y-2 overflow-y-auto flex-1 text-xs">
@@ -152,8 +174,11 @@
     const clearLogBtn = document.getElementById("clear-log-btn");
     const networksContainer = document.getElementById("networks-container");
     const refreshNetworksBtn = document.getElementById("refresh-networks-btn");
+    const whitelistContainer = document.getElementById("whitelist-container");
+    const refreshWhitelistBtn = document.getElementById("refresh-whitelist-btn");
     const blacklistContainer = document.getElementById("blacklist-container");
     const refreshBlacklistBtn = document.getElementById("refresh-blacklist-btn");
+    const clearBlacklistBtn = document.getElementById("clear-blacklist-btn");
 
     let totalEvents = 0;
     const MAX_DOM_ROWS = 500;
@@ -369,6 +394,28 @@
       }
     }
 
+    async function removeBlacklistItem(freqHzStr) {
+      try {
+        await fetch(`/api/blacklist/${encodeURIComponent(freqHzStr)}`, {
+          method: "DELETE"
+        });
+        fetchBlacklist();
+      } catch (e) {
+        // Ignore transient network errors
+      }
+    }
+
+    async function clearAllBlacklist() {
+      try {
+        await fetch("/api/blacklist", {
+          method: "DELETE"
+        });
+        fetchBlacklist();
+      } catch (e) {
+        // Ignore transient network errors
+      }
+    }
+
     async function fetchBlacklist() {
       try {
         const res = await fetch("/api/blacklist");
@@ -378,7 +425,9 @@
 
         const nowSec = Date.now() / 1000;
         const entries = Object.entries(data || {}).filter(([, info]) => {
-          return info && typeof info.expire_at === "number" && info.expire_at > nowSec;
+          if (!info) return false;
+          if (info.status === "warning" && info.strikes > 0) return true;
+          return typeof info.expire_at === "number" && info.expire_at > nowSec;
         });
 
         if (entries.length === 0) {
@@ -390,28 +439,51 @@
 
         entries.forEach(([freqHzStr, info]) => {
           const freqMhz = (Number(freqHzStr) / 1e6).toFixed(4);
-          const remainingSec = Math.max(0, Math.round(info.expire_at - nowSec));
-          const remainingMin = Math.ceil(remainingSec / 60);
-          const countdownText = remainingSec >= 60
-            ? `Expires in ${remainingMin} min`
-            : `Expires in ${remainingSec} s`;
+          const isWarning = info.status === "warning";
+
+          let countdownText = "";
+          if (isWarning) {
+            countdownText = `Strike ${info.strikes}/${info.max_strikes || 3} (Active - Not blacklisted yet)`;
+          } else {
+            const remainingSec = Math.max(0, Math.round(info.expire_at - nowSec));
+            const remainingMin = Math.ceil(remainingSec / 60);
+            countdownText = remainingSec >= 60
+              ? `Expires in ${remainingMin} min`
+              : `Expires in ${remainingSec} s`;
+          }
 
           const card = document.createElement("div");
-          card.className = "bg-gray-950/80 border border-amber-900/50 rounded p-2.5 space-y-1";
+          card.className = isWarning
+            ? "bg-gray-950/80 border border-gray-700 rounded p-2.5 space-y-1.5"
+            : "bg-gray-950/80 border border-amber-900/50 rounded p-2.5 space-y-1.5";
 
           const topRow = document.createElement("div");
-          topRow.className = "flex items-center justify-between";
+          topRow.className = "flex items-center justify-between gap-2";
 
           const freqEl = document.createElement("span");
-          freqEl.className = "text-amber-400 font-bold";
+          freqEl.className = isWarning ? "text-gray-200 font-bold" : "text-amber-400 font-bold";
           freqEl.textContent = `${freqMhz} MHz`;
 
+          const rightGroup = document.createElement("div");
+          rightGroup.className = "flex items-center gap-1.5";
+
           const reasonBadge = document.createElement("span");
-          reasonBadge.className = "px-1.5 py-0.5 rounded bg-red-950/80 border border-red-800/70 text-red-300 text-[10px] font-semibold";
+          reasonBadge.className = isWarning
+            ? "px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700/70 text-amber-300 text-[10px] font-semibold"
+            : "px-1.5 py-0.5 rounded bg-red-950/80 border border-red-800/70 text-red-300 text-[10px] font-semibold";
           reasonBadge.textContent = info.reason || "Ignored";
 
+          const removeBtn = document.createElement("button");
+          removeBtn.className = "px-1.5 py-0.5 rounded bg-gray-800 hover:bg-red-900/80 text-gray-300 hover:text-white border border-gray-700 text-[10px] transition";
+          removeBtn.textContent = "Remove";
+          removeBtn.title = "Remove frequency from blacklist / reset strikes";
+          removeBtn.addEventListener("click", () => removeBlacklistItem(freqHzStr));
+
+          rightGroup.appendChild(reasonBadge);
+          rightGroup.appendChild(removeBtn);
+
           topRow.appendChild(freqEl);
-          topRow.appendChild(reasonBadge);
+          topRow.appendChild(rightGroup);
 
           const expRow = document.createElement("div");
           expRow.className = "text-gray-400 text-[11px]";
@@ -426,8 +498,55 @@
       }
     }
 
+    async function fetchWhitelist() {
+      try {
+        const res = await fetch("/api/whitelist");
+        if (!res.ok) return;
+        const list = await res.json();
+        whitelistContainer.innerHTML = "";
+
+        if (!Array.isArray(list) || list.length === 0) {
+          whitelistContainer.innerHTML = `<div class="text-gray-500 italic py-4 text-center">No whitelisted frequencies yet.</div>`;
+          return;
+        }
+
+        list.forEach((item) => {
+          const card = document.createElement("div");
+          card.className = "bg-gray-950/80 border border-emerald-900/50 rounded p-2.5 space-y-1";
+
+          const topRow = document.createElement("div");
+          topRow.className = "flex items-center justify-between";
+
+          const freqEl = document.createElement("span");
+          freqEl.className = "text-emerald-400 font-bold";
+          freqEl.textContent = `${item.freq_mhz || "?"} MHz`;
+
+          const badgeEl = document.createElement("span");
+          badgeEl.className = "px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 text-[10px] font-semibold";
+          badgeEl.textContent = `Hits: ${item.hit_count ?? 1}`;
+
+          topRow.appendChild(freqEl);
+          topRow.appendChild(badgeEl);
+
+          const metaRow = document.createElement("div");
+          metaRow.className = "text-gray-400 text-[11px] flex items-center justify-between";
+          const laText = item.la !== undefined && item.la !== null ? `LA ${item.la}` : "Verified";
+          const catText = item.last_category ? `Last: ${item.last_category}` : "";
+          metaRow.textContent = catText ? `${laText} | ${catText}` : laText;
+
+          card.appendChild(topRow);
+          card.appendChild(metaRow);
+          whitelistContainer.appendChild(card);
+        });
+      } catch (e) {
+        // Ignore transient network errors
+      }
+    }
+
     refreshNetworksBtn.addEventListener("click", loadNetworks);
+    refreshWhitelistBtn.addEventListener("click", fetchWhitelist);
     refreshBlacklistBtn.addEventListener("click", fetchBlacklist);
+    clearBlacklistBtn.addEventListener("click", clearAllBlacklist);
 
     function connectWebSocket() {
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -458,8 +577,10 @@
     }
 
     loadNetworks();
+    fetchWhitelist();
     fetchBlacklist();
     setInterval(loadNetworks, 15000);
+    setInterval(fetchWhitelist, 10000);
     setInterval(fetchBlacklist, 10000);
     connectWebSocket();
   </script>

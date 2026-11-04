@@ -135,7 +135,6 @@ def main():
     signal.signal(signal.SIGTERM, sig_handler)
 
     tb.start()
-    print("[gnuradio] Flowgraph running.", flush=True)
     try:
         while True:
             time.sleep(1.0)

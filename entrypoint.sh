@@ -4,7 +4,7 @@ set -e
 MODE="${MODE:-static}"
 WEB_PORT="${WEB_PORT:-8080}"
 TETRA_CHANNELS="${TETRA_CHANNELS:-427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7}"
-VERSION="${APP_VERSION:-2026.11.04.5}"
+VERSION="${APP_VERSION:-2026.11.04.6}"
 RELEASE_DATE="${APP_RELEASE_DATE:-2026-11-04}"
 
 cat << 'EOF'
@@ -38,7 +38,7 @@ echo "  WebUI Port   : ${WEB_PORT}"
 echo "=============================================================================================="
 
 echo "[entrypoint] Starting FastAPI WebUI on 0.0.0.0:${WEB_PORT}..."
-uvicorn src.web_api:app --host 0.0.0.0 --port "${WEB_PORT}" &
+uvicorn src.web_api:app --host 0.0.0.0 --port "${WEB_PORT}" --no-access-log --log-level warning &
 WEB_PID=$!
 
 if [ "$MODE" = "scanner" ]; then

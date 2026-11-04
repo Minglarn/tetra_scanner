@@ -35,11 +35,13 @@ SCAN_END_MHZ = parse_env_float("SCAN_END_MHZ", 430.0)
 IDLE_TIMEOUT_SEC = parse_env_int(
     "IDLE_TIMEOUT_SEC", parse_env_int("SCAN_DWELL_TIME", 900)
 )
+BLACKLIST_STRIKES = max(1, parse_env_int("BLACKLIST_STRIKES", 3))
 BLACKLIST_TIME_SEC = parse_env_int("BLACKLIST_TIME_SEC", 3600)
 FORCE_SWEEP_PENALTY_SEC = 900
 
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
+WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
 FORCE_SWEEP_FLAG = "/tmp/force_sweep.flag"
 
 RTL_DEVICE_INDEX = parse_env_int("RTL_DEVICE_INDEX", 1)
@@ -86,20 +88,73 @@ def save_blacklist(data):
         print(f"[scanner] Warning: failed saving {BLACKLIST_FILE}: {exc}", flush=True)
 
 
-def add_frequencies_to_blacklist(freq_list_hz, duration_sec, reason):
+def load_whitelist():
+    if not os.path.exists(WHITELIST_FILE):
+        return {}
+    try:
+        with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as exc:
+        print(f"[scanner] Warning: failed reading {WHITELIST_FILE}: {exc}", flush=True)
+    return {}
+
+
+def add_frequencies_to_blacklist(freq_list_hz, duration_sec, reason, immediate=False):
     bl = load_blacklist()
+    wl = load_whitelist()
     now_ts = time.time()
-    expire_at = round(now_ts + float(duration_sec), 2)
+
     for f_hz in freq_list_hz:
         key = str(int(f_hz))
-        bl[key] = {
-            "expire_at": expire_at,
-            "reason": reason,
-        }
-        print(
-            f"[scanner] Blacklisted {int(f_hz) / 1e6:.4f} MHz for {duration_sec}s (reason: {reason})",
-            flush=True,
-        )
+        if key in wl and not immediate:
+            print(
+                f"[scanner] Keeping whitelisted frequency {int(f_hz) / 1e6:.4f} MHz (protected from Idle Timeout blacklist)",
+                flush=True,
+            )
+            continue
+
+        prev_entry = bl.get(key) if isinstance(bl.get(key), dict) else {}
+        prev_expire = float(prev_entry.get("expire_at", 0))
+        if prev_expire > 0 and now_ts >= prev_expire:
+            prev_strikes = 0
+        else:
+            prev_strikes = int(prev_entry.get("strikes", 0))
+
+        if immediate:
+            strikes = BLACKLIST_STRIKES
+        else:
+            strikes = prev_strikes + 1
+
+        if strikes >= BLACKLIST_STRIKES:
+            expire_at = round(now_ts + float(duration_sec), 2)
+            bl[key] = {
+                "strikes": strikes,
+                "max_strikes": BLACKLIST_STRIKES,
+                "expire_at": expire_at,
+                "last_strike_at": round(now_ts, 2),
+                "reason": f"{reason} ({strikes}/{BLACKLIST_STRIKES})",
+            }
+            print(
+                f"[scanner] Blacklisted {int(f_hz) / 1e6:.4f} MHz for {duration_sec}s "
+                f"(Strike {strikes}/{BLACKLIST_STRIKES} - {reason})",
+                flush=True,
+            )
+        else:
+            bl[key] = {
+                "strikes": strikes,
+                "max_strikes": BLACKLIST_STRIKES,
+                "expire_at": 0,
+                "last_strike_at": round(now_ts, 2),
+                "reason": f"Warning {strikes}/{BLACKLIST_STRIKES} ({reason})",
+            }
+            print(
+                f"[scanner] Frequency {int(f_hz) / 1e6:.4f} MHz quiet: recorded Strike "
+                f"{strikes}/{BLACKLIST_STRIKES} (not blacklisted yet)",
+                flush=True,
+            )
+
     save_blacklist(bl)
 
 
@@ -370,28 +425,60 @@ def phase1_sweep_band(centers):
 
 
 def phase2_select_best_window(all_peaks):
-    if not all_peaks:
-        return None, []
-
+    whitelist = load_whitelist()
     blacklist = load_blacklist()
     now_ts = time.time()
     blacklist_modified = False
-    filtered_peaks = []
 
-    for pk in all_peaks:
-        f_key = str(int(pk["freq_hz"]))
+    peaks_by_hz = {int(p["freq_hz"]): dict(p) for p in (all_peaks or [])}
+
+    start_limit_hz = int(round(SCAN_START_MHZ * 1_000_000))
+    end_limit_hz = int(round(SCAN_END_MHZ * 1_000_000))
+
+    for wl_key, wl_info in whitelist.items():
+        try:
+            f_hz = int(wl_key)
+        except ValueError:
+            continue
+        if not (start_limit_hz <= f_hz <= end_limit_hz):
+            continue
+        if f_hz in peaks_by_hz:
+            peaks_by_hz[f_hz]["whitelisted"] = True
+            peaks_by_hz[f_hz]["la"] = wl_info.get("la")
+        else:
+            peaks_by_hz[f_hz] = {
+                "freq_hz": f_hz,
+                "dbm": -40.0,
+                "snr_db": 10.0,
+                "noise_floor": -50.0,
+                "whitelisted": True,
+                "la": wl_info.get("la"),
+            }
+
+    if not peaks_by_hz:
+        return None, []
+
+    filtered_peaks = []
+    for f_hz, pk in peaks_by_hz.items():
+        f_key = str(int(f_hz))
+        pk["strikes"] = 0
         if f_key in blacklist:
-            entry = blacklist[f_key]
+            entry = blacklist[f_key] if isinstance(blacklist[f_key], dict) else {}
             expire_at = float(entry.get("expire_at", 0))
-            if now_ts < expire_at:
-                print(
-                    f"[scanner] Ignoring blacklisted frequency {pk['freq_hz'] / 1e6:.4f} MHz",
-                    flush=True,
-                )
-                continue
+            strikes = int(entry.get("strikes", 0))
+            if expire_at > 0:
+                if now_ts < expire_at:
+                    print(
+                        f"[scanner] Ignoring blacklisted frequency {f_hz / 1e6:.4f} MHz "
+                        f"({entry.get('reason', 'Blacklisted')})",
+                        flush=True,
+                    )
+                    continue
+                else:
+                    del blacklist[f_key]
+                    blacklist_modified = True
             else:
-                del blacklist[f_key]
-                blacklist_modified = True
+                pk["strikes"] = strikes
         filtered_peaks.append(pk)
 
     if blacklist_modified:
@@ -404,14 +491,21 @@ def phase2_select_best_window(all_peaks):
     candidate_starts = [p["freq_hz"] for p in sorted_by_freq]
 
     best_window_peaks = []
-    best_score = (-1, -1e9)
+    best_score = (-1, -1, -1e9)
 
     for w_start in candidate_starts:
         w_end = w_start + MAX_WINDOW_SPAN_HZ
         in_window = [
             p for p in filtered_peaks if w_start <= p["freq_hz"] <= w_end
         ]
-        in_window.sort(key=lambda x: x["dbm"], reverse=True)
+        in_window.sort(
+            key=lambda x: (
+                1 if x.get("whitelisted") else 0,
+                -int(x.get("strikes", 0)),
+                x["dbm"],
+            ),
+            reverse=True,
+        )
 
         selected = []
         for cand in in_window:
@@ -427,9 +521,13 @@ def phase2_select_best_window(all_peaks):
         if not selected:
             continue
 
+        wl_count = sum(1 for p in selected if p.get("whitelisted"))
+        unpenalized_count = sum(1 for p in selected if int(p.get("strikes", 0)) == 0)
         count = len(selected)
-        total_snr = sum(p["snr_db"] for p in selected)
-        score = (count, round(total_snr, 2))
+        total_snr = sum(
+            p["snr_db"] - (int(p.get("strikes", 0)) * 4.0) for p in selected
+        )
+        score = (wl_count, unpenalized_count, count, round(total_snr, 2))
         if score > best_score:
             best_score = score
             best_window_peaks = selected
@@ -587,7 +685,10 @@ def phase3_monitor_channels(center_hz, selected_peaks):
                     flush=True,
                 )
                 add_frequencies_to_blacklist(
-                    active_frequencies, FORCE_SWEEP_PENALTY_SEC, "Manual Force"
+                    active_frequencies,
+                    FORCE_SWEEP_PENALTY_SEC,
+                    "Manual Force",
+                    immediate=True,
                 )
                 break
 

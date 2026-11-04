@@ -10,11 +10,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.5")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.6")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
 BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
+WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
@@ -89,12 +90,90 @@ async def get_blacklist():
         if not isinstance(info, dict):
             continue
         expire_at = float(info.get("expire_at", 0))
+        strikes = int(info.get("strikes", 0))
+        max_strikes = int(info.get("max_strikes", 3))
         if expire_at > now_ts:
             active[freq_str] = {
                 "expire_at": expire_at,
-                "reason": info.get("reason", "Unknown"),
+                "strikes": strikes,
+                "max_strikes": max_strikes,
+                "status": "blacklisted",
+                "reason": info.get("reason", "Idle Timeout"),
+            }
+        elif expire_at == 0 and strikes > 0:
+            active[freq_str] = {
+                "expire_at": 0,
+                "strikes": strikes,
+                "max_strikes": max_strikes,
+                "status": "warning",
+                "reason": info.get("reason", f"Strike {strikes}/{max_strikes}"),
             }
     return active
+
+
+@app.delete("/api/blacklist/{freq_hz}", response_class=JSONResponse)
+async def remove_from_blacklist(freq_hz: str):
+    if not os.path.exists(BLACKLIST_FILE):
+        return {"status": "ok", "removed": freq_hz}
+
+    try:
+        async with aiofiles.open(
+            BLACKLIST_FILE, mode="r", encoding="utf-8", errors="replace"
+        ) as f:
+            content = await f.read()
+            data = json.loads(content) if content.strip() else {}
+            if not isinstance(data, dict):
+                data = {}
+    except Exception:
+        data = {}
+
+    if freq_hz in data:
+        del data[freq_hz]
+        tmp_path = f"{BLACKLIST_FILE}.tmp"
+        try:
+            async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, indent=2, sort_keys=True))
+            os.replace(tmp_path, BLACKLIST_FILE)
+        except Exception:
+            pass
+
+    return {"status": "ok", "removed": freq_hz}
+
+
+@app.delete("/api/blacklist", response_class=JSONResponse)
+async def clear_blacklist():
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp_path = f"{BLACKLIST_FILE}.tmp"
+        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+            await f.write("{}\n")
+        os.replace(tmp_path, BLACKLIST_FILE)
+    except Exception:
+        pass
+    return {"status": "ok", "cleared": True}
+
+
+@app.get("/api/whitelist", response_class=JSONResponse)
+async def get_whitelist():
+    if not os.path.exists(WHITELIST_FILE):
+        return []
+
+    try:
+        async with aiofiles.open(
+            WHITELIST_FILE, mode="r", encoding="utf-8", errors="replace"
+        ) as f:
+            content = await f.read()
+            if not content.strip():
+                return []
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                return []
+    except Exception:
+        return []
+
+    items = [v for v in data.values() if isinstance(v, dict)]
+    items.sort(key=lambda x: x.get("freq_hz") or 0)
+    return items
 
 
 async def read_recent_lines(filepath: str, max_lines: int = 100):

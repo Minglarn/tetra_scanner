@@ -16,7 +16,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.5")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.6")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -52,6 +52,8 @@ HOST_NAME = os.environ.get("HOST_NAME", "iridium")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 DISCOVERED_NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
+WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
+BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
 NETWORK_LOG_COOLDOWN_S = 3600.0
 
 IGNORED_PDUS = {"D-CK CHANGE DEMAND"}
@@ -708,6 +710,30 @@ def load_seen_networks(filepath):
     return seen
 
 
+def load_json_dict(filepath):
+    if not os.path.exists(filepath):
+        return {}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_json_dict(filepath, data):
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        tmp_path = f"{filepath}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, filepath)
+    except Exception as exc:
+        print(f"[parser] Failed writing {filepath}: {exc}", flush=True)
+
+
 def publish_ha_discovery(client):
     if not HA_DISCOVERY_ENABLED or client is None:
         return
@@ -840,6 +866,8 @@ def main():
     active_tx = {}
     unit_registry = {}
     seen_networks = load_seen_networks(DISCOVERED_NETWORKS_FILE)
+    whitelist_data = load_json_dict(WHITELIST_FILE)
+    whitelist_last_save = {}
     channel_net_cache = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
     last_heartbeat = time.time()
@@ -851,6 +879,58 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
+
+    def register_whitelisted_carrier(ch, category, mcc=None, mnc=None, la=None):
+        freq_hz = int(ch["freq_hz"])
+        freq_key = str(freq_hz)
+        freq_mhz = ch["freq_mhz"]
+        now_ts = time.time()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        net_state = channel_net_cache.get(freq_mhz, {})
+        eff_mcc = mcc if mcc is not None else net_state.get("mcc")
+        eff_mnc = mnc if mnc is not None else net_state.get("mnc")
+        eff_la = la if la is not None else net_state.get("la") or ch.get("la")
+
+        is_new = freq_key not in whitelist_data
+        entry = whitelist_data.get(
+            freq_key,
+            {
+                "freq_hz": freq_hz,
+                "freq_mhz": freq_mhz,
+                "first_seen": now_iso,
+                "hit_count": 0,
+            },
+        )
+        entry["freq_hz"] = freq_hz
+        entry["freq_mhz"] = freq_mhz
+        entry["last_seen"] = now_iso
+        entry["last_epoch"] = round(now_ts, 3)
+        entry["last_category"] = category
+        entry["hit_count"] = int(entry.get("hit_count", 0)) + 1
+        if eff_mcc is not None:
+            entry["mcc"] = eff_mcc
+        if eff_mnc is not None:
+            entry["mnc"] = eff_mnc
+        if eff_la is not None:
+            entry["la"] = eff_la
+
+        whitelist_data[freq_key] = entry
+
+        if is_new:
+            print(
+                f"[WHITELIST] Verified active TETRA carrier {freq_mhz} MHz (LA {eff_la}) added to whitelist.json (via {category})",
+                flush=True,
+            )
+            bl = load_json_dict(BLACKLIST_FILE)
+            if freq_key in bl:
+                del bl[freq_key]
+                save_json_dict(BLACKLIST_FILE, bl)
+
+        last_saved = whitelist_last_save.get(freq_key, 0.0)
+        if is_new or (now_ts - last_saved) >= 10.0:
+            save_json_dict(WHITELIST_FILE, whitelist_data)
+            whitelist_last_save[freq_key] = now_ts
 
     def update_unit_registry(ssi, dest_ssi, decoded):
         parsed = decoded.get("parsed")
@@ -941,6 +1021,10 @@ def main():
         cat = event_dict.get("category", "OTHER")
         freq = event_dict.get("freq_mhz", "?")
         la = event_dict.get("la", "?")
+        for ch_obj in channels:
+            if ch_obj["freq_mhz"] == freq:
+                register_whitelisted_carrier(ch_obj, cat, la=la)
+                break
         human = event_dict.get("human_text") or event_dict.get("pdu", "?")
         print(f"[{cat}] {freq} MHz (LA{la}) | {human}", flush=True)
 
@@ -974,6 +1058,8 @@ def main():
 
         if mcc is None and mnc is None and pkt_la is None:
             return
+
+        register_whitelisted_carrier(ch, "NETWORK", mcc=mcc, mnc=mnc, la=la)
 
         net_id = f"{freq_str}_{mcc}_{mnc}_{la}"
         last_seen = seen_networks.get(net_id)
@@ -1460,6 +1546,8 @@ def main():
             last_heartbeat = now_ts
 
     flush_expired_sds(time.time(), force=True)
+    if whitelist_data:
+        save_json_dict(WHITELIST_FILE, whitelist_data)
     if mqtt_client is not None:
         mqtt_client.publish(
             f"{MQTT_BASE_TOPIC}/status", payload="offline", qos=1, retain=True
