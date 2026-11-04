@@ -3,8 +3,11 @@ set -e
 
 MODE="${MODE:-static}"
 WEB_PORT="${WEB_PORT:-8080}"
-VERSION="${APP_VERSION:-2026.11.04.19}"
+VERSION="${APP_VERSION:-2026.11.04.20}"
 RELEASE_DATE="${APP_RELEASE_DATE:-2026-11-04}"
+LOG_DIR="${LOG_DIR:-/app/logs}"
+
+rm -f "${LOG_DIR}/runtime_config.json" /tmp/reload_config.flag /tmp/soft_config.flag /tmp/force_sweep.flag
 
 cat << 'EOF'
  ███████████ ██████████ ███████████ ███████████     █████████                                 
