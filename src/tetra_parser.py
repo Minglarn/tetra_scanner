@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.18")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.19")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",

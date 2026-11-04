@@ -112,6 +112,13 @@ def load_runtime_config():
     cfg["IDLE_TIMEOUT_SEC"] = max(15, int(cfg.get("IDLE_TIMEOUT_SEC", 900)))
     cfg["BLACKLIST_STRIKES"] = max(1, int(cfg.get("BLACKLIST_STRIKES", 3)))
     cfg["BLACKLIST_TIME_SEC"] = max(10, int(cfg.get("BLACKLIST_TIME_SEC", 3600)))
+    cfg["CENTER_FREQ"] = int(float(cfg.get("CENTER_FREQ", 427750000)))
+    cfg["TETRA_CHANNELS"] = str(
+        cfg.get(
+            "TETRA_CHANNELS",
+            "427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7",
+        )
+    ).strip()
     return cfg
 
 

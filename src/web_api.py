@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.18")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.19")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -94,6 +94,52 @@ async def get_config():
     return cfg
 
 
+def compute_optimal_center_hz(freq_hz_list: list[int]) -> int:
+    if not freq_hz_list:
+        return 427750000
+    min_f = min(freq_hz_list)
+    max_f = max(freq_hz_list)
+    raw_center = (min_f + max_f) // 2
+    center_hz = int(round(raw_center / 25000.0) * 25000)
+    for f_hz in freq_hz_list:
+        if abs(f_hz - center_hz) < 12500:
+            center_hz += 12500
+            break
+    return center_hz
+
+
+def normalize_channels_and_center(channels_raw: str, center_raw=None):
+    entries = [c.strip() for c in str(channels_raw or "").split(",") if c.strip()]
+    if not entries:
+        raise ValueError("TETRA_CHANNELS cannot be empty")
+
+    normalized_parts = []
+    freq_hz_list = []
+    for idx, entry in enumerate(entries, start=1):
+        parts = entry.split(":", 1)
+        f_val = float(parts[0].strip())
+        if f_val < 100000.0:
+            f_hz = int(round(f_val * 1_000_000))
+        else:
+            f_hz = int(round(f_val))
+        la_str = parts[1].strip() if len(parts) > 1 and parts[1].strip() else str(idx)
+        freq_hz_list.append(f_hz)
+        normalized_parts.append(f"{f_hz}:{la_str}")
+
+    if center_raw is not None and str(center_raw).strip() != "":
+        c_val = float(center_raw)
+        if 0 < c_val < 100000.0:
+            center_hz = int(round(c_val * 1_000_000))
+        elif c_val >= 100000.0:
+            center_hz = int(round(c_val))
+        else:
+            center_hz = compute_optimal_center_hz(freq_hz_list)
+    else:
+        center_hz = compute_optimal_center_hz(freq_hz_list)
+
+    return ",".join(normalized_parts), center_hz
+
+
 @app.post("/api/config", response_class=JSONResponse)
 async def update_config(request: Request):
     try:
@@ -129,6 +175,18 @@ async def update_config(request: Request):
             new_cfg["BLACKLIST_STRIKES"] = max(1, int(body["BLACKLIST_STRIKES"]))
         if "BLACKLIST_TIME_SEC" in body:
             new_cfg["BLACKLIST_TIME_SEC"] = max(10, int(body["BLACKLIST_TIME_SEC"]))
+        if "TETRA_CHANNELS" in body and str(body["TETRA_CHANNELS"]).strip():
+            norm_ch, norm_center = normalize_channels_and_center(
+                body["TETRA_CHANNELS"],
+                body.get("CENTER_FREQ", new_cfg.get("CENTER_FREQ")),
+            )
+            new_cfg["TETRA_CHANNELS"] = norm_ch
+            new_cfg["CENTER_FREQ"] = norm_center
+        elif "CENTER_FREQ" in body and str(body["CENTER_FREQ"]).strip():
+            c_val = float(body["CENTER_FREQ"])
+            new_cfg["CENTER_FREQ"] = (
+                int(round(c_val * 1_000_000)) if c_val < 100000.0 else int(round(c_val))
+            )
     except (ValueError, TypeError) as exc:
         return JSONResponse(
             {"status": "error", "message": f"Invalid parameter value: {exc}"},
@@ -148,6 +206,8 @@ async def update_config(request: Request):
         "MODE",
         "SCAN_START_MHZ",
         "SCAN_END_MHZ",
+        "CENTER_FREQ",
+        "TETRA_CHANNELS",
     )
     needs_pipeline_restart = bool(body.get("force_restart")) or any(
         old_cfg.get(k) != new_cfg.get(k) for k in hard_keys
@@ -174,6 +234,8 @@ async def update_config(request: Request):
             "freq_mhz": "SYS",
             "human_text": (
                 f"Settings updated ({action_str}): Mode={new_cfg['MODE']}, "
+                f"Center={new_cfg.get('CENTER_FREQ', 0) / 1e6:.4f} MHz, "
+                f"Channels={new_cfg.get('TETRA_CHANNELS', '')}, "
                 f"Band={new_cfg['SCAN_START_MHZ']}-{new_cfg['SCAN_END_MHZ']} MHz, "
                 f"Gain={new_cfg['RTL_GAIN']} dB, IdleTimeout={new_cfg['IDLE_TIMEOUT_SEC']}s, "
                 f"Strikes={new_cfg['BLACKLIST_STRIKES']}."
@@ -365,6 +427,133 @@ async def get_whitelist():
     ]
     items.sort(key=lambda x: x.get("freq_hz") or 0)
     return items
+
+
+@app.delete("/api/whitelist/{freq_hz}", response_class=JSONResponse)
+async def remove_from_whitelist(freq_hz: str):
+    if not os.path.exists(WHITELIST_FILE):
+        return {"status": "ok", "removed": freq_hz}
+
+    try:
+        async with aiofiles.open(
+            WHITELIST_FILE, mode="r", encoding="utf-8", errors="replace"
+        ) as f:
+            content = await f.read()
+            data = json.loads(content) if content.strip() else {}
+            if not isinstance(data, dict):
+                data = {}
+    except Exception:
+        data = {}
+
+    if freq_hz in data:
+        del data[freq_hz]
+        tmp_path = f"{WHITELIST_FILE}.tmp"
+        try:
+            async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+                await f.write(json.dumps(data, indent=2, sort_keys=True))
+            os.replace(tmp_path, WHITELIST_FILE)
+        except Exception:
+            pass
+
+    return {"status": "ok", "removed": freq_hz}
+
+
+@app.post("/api/whitelist/lock", response_class=JSONResponse)
+async def lock_to_whitelist(request: Request):
+    selected_hz = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and isinstance(body.get("frequencies"), list):
+            selected_hz = {int(f) for f in body["frequencies"] if str(f).strip()}
+    except Exception:
+        pass
+
+    wl_items = await get_whitelist()
+    if selected_hz:
+        wl_items = [item for item in wl_items if int(item.get("freq_hz", 0)) in selected_hz]
+
+    if not wl_items:
+        return JSONResponse(
+            {"status": "error", "message": "No verified whitelisted frequencies available to lock."},
+            status_code=400,
+        )
+
+    wl_items.sort(key=lambda x: int(x.get("freq_hz") or 0))
+    best_cluster = []
+    best_score = (-1, -1)
+    for start_item in wl_items:
+        f_start = int(start_item.get("freq_hz") or 0)
+        f_limit = f_start + 1_800_000
+        in_win = [
+            it
+            for it in wl_items
+            if f_start <= int(it.get("freq_hz") or 0) <= f_limit
+        ]
+        if len(in_win) > 8:
+            in_win = sorted(
+                in_win,
+                key=lambda x: int(x.get("hit_count") or 0),
+                reverse=True,
+            )[:8]
+            in_win.sort(key=lambda x: int(x.get("freq_hz") or 0))
+        hits_sum = sum(int(it.get("hit_count") or 1) for it in in_win)
+        sc = (len(in_win), hits_sum)
+        if sc > best_score:
+            best_score = sc
+            best_cluster = in_win
+
+    freq_hz_list = [int(it["freq_hz"]) for it in best_cluster]
+    center_hz = compute_optimal_center_hz(freq_hz_list)
+    ch_parts = []
+    for idx, it in enumerate(best_cluster, start=1):
+        la_val = it.get("la") if it.get("la") is not None else idx
+        ch_parts.append(f"{int(it['freq_hz'])}:{la_val}")
+    channels_str = ",".join(ch_parts)
+
+    cfg = await read_runtime_config()
+    cfg["MODE"] = "static"
+    cfg["CENTER_FREQ"] = center_hz
+    cfg["TETRA_CHANNELS"] = channels_str
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
+    async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+        await f.write(json.dumps(cfg, indent=2, sort_keys=True))
+    os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+
+    try:
+        async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as f:
+            await f.write(str(time.time()))
+    except Exception:
+        pass
+
+    try:
+        iso_ts = datetime.now(timezone.utc).isoformat()
+        freqs_mhz = ", ".join(f"{hz / 1e6:.4f} MHz" for hz in freq_hz_list)
+        sys_event = {
+            "time": iso_ts,
+            "timestamp": iso_ts,
+            "category": "SYSTEM",
+            "freq_mhz": "SYS",
+            "human_text": (
+                f"Locked receiver to {len(freq_hz_list)} whitelisted channels in STATIC mode "
+                f"(Center {center_hz / 1e6:.4f} MHz): {freqs_mhz}"
+            ),
+        }
+        async with aiofiles.open(EVENTS_FILE, mode="a", encoding="utf-8") as ef:
+            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
+            await ef.flush()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "config": cfg,
+        "locked_count": len(freq_hz_list),
+        "center_hz": center_hz,
+        "tetra_channels": channels_str,
+    }
 
 
 async def read_recent_lines(filepath: str, max_lines: int = 100):
