@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.16")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.17")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -888,7 +888,16 @@ def main():
     voice_lock = threading.Lock()
     unit_registry = {}
     seen_networks = load_seen_networks(DISCOVERED_NETWORKS_FILE)
-    whitelist_data = load_json_dict(WHITELIST_FILE)
+    raw_whitelist_data = load_json_dict(WHITELIST_FILE)
+    valid_wl_categories = {"SDS", "CALL", "VOICE", "STATUS", "ROAMING", "NETWORK"}
+    whitelist_data = {
+        k: v
+        for k, v in raw_whitelist_data.items()
+        if isinstance(v, dict)
+        and str(v.get("last_category", "")).upper() in valid_wl_categories
+    }
+    if len(whitelist_data) != len(raw_whitelist_data):
+        save_json_dict(WHITELIST_FILE, whitelist_data)
     whitelist_last_save = {}
     channel_net_cache = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
@@ -1307,13 +1316,6 @@ def main():
         if enc_mode is not None:
             state["encryption_mode"] = enc_mode
 
-        register_whitelisted_carrier(
-            ch,
-            pdu or service or "TRAFFIC",
-            mcc=state.get("mcc"),
-            mnc=state.get("mnc"),
-            la=state.get("la"),
-        )
         persist_net_state(state, pdu or service, now_ts, emit_log_event=False)
 
     def handle_network_discovery(ch, pkt, pdu, now_ts):
@@ -1414,18 +1416,6 @@ def main():
                     nb_state["mnc"] = state["mnc"]
                 nb_state["reported_by"] = freq_str
 
-                nb_ch_proxy = {
-                    "freq_hz": nb_freq_hz,
-                    "freq_mhz": nb_freq_mhz,
-                    "la": nb.get("la"),
-                }
-                register_whitelisted_carrier(
-                    nb_ch_proxy,
-                    "NEIGHBOUR_BROADCAST",
-                    mcc=nb_state.get("mcc"),
-                    mnc=nb_state.get("mnc"),
-                    la=nb.get("la"),
-                )
                 persist_net_state(
                     nb_state,
                     f"NEIGHBOUR ({pdu})",

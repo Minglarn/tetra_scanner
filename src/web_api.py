@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.16")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.17")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -356,7 +356,13 @@ async def get_whitelist():
     except Exception:
         return []
 
-    items = [v for v in data.values() if isinstance(v, dict)]
+    valid_wl_categories = {"SDS", "CALL", "VOICE", "STATUS", "ROAMING", "NETWORK"}
+    items = [
+        v
+        for v in data.values()
+        if isinstance(v, dict)
+        and str(v.get("last_category", "")).upper() in valid_wl_categories
+    ]
     items.sort(key=lambda x: x.get("freq_hz") or 0)
     return items
 

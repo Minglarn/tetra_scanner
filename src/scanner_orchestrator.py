@@ -150,14 +150,49 @@ def save_blacklist(data):
         print(f"[scanner] Warning: failed saving {BLACKLIST_FILE}: {exc}", flush=True)
 
 
+VALID_WHITELIST_CATEGORIES = {
+    "SDS",
+    "CALL",
+    "VOICE",
+    "STATUS",
+    "ROAMING",
+    "NETWORK",
+}
+
+
+def save_whitelist(data):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp_path = f"{WHITELIST_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp_path, WHITELIST_FILE)
+    except Exception as exc:
+        print(f"[scanner] Warning: failed saving {WHITELIST_FILE}: {exc}", flush=True)
+
+
 def load_whitelist():
     if not os.path.exists(WHITELIST_FILE):
         return {}
     try:
         with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict):
-                return data
+            if not isinstance(data, dict):
+                return {}
+            cleaned = {}
+            modified = False
+            for k, v in data.items():
+                if not isinstance(v, dict):
+                    modified = True
+                    continue
+                last_cat = str(v.get("last_category") or "").upper()
+                if last_cat and last_cat not in VALID_WHITELIST_CATEGORIES:
+                    modified = True
+                    continue
+                cleaned[k] = v
+            if modified:
+                save_whitelist(cleaned)
+            return cleaned
     except Exception as exc:
         print(f"[scanner] Warning: failed reading {WHITELIST_FILE}: {exc}", flush=True)
     return {}
@@ -354,7 +389,7 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
 
 def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
     if not csv_path or not os.path.exists(csv_path):
-        return []
+        return [], {}
 
     fine_bins = {}
     try:
@@ -398,10 +433,10 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
                     fine_bins.setdefault(freq_int, []).append(dbm)
     except Exception as exc:
         print(f"[scanner] Error parsing {csv_path}: {exc}", flush=True)
-        return []
+        return [], {}
 
     if not fine_bins:
-        return []
+        return [], {}
 
     avg_spectrum = sorted(
         (freq, sum(vals) / float(len(vals))) for freq, vals in fine_bins.items()
@@ -410,10 +445,25 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
     noise_floor = statistics.median(all_dbm)
     min_threshold = max(noise_floor + MIN_SNR_ABOVE_FLOOR_DB, ABSOLUTE_MIN_DBM)
 
+    block_grid = {}
     snapped_peaks = {}
     num_bins = len(avg_spectrum)
 
     for idx, (freq_hz, dbm) in enumerate(avg_spectrum):
+        snapped_25k = int(round(freq_hz / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
+        snr_db = round(dbm - noise_floor, 1)
+        grid_entry = {
+            "freq_hz": snapped_25k,
+            "dbm": round(dbm, 2),
+            "snr_db": snr_db,
+            "noise_floor": round(noise_floor, 2),
+        }
+        if (
+            snapped_25k not in block_grid
+            or grid_entry["dbm"] > block_grid[snapped_25k]["dbm"]
+        ):
+            block_grid[snapped_25k] = grid_entry
+
         if dbm < min_threshold:
             continue
 
@@ -438,13 +488,12 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
         if not is_local_max:
             continue
 
-        snapped_25k = int(round(freq_hz / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
-        snr_db = round(dbm - noise_floor, 1)
         entry = {
             "freq_hz": snapped_25k,
             "dbm": round(dbm, 2),
             "snr_db": snr_db,
             "noise_floor": round(noise_floor, 2),
+            "measured_peak": True,
         }
         if (
             snapped_25k not in snapped_peaks
@@ -468,7 +517,7 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
         )
         print(f"[scanner]     {cand_msg}", flush=True)
         emit_system_event(cand_msg)
-    return block_peaks
+    return block_peaks, block_grid
 
 
 def phase1_sweep_band(centers, cfg):
@@ -488,6 +537,7 @@ def phase1_sweep_band(centers, cfg):
     )
 
     merged_peaks = {}
+    merged_grid = {}
     for center_mhz in centers:
         if not RUNNING:
             break
@@ -504,7 +554,10 @@ def phase1_sweep_band(centers, cfg):
             time.sleep(0.5)
             continue
 
-        block_peaks = parse_block_csv(csv_path, start_hz, end_hz, center_hz)
+        block_peaks, block_grid = parse_block_csv(csv_path, start_hz, end_hz, center_hz)
+        for f_hz, g_entry in block_grid.items():
+            if f_hz not in merged_grid or g_entry["dbm"] > merged_grid[f_hz]["dbm"]:
+                merged_grid[f_hz] = g_entry
         for pk in block_peaks:
             f_hz = pk["freq_hz"]
             if f_hz not in merged_peaks or pk["dbm"] > merged_peaks[f_hz]["dbm"]:
@@ -512,19 +565,29 @@ def phase1_sweep_band(centers, cfg):
 
     all_peaks = list(merged_peaks.values())
     all_peaks.sort(key=lambda x: x["dbm"], reverse=True)
-    return all_peaks
+    return all_peaks, merged_grid
 
 
-def phase2_select_best_window(all_peaks, cfg):
+def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
     whitelist = load_whitelist()
     blacklist = load_blacklist()
+    measured_grid = measured_grid or {}
     now_ts = time.time()
     blacklist_modified = False
 
-    peaks_by_hz = {int(p["freq_hz"]): dict(p) for p in (all_peaks or [])}
-
     start_limit_hz = int(round(cfg["SCAN_START_MHZ"] * 1_000_000))
     end_limit_hz = int(round(cfg["SCAN_END_MHZ"] * 1_000_000))
+
+    peaks_by_hz = {}
+    for p in all_peaks or []:
+        f_hz = int(p["freq_hz"])
+        if not (start_limit_hz <= f_hz <= end_limit_hz):
+            continue
+        pk_copy = dict(p)
+        pk_copy["measured_peak"] = True
+        pk_copy["whitelisted"] = False
+        pk_copy["source"] = "MEASURED"
+        peaks_by_hz[f_hz] = pk_copy
 
     for wl_key, wl_info in whitelist.items():
         try:
@@ -533,17 +596,23 @@ def phase2_select_best_window(all_peaks, cfg):
             continue
         if not (start_limit_hz <= f_hz <= end_limit_hz):
             continue
+        wl_la = wl_info.get("la") if isinstance(wl_info, dict) else None
         if f_hz in peaks_by_hz:
             peaks_by_hz[f_hz]["whitelisted"] = True
-            peaks_by_hz[f_hz]["la"] = wl_info.get("la")
-        else:
+            peaks_by_hz[f_hz]["source"] = "MEASURED+WHITELIST"
+            if wl_la is not None:
+                peaks_by_hz[f_hz]["la"] = wl_la
+        elif not all_peaks:
+            grid_meas = measured_grid.get(f_hz)
             peaks_by_hz[f_hz] = {
                 "freq_hz": f_hz,
-                "dbm": -40.0,
-                "snr_db": 10.0,
-                "noise_floor": -50.0,
+                "dbm": grid_meas["dbm"] if grid_meas else None,
+                "snr_db": grid_meas["snr_db"] if grid_meas else None,
+                "noise_floor": grid_meas["noise_floor"] if grid_meas else None,
+                "measured_peak": False,
                 "whitelisted": True,
-                "la": wl_info.get("la"),
+                "source": "WHITELIST",
+                "la": wl_la,
             }
 
     if not peaks_by_hz:
@@ -588,14 +657,16 @@ def phase2_select_best_window(all_peaks, cfg):
             continue
         prev = unique_sorted[-1]
         if abs(cand["freq_hz"] - prev["freq_hz"]) < MIN_PEAK_SEPARATION_HZ:
-            if cand["dbm"] > prev["dbm"]:
+            cand_dbm = cand["dbm"] if cand.get("dbm") is not None else -999.0
+            prev_dbm = prev["dbm"] if prev.get("dbm") is not None else -999.0
+            if cand_dbm > prev_dbm:
                 unique_sorted[-1] = cand
         else:
             unique_sorted.append(cand)
 
     max_bandwidth_hz = MAX_WINDOW_SPAN_HZ
     best_window_peaks = []
-    best_score = (-1, -1e9, -1e9)
+    best_score = (-1, -1, -1e9, -1e9)
 
     for freq_a_obj in unique_sorted:
         freq_a = freq_a_obj["freq_hz"]
@@ -610,18 +681,27 @@ def phase2_select_best_window(all_peaks, cfg):
         if len(in_window) > MAX_PEAKS:
             in_window_strongest = sorted(
                 in_window,
-                key=lambda x: (x["snr_db"], x["dbm"]),
+                key=lambda x: (
+                    1 if x.get("measured_peak") else 0,
+                    x["snr_db"] if x.get("snr_db") is not None else -999.0,
+                    x["dbm"] if x.get("dbm") is not None else -999.0,
+                ),
                 reverse=True,
             )[:MAX_PEAKS]
             selected = sorted(in_window_strongest, key=lambda x: x["freq_hz"])
         else:
             selected = in_window
 
+        measured_count = sum(1 for p in selected if p.get("measured_peak"))
         density = len(selected)
-        total_snr = round(sum(p["snr_db"] for p in selected), 2)
-        total_dbm = round(sum(p["dbm"] for p in selected), 2)
+        total_snr = round(
+            sum(p["snr_db"] for p in selected if p.get("snr_db") is not None), 2
+        )
+        total_dbm = round(
+            sum(p["dbm"] for p in selected if p.get("dbm") is not None), 2
+        )
 
-        score = (density, total_snr, total_dbm)
+        score = (measured_count, density, total_snr, total_dbm)
         if score > best_score:
             best_score = score
             best_window_peaks = selected
@@ -653,7 +733,7 @@ def phase2_select_best_window(all_peaks, cfg):
         flush=True,
     )
     print(
-        "  Chan # | Frequency (MHz) | Frequency (Hz) | Signal (dBm) | SNR (dB) | Offset from Center",
+        "  Chan # | Frequency (MHz) | Frequency (Hz) | Signal (dBm) | SNR (dB) | Offset / Source",
         flush=True,
     )
     print(
@@ -665,12 +745,23 @@ def phase2_select_best_window(all_peaks, cfg):
         f_hz = pk["freq_hz"]
         f_mhz = f_hz / 1e6
         offset_khz = (f_hz - center_hz) / 1e3
+        dbm_val = pk.get("dbm")
+        snr_val = pk.get("snr_db")
+        dbm_str = f"{dbm_val:>7.1f} dBm" if dbm_val is not None else "    N/A dBm"
+        snr_str = f"+{snr_val:>4.1f} dB" if snr_val is not None else "  N/A dB"
+        wl_tag = " [WHITELIST]" if pk.get("whitelisted") else ""
+        la_tag = f" (LA {pk['la']})" if pk.get("la") is not None else ""
         print(
-            f"  #{idx:<5} | {f_mhz:>11.4f} MHz | {f_hz:>11} Hz | {pk['dbm']:>7.1f} dBm | "
-            f"+{pk['snr_db']:>4.1f} dB | {offset_khz:>+8.1f} kHz",
+            f"  #{idx:<5} | {f_mhz:>11.4f} MHz | {f_hz:>11} Hz | {dbm_str} | "
+            f"{snr_str} | {offset_khz:>+8.1f} kHz{wl_tag}{la_tag}",
             flush=True,
         )
-        win_parts.append(f"#{idx} {f_mhz:.4f} MHz ({pk['dbm']:.1f} dBm, +{pk['snr_db']:.1f} dB SNR)")
+        if dbm_val is not None and snr_val is not None:
+            win_parts.append(
+                f"#{idx} {f_mhz:.4f} MHz ({dbm_val:.1f} dBm, +{snr_val:.1f} dB SNR){wl_tag}{la_tag}"
+            )
+        else:
+            win_parts.append(f"#{idx} {f_mhz:.4f} MHz (static){wl_tag}{la_tag}")
     print(
         "==============================================================================================",
         flush=True,
@@ -925,14 +1016,16 @@ def main():
             print(f"[scanner] {cycle_msg}", flush=True)
             emit_system_event(cycle_msg)
 
-            all_peaks = phase1_sweep_band(centers, cfg)
+            all_peaks, measured_grid = phase1_sweep_band(centers, cfg)
             if not RUNNING:
                 break
             if os.path.exists(RELOAD_CONFIG_FLAG):
                 continue
 
             cfg = load_runtime_config()
-            center_hz, best_peaks = phase2_select_best_window(all_peaks, cfg)
+            center_hz, best_peaks = phase2_select_best_window(
+                all_peaks, cfg, measured_grid=measured_grid
+            )
             if not best_peaks or center_hz is None:
                 retry_msg = "No non-blacklisted TETRA carriers available. Retrying in 10s..."
                 print(f"[scanner] {retry_msg}", flush=True)
@@ -946,7 +1039,7 @@ def main():
 
             active_frequencies = [int(pk["freq_hz"]) for pk in best_peaks]
             channels_list = [
-                f"{pk['freq_hz']}:{idx}"
+                f"{pk['freq_hz']}:{pk.get('la') if pk.get('la') is not None else idx}"
                 for idx, pk in enumerate(best_peaks, start=1)
             ]
             channels_str = ",".join(channels_list)
