@@ -413,9 +413,31 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
     return None
 
 
-def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
+def classify_rf_peak(dbm, snr_db):
+    if dbm >= -12.0:
+        return "NEAR SATURATION"
+    if snr_db >= 8.0:
+        return "STRONG"
+    if snr_db >= 4.0:
+        return "GOOD"
+    if snr_db >= 2.5:
+        return "MODERATE"
+    return "WEAK/BORDERLINE"
+
+
+def classify_noise_floor(noise_floor):
+    if noise_floor > -29.0:
+        return "HIGH / OVERLOAD"
+    if noise_floor > -34.5:
+        return "ELEVATED"
+    if noise_floor >= -44.0:
+        return "OPTIMAL"
+    return "LOW"
+
+
+def parse_block_csv(csv_path, start_hz, end_hz, center_hz, current_gain=24.0):
     if not csv_path or not os.path.exists(csv_path):
-        return [], {}
+        return [], {}, None
 
     fine_bins = {}
     try:
@@ -459,10 +481,10 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
                     fine_bins.setdefault(freq_int, []).append(dbm)
     except Exception as exc:
         print(f"[scanner] Error parsing {csv_path}: {exc}", flush=True)
-        return [], {}
+        return [], {}, None
 
     if not fine_bins:
-        return [], {}
+        return [], {}, None
 
     avg_spectrum = sorted(
         (freq, sum(vals) / float(len(vals))) for freq, vals in fine_bins.items()
@@ -508,27 +530,60 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
 
     block_peaks = list(snapped_peaks.values())
     block_peaks.sort(key=lambda x: x["dbm"], reverse=True)
+    nf_status = classify_noise_floor(noise_floor)
     lines = [
         f"[PHASE 1 RESULT] {start_hz / 1e6:.3f} - {end_hz / 1e6:.3f} MHz | "
-        f"Noise floor: {noise_floor:.1f} dBm | Found {len(block_peaks)} RF peak(s):"
+        f"Noise floor: {noise_floor:.1f} dBm [{nf_status}] | Found {len(block_peaks)} RF peak(s):"
     ]
     if block_peaks:
         for pk in block_peaks[:8]:
+            q_label = classify_rf_peak(pk["dbm"], pk["snr_db"])
             lines.append(
-                f"  -> {pk['freq_hz'] / 1e6:.4f} MHz  |  {pk['dbm']:>6.1f} dBm  |  +{pk['snr_db']:.1f} dB SNR"
+                f"  -> {pk['freq_hz'] / 1e6:.4f} MHz  |  {pk['dbm']:>6.1f} dBm  |  +{pk['snr_db']:>4.1f} dB SNR  [{q_label}]"
             )
     else:
         lines.append("  -> None above threshold")
+
+    strongest_dbm = block_peaks[0]["dbm"] if block_peaks else -99.0
+    strongest_mhz = block_peaks[0]["freq_hz"] / 1e6 if block_peaks else 0.0
+    weak_count = sum(1 for pk in block_peaks if pk["snr_db"] < 3.5)
+
+    if noise_floor > -29.0:
+        rec_gain = max(0.0, round(current_gain - 8.0, 1))
+        lines.append(
+            f"  [RF ADVICE] High noise floor ({noise_floor:.1f} dBm) indicates RF front-end overload. "
+            f"Try lowering Gain from {current_gain:.1f} dB to ~{rec_gain:.1f} dB."
+        )
+    elif strongest_dbm >= -12.0:
+        rec_gain = max(0.0, round(current_gain - 5.0, 1))
+        lines.append(
+            f"  [RF ADVICE] Very strong carrier at {strongest_mhz:.4f} MHz ({strongest_dbm:.1f} dBm) is close to RTL-SDR ADC clipping "
+            f"and can cause ghost peaks in this 2 MHz block. If monitoring this sub-band, lower Gain to ~{rec_gain:.1f} dB."
+        )
+    elif len(block_peaks) >= 10 and weak_count >= 6:
+        rec_gain = max(0.0, round(current_gain - 3.0, 1))
+        lines.append(
+            f"  [RF ADVICE] High peak density ({len(block_peaks)} peaks, {weak_count} weak <3.5 dB SNR). "
+            f"If false ghost peaks persist, try lowering Gain slightly from {current_gain:.1f} dB to ~{rec_gain:.1f} dB."
+        )
+    elif noise_floor < -44.0 and not block_peaks:
+        rec_gain = min(49.6, round(current_gain + 6.0, 1))
+        lines.append(
+            f"  [RF ADVICE] Low noise floor ({noise_floor:.1f} dBm) with 0 peaks. "
+            f"Consider raising Gain from {current_gain:.1f} dB to ~{rec_gain:.1f} dB."
+        )
+
     block_summary = "\n".join(lines)
     print(block_summary, flush=True)
     emit_system_event(block_summary)
-    return block_peaks, block_grid
+    return block_peaks, block_grid, noise_floor
 
 
 def phase1_sweep_band(centers, cfg):
+    current_gain = float(cfg.get("RTL_GAIN", 24.0))
     sweep_start_msg = (
         f"[PHASE 1: RF SPECTRUM SWEEP]\n"
-        f"  Band: {cfg['SCAN_START_MHZ']:.1f} - {cfg['SCAN_END_MHZ']:.1f} MHz ({len(centers)} blocks x 2.0 MHz)\n"
+        f"  Band: {cfg['SCAN_START_MHZ']:.1f} - {cfg['SCAN_END_MHZ']:.1f} MHz ({len(centers)} blocks x 2.0 MHz, Gain: {current_gain:.1f} dB)\n"
         f"  Step: Measuring RF signal strength (25 kHz grid)"
     )
     print(sweep_start_msg, flush=True)
@@ -536,6 +591,7 @@ def phase1_sweep_band(centers, cfg):
 
     merged_peaks = {}
     merged_grid = {}
+    block_floors = []
     for center_mhz in centers:
         if not RUNNING:
             break
@@ -552,7 +608,11 @@ def phase1_sweep_band(centers, cfg):
             time.sleep(0.5)
             continue
 
-        block_peaks, block_grid = parse_block_csv(csv_path, start_hz, end_hz, center_hz)
+        block_peaks, block_grid, block_nf = parse_block_csv(
+            csv_path, start_hz, end_hz, center_hz, current_gain=current_gain
+        )
+        if block_nf is not None:
+            block_floors.append((center_mhz, block_nf, len(block_peaks)))
         for f_hz, g_entry in block_grid.items():
             if f_hz not in merged_grid or g_entry["dbm"] > merged_grid[f_hz]["dbm"]:
                 merged_grid[f_hz] = g_entry
@@ -567,9 +627,70 @@ def phase1_sweep_band(centers, cfg):
         f"[PHASE 1 DONE] Total unique RF candidates found: {len(all_peaks)}"
     ]
     for idx, p in enumerate(all_peaks[:8], start=1):
+        q_label = classify_rf_peak(p["dbm"], p["snr_db"])
         done_lines.append(
-            f"  #{idx}: {p['freq_hz'] / 1e6:.4f} MHz  ({p['dbm']:.1f} dBm, +{p['snr_db']:.1f} dB SNR)"
+            f"  #{idx}: {p['freq_hz'] / 1e6:.4f} MHz  ({p['dbm']:.1f} dBm, +{p['snr_db']:.1f} dB SNR) [{q_label}]"
         )
+
+    if block_floors:
+        nf_vals = [nf for _, nf, _ in block_floors]
+        med_nf = statistics.median(nf_vals)
+        min_nf = min(nf_vals)
+        max_nf = max(nf_vals)
+        nf_label = classify_noise_floor(med_nf)
+
+        strong_peaks = [p for p in all_peaks if p["snr_db"] >= 4.0]
+        moderate_peaks = [p for p in all_peaks if 2.5 <= p["snr_db"] < 4.0]
+        weak_peaks = [p for p in all_peaks if p["snr_db"] < 2.5]
+        overload_peaks = [p for p in all_peaks if p["dbm"] >= -12.0]
+
+        done_lines.append("  ------------------------------------------------------------")
+        done_lines.append("  [RF HEALTH & GAIN ADVISOR]")
+        done_lines.append(
+            f"  Noise Floor : Median {med_nf:.1f} dBm (range {min_nf:.1f} to {max_nf:.1f} dBm) -> {nf_label} (Target: -44 to -35 dBm)"
+        )
+        done_lines.append(
+            f"  Peak Quality: {len(strong_peaks)} Strong/Good (>=4 dB SNR), "
+            f"{len(moderate_peaks)} Moderate (2.5-4 dB), {len(weak_peaks)} Weak (<2.5 dB)"
+        )
+
+        if med_nf > -29.0:
+            rec_gain = max(0.0, round(current_gain - 8.0, 1))
+            done_lines.append(
+                f"  Gain Advice : REDUCE GAIN. Median noise floor ({med_nf:.1f} dBm) is too high and masks TETRA signals. "
+                f"Lower Gain from {current_gain:.1f} dB to ~{rec_gain:.1f} dB."
+            )
+        elif med_nf > -34.5:
+            rec_gain = max(0.0, round(current_gain - 4.0, 1))
+            done_lines.append(
+                f"  Gain Advice : SLIGHTLY HIGH GAIN. Noise floor ({med_nf:.1f} dBm) is elevated. "
+                f"Try lowering Gain from {current_gain:.1f} dB to ~{rec_gain:.1f} dB for cleaner SNR."
+            )
+        elif med_nf < -44.0 and len(strong_peaks) < 2:
+            rec_gain = min(49.6, round(current_gain + 6.0, 1))
+            done_lines.append(
+                f"  Gain Advice : INCREASE GAIN. Noise floor ({med_nf:.1f} dBm) is low and few strong signals were found. "
+                f"Try raising Gain from {current_gain:.1f} dB to ~{rec_gain:.1f} dB."
+            )
+        elif overload_peaks:
+            ov_list = ", ".join(f"{p['freq_hz']/1e6:.4f} MHz ({p['dbm']:.1f} dBm)" for p in overload_peaks[:2])
+            rec_gain = max(0.0, round(current_gain - 4.0, 1))
+            done_lines.append(
+                f"  Gain Advice : GOOD OVERALL (Gain {current_gain:.1f} dB is optimal for most blocks), "
+                f"but near-saturation blocker(s) at {ov_list} may cause ghost peaks in their local 2 MHz block. "
+                f"Keep Gain {current_gain:.1f} dB for weak TETRA bands, or lower to ~{rec_gain:.1f} dB / narrow Scan Start-End if targeting that block."
+            )
+        elif len(strong_peaks) == 0 and len(all_peaks) > 0:
+            rec_gain = min(49.6, round(current_gain + 4.0, 1))
+            done_lines.append(
+                f"  Gain Advice : WEAK SIGNALS ONLY (max SNR +{all_peaks[0]['snr_db']:.1f} dB). "
+                f"Noise floor ({med_nf:.1f} dBm) is healthy; try testing Gain ~{rec_gain:.1f} dB or check antenna placement."
+            )
+        else:
+            done_lines.append(
+                f"  Gain Advice : OPTIMAL (Gain {current_gain:.1f} dB). Noise floor ({med_nf:.1f} dBm) and dynamic range are well balanced."
+            )
+
     p1_done_msg = "\n".join(done_lines)
     print(p1_done_msg, flush=True)
     emit_system_event(p1_done_msg)
