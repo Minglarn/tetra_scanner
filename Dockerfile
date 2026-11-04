@@ -2,12 +2,12 @@ FROM ubuntu:20.04
 
 LABEL org.opencontainers.image.title="tetra_scanner"
 LABEL org.opencontainers.image.description="Multi-channel TETRA data and signaling decoder for MCC 240 / MNC 11"
-LABEL org.opencontainers.image.version="2026.11.04.2"
 LABEL org.opencontainers.image.source="https://github.com/Minglarn/tetra_scanner"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV APP_VERSION=2026.11.04.2
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -37,9 +37,8 @@ RUN git clone https://gitlab.com/larryth/tetra-kit.git /opt/tetra-kit \
 
 RUN mkdir -p /app/src /app/logs
 
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
-ENV APP_VERSION=2026.11.04.2
+LABEL org.opencontainers.image.version="2026.11.04.3"
+ENV APP_VERSION=2026.11.04.3
 ENV APP_RELEASE_DATE=2026-11-04
 
 COPY src/tetra_multi_rtl.py /app/src/tetra_multi_rtl.py

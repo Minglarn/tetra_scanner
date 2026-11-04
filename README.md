@@ -4,7 +4,7 @@ Realtidsavkodare och frekvensskanner för TETRA-basstationer med en enda RTL-SDR
 - **Static Mode (`MODE=static`)**: Lyssnar kontinuerligt på upp till 6 fasta TETRA-bärvågor inom ett 2.0 MHz-fönster (standard: MCC 240 / MNC 11 på `427.000-428.500 MHz`).
 - **Auto-Discovery Scanner Mode (`MODE=scanner`)**: Sveper automatiskt valfritt frekvensband (t.ex. `410-430 MHz`) i 2 MHz-block, hittar aktiva TETRA-bärvågor och avkodar både nätverksidentitet (`MCC`, `MNC`, `LA`) och datatrafik.
 
-Version (CalVer): `2026.11.04.1`
+Version (CalVer): `2026.11.04.3`
 
 ---
 

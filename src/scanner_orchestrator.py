@@ -42,11 +42,12 @@ RTL_PPM = parse_env_int("RTL_PPM", 0)
 MAX_PEAKS = 6
 PTS_GRID_HZ = 25000
 MIN_PEAK_SEPARATION_HZ = 25000
-DC_SPIKE_GUARD_HZ = 25000
-EDGE_GUARD_HZ = 25000
+LOCAL_PEAK_RADIUS_HZ = 16000
+DC_SPIKE_GUARD_HZ = 15000
+EDGE_GUARD_HZ = 15000
 MAX_WINDOW_SPAN_HZ = 1900000
-MIN_SNR_ABOVE_FLOOR_DB = parse_env_float("SCAN_MIN_SNR_DB", 5.0)
-ABSOLUTE_MIN_DBM = parse_env_float("SCAN_MIN_DBM", -45.0)
+MIN_SNR_ABOVE_FLOOR_DB = parse_env_float("SCAN_MIN_SNR_DB", 3.0)
+ABSOLUTE_MIN_DBM = parse_env_float("SCAN_MIN_DBM", -65.0)
 
 PAYLOAD_TAGS = ("[SDS]", "[CALL]", "[STATUS]", "[ROAMING]")
 
@@ -125,20 +126,20 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz):
         "rtl_power",
         "-d",
         str(RTL_DEVICE_INDEX),
+        "-f",
+        f"{start_hz}:{end_hz}:2k",
         "-g",
         str(RTL_GAIN),
         "-p",
         str(RTL_PPM),
-        "-f",
-        f"{start_hz}:{end_hz}:12.5k",
         "-i",
-        "5",
+        "10",
         "-1",
         csv_path,
     ]
     print(
         f"[scanner] [PHASE 1: SWEEP] Scanning {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz "
-        f"(center {center_mhz:.3f} MHz) -> {csv_path}",
+        f"(center {center_mhz:.3f} MHz, 2k step, 10s integration) -> {csv_path}",
         flush=True,
     )
     try:
@@ -147,7 +148,7 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=25,
+            timeout=35,
             check=False,
         )
         if res.returncode != 0:
@@ -168,7 +169,7 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
     if not csv_path or not os.path.exists(csv_path):
         return []
 
-    bin_accum = {}
+    fine_bins = {}
     try:
         with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
             reader = csv.reader(f)
@@ -206,39 +207,78 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz):
                         or raw_freq > (end_hz - EDGE_GUARD_HZ)
                     ):
                         continue
-                    snapped_25k = int(round(raw_freq / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
-                    bin_accum.setdefault(snapped_25k, []).append(dbm)
+                    freq_int = int(round(raw_freq))
+                    fine_bins.setdefault(freq_int, []).append(dbm)
     except Exception as exc:
         print(f"[scanner] Error parsing {csv_path}: {exc}", flush=True)
         return []
 
-    if not bin_accum:
+    if not fine_bins:
         return []
 
-    peak_per_25k = {freq: max(vals) for freq, vals in bin_accum.items()}
-    all_dbm = list(peak_per_25k.values())
+    avg_spectrum = sorted(
+        (freq, sum(vals) / float(len(vals))) for freq, vals in fine_bins.items()
+    )
+    all_dbm = [dbm for _, dbm in avg_spectrum]
     noise_floor = statistics.median(all_dbm)
     min_threshold = max(noise_floor + MIN_SNR_ABOVE_FLOOR_DB, ABSOLUTE_MIN_DBM)
 
-    block_peaks = []
-    for freq_hz, dbm in peak_per_25k.items():
-        if dbm >= min_threshold:
-            snr_db = round(dbm - noise_floor, 1)
-            block_peaks.append(
-                {
-                    "freq_hz": freq_hz,
-                    "dbm": round(dbm, 2),
-                    "snr_db": snr_db,
-                    "noise_floor": round(noise_floor, 2),
-                }
-            )
+    snapped_peaks = {}
+    num_bins = len(avg_spectrum)
 
+    for idx, (freq_hz, dbm) in enumerate(avg_spectrum):
+        if dbm < min_threshold:
+            continue
+
+        is_local_max = True
+        j = idx - 1
+        while j >= 0 and (freq_hz - avg_spectrum[j][0]) <= LOCAL_PEAK_RADIUS_HZ:
+            if avg_spectrum[j][1] > dbm:
+                is_local_max = False
+                break
+            j -= 1
+
+        if not is_local_max:
+            continue
+
+        j = idx + 1
+        while j < num_bins and (avg_spectrum[j][0] - freq_hz) <= LOCAL_PEAK_RADIUS_HZ:
+            if avg_spectrum[j][1] > dbm:
+                is_local_max = False
+                break
+            j += 1
+
+        if not is_local_max:
+            continue
+
+        snapped_25k = int(round(freq_hz / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
+        snr_db = round(dbm - noise_floor, 1)
+        entry = {
+            "freq_hz": snapped_25k,
+            "dbm": round(dbm, 2),
+            "snr_db": snr_db,
+            "noise_floor": round(noise_floor, 2),
+        }
+        if (
+            snapped_25k not in snapped_peaks
+            or entry["dbm"] > snapped_peaks[snapped_25k]["dbm"]
+        ):
+            snapped_peaks[snapped_25k] = entry
+
+    block_peaks = list(snapped_peaks.values())
     block_peaks.sort(key=lambda x: x["dbm"], reverse=True)
     print(
         f"[scanner]   Block {start_hz / 1e6:.3f}-{end_hz / 1e6:.3f} MHz | "
-        f"Noise floor: {noise_floor:.1f} dBm | Candidates >= {min_threshold:.1f} dBm: {len(block_peaks)}",
+        f"Noise floor: {noise_floor:.1f} dBm | Threshold (+{MIN_SNR_ABOVE_FLOOR_DB:.1f} dB): "
+        f"{min_threshold:.1f} dBm | Peaks found: {len(block_peaks)}",
         flush=True,
     )
+    for pk in block_peaks[:8]:
+        print(
+            f"[scanner]     Candidate: {pk['freq_hz'] / 1e6:.4f} MHz "
+            f"({pk['dbm']:.1f} dBm, +{pk['snr_db']:.1f} dB SNR)",
+            flush=True,
+        )
     return block_peaks
 
 
@@ -248,8 +288,8 @@ def phase1_sweep_band(centers):
         flush=True,
     )
     print(
-        f"[scanner] [PHASE 1: SWEEP] Starting full-band hunt across "
-        f"{SCAN_START_MHZ:.3f}-{SCAN_END_MHZ:.3f} MHz (25 kHz PTS grid)",
+        f"[scanner] [PHASE 1: SWEEP] Starting high-resolution full-band hunt across "
+        f"{SCAN_START_MHZ:.3f}-{SCAN_END_MHZ:.3f} MHz (2 kHz step -> 25 kHz PTS grid)",
         flush=True,
     )
     print(
