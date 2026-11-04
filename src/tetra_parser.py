@@ -12,9 +12,16 @@ import base64
 import zlib
 import wave
 import shutil
+import logging
 import threading
 import subprocess
 from datetime import datetime, timezone
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    stream=sys.stdout,
+)
 
 try:
     import paho.mqtt.client as mqtt
@@ -22,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.14")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.15")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -57,7 +64,9 @@ UDP_OUT_INCLUDE_RAW = os.environ.get("UDP_OUT_INCLUDE_RAW", "false").lower() in 
 HOST_NAME = os.environ.get("HOST_NAME", "iridium")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
-MIN_VOICE_FRAMES = int(os.environ.get("MIN_VOICE_FRAMES", "12"))
+MIN_VOICE_FRAMES = int(os.environ.get("MIN_VOICE_FRAMES", "6"))
+VOICE_SPLIT_TIMEOUT_S = float(os.environ.get("VOICE_SPLIT_TIMEOUT_S", "1.5"))
+MAX_AUDIO_FILES = int(os.environ.get("MAX_AUDIO_FILES", "500"))
 LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 DISCOVERED_NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
 WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
@@ -1543,6 +1552,32 @@ def main():
                 return path
         return shutil.which(name)
 
+    def cleanup_old_audio_files(max_files=MAX_AUDIO_FILES):
+        if max_files <= 0 or not os.path.isdir(AUDIO_DIR):
+            return
+        try:
+            wav_entries = []
+            for fname in os.listdir(AUDIO_DIR):
+                if not fname.lower().endswith(".wav"):
+                    continue
+                fpath = os.path.join(AUDIO_DIR, fname)
+                try:
+                    if os.path.isfile(fpath):
+                        wav_entries.append((os.path.getmtime(fpath), fpath))
+                except OSError:
+                    continue
+            if len(wav_entries) <= max_files:
+                return
+            wav_entries.sort(key=lambda item: item[0])
+            to_delete = wav_entries[: len(wav_entries) - max_files]
+            for _, fpath in to_delete:
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+        except Exception as exc:
+            logging.error("[parser] Failed cleaning up old audio files in %s: %s", AUDIO_DIR, exc)
+
     def decode_and_emit_voice(buf):
         frames = buf.get("frames") or []
         if len(frames) < MIN_VOICE_FRAMES:
@@ -1561,6 +1596,7 @@ def main():
         now_ts = time.time()
         ts_int = int(now_ts)
         ts_ms = int(now_ts * 1000)
+        tid = threading.get_ident()
         now_iso = datetime.now(timezone.utc).isoformat()
 
         raw_chunks = []
@@ -1580,7 +1616,7 @@ def main():
             return
 
         out_bytes = b"".join(raw_chunks)
-        tmp_base = f"/tmp/voice_{ts_ms}_{safe_ssi}"
+        tmp_base = f"/tmp/voice_{ts_ms}_{tid}_{safe_ssi}"
         out_path = f"{tmp_base}.out"
         cod_path = f"{tmp_base}.cod"
         raw_path = f"{tmp_base}.raw"
@@ -1596,60 +1632,84 @@ def main():
             cdecoder_bin = find_codec_binary("cdecoder")
             sdecoder_bin = find_codec_binary("sdecoder")
 
-            if cdecoder_bin and sdecoder_bin:
-                subprocess.run(
-                    [cdecoder_bin, out_path, cod_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=20,
-                    check=False,
+            if not cdecoder_bin or not sdecoder_bin:
+                logging.error(
+                    "[parser] ETSI codec binary missing (cdecoder=%s, sdecoder=%s). Dropping %d voice frames on %s MHz.",
+                    cdecoder_bin,
+                    sdecoder_bin,
+                    len(raw_chunks),
+                    freq_mhz,
                 )
-                if os.path.exists(cod_path) and os.path.getsize(cod_path) > 0:
-                    subprocess.run(
-                        [sdecoder_bin, cod_path, raw_path],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=20,
-                        check=False,
-                    )
-
-            if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 1920:
                 return
 
-            pcm_bytes_len = os.path.getsize(raw_path)
-            sox_bin = shutil.which("sox")
-            if sox_bin:
-                subprocess.run(
-                    [
-                        sox_bin,
-                        "-r",
-                        "8k",
-                        "-e",
-                        "signed",
-                        "-b",
-                        "16",
-                        "-c",
-                        "1",
-                        raw_path,
-                        wav_path,
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=20,
-                    check=False,
+            cdec_res = subprocess.run(
+                [cdecoder_bin, out_path, cod_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if cdec_res.returncode != 0:
+                logging.error(
+                    "[parser] cdecoder failed (exit %s) on %s MHz (SSI %s): %s",
+                    cdec_res.returncode,
+                    freq_mhz,
+                    ssi_label,
+                    (cdec_res.stderr or cdec_res.stdout or "").strip(),
                 )
+                return
 
-            if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
-                pcm_source = open(raw_path, "rb").read()
-                if len(pcm_source) % 2 == 1:
-                    pcm_source += b"\x00"
-                with wave.open(wav_path, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(8000)
-                    wf.writeframes(pcm_source)
+            if not os.path.exists(cod_path) or os.path.getsize(cod_path) == 0:
+                logging.error(
+                    "[parser] cdecoder produced empty .cod output for %d frames on %s MHz (SSI %s)",
+                    len(raw_chunks),
+                    freq_mhz,
+                    ssi_label,
+                )
+                return
+
+            sdec_res = subprocess.run(
+                [sdecoder_bin, cod_path, raw_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            if sdec_res.returncode != 0:
+                logging.error(
+                    "[parser] sdecoder failed (exit %s) on %s MHz (SSI %s): %s",
+                    sdec_res.returncode,
+                    freq_mhz,
+                    ssi_label,
+                    (sdec_res.stderr or sdec_res.stdout or "").strip(),
+                )
+                return
+
+            if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 960:
+                logging.error(
+                    "[parser] sdecoder produced insufficient .raw PCM data (%d bytes) on %s MHz (SSI %s)",
+                    os.path.getsize(raw_path) if os.path.exists(raw_path) else 0,
+                    freq_mhz,
+                    ssi_label,
+                )
+                return
+
+            with open(raw_path, "rb") as rf:
+                pcm_source = rf.read()
+
+            pcm_bytes_len = len(pcm_source)
+            if pcm_bytes_len % 2 == 1:
+                pcm_source += b"\x00"
+
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(8000)
+                wf.writeframes(pcm_source)
         except Exception as exc:
-            print(f"[parser] Voice WAV conversion error: {exc}", flush=True)
+            logging.error("[parser] Voice WAV conversion error on %s MHz: %s", freq_mhz, exc)
             return
         finally:
             for p in (out_path, cod_path, raw_path):
@@ -1659,8 +1719,10 @@ def main():
                 except OSError:
                     pass
 
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1964:
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1004:
             return
+
+        cleanup_old_audio_files(MAX_AUDIO_FILES)
 
         duration_s = round(pcm_bytes_len / 16000.0, 1)
         badge = format_unit_badge(ssi, unit_registry) if ssi is not None else ""
@@ -1694,6 +1756,36 @@ def main():
         }
         emit_event(voice_event)
 
+    def flush_voice_buffer(key, usage_marker=None, ssi=None, gssi=None):
+        to_decode = []
+        freq_match = key[0] if isinstance(key, tuple) and key else str(key)
+        with voice_lock:
+            if key in voice_buffers:
+                to_decode.append(voice_buffers.pop(key))
+            else:
+                for b_key, buf in list(voice_buffers.items()):
+                    if b_key[0] != freq_match:
+                        continue
+                    if (
+                        (usage_marker is not None and buf.get("usage_marker") == usage_marker)
+                        or (ssi is not None and buf.get("ssi") == ssi)
+                        or (gssi is not None and buf.get("gssi") == gssi)
+                        or (usage_marker is None and ssi is None and gssi is None)
+                    ):
+                        to_decode.append(voice_buffers.pop(b_key))
+                if not to_decode:
+                    for b_key in list(voice_buffers.keys()):
+                        if b_key[0] == freq_match:
+                            to_decode.append(voice_buffers.pop(b_key))
+
+        for buf in to_decode:
+            if len(buf.get("frames") or []) >= MIN_VOICE_FRAMES:
+                threading.Thread(
+                    target=decode_and_emit_voice,
+                    args=(buf,),
+                    daemon=True,
+                ).start()
+
     def flush_expired_voice_buffers(now_ts, force=False):
         ready = []
         with voice_lock:
@@ -1704,12 +1796,17 @@ def main():
             decode_and_emit_voice(buf)
 
     def voice_monitor_worker():
+        last_cleanup = 0.0
         while running:
             time.sleep(0.5)
+            now_ts = time.time()
             try:
-                flush_expired_voice_buffers(time.time(), force=False)
-            except Exception:
-                pass
+                flush_expired_voice_buffers(now_ts, force=False)
+                if now_ts - last_cleanup >= 30.0:
+                    cleanup_old_audio_files(MAX_AUDIO_FILES)
+                    last_cleanup = now_ts
+            except Exception as exc:
+                logging.error("[parser] Error in voice_monitor_worker: %s", exc)
 
     voice_thread = threading.Thread(target=voice_monitor_worker, daemon=True)
     voice_thread.start()
@@ -1789,7 +1886,7 @@ def main():
                 buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or 1))
                 with voice_lock:
                     buf = voice_buffers.get(buf_key)
-                    if buf is not None and (now_ts - buf["last_seen"] > 0.6):
+                    if buf is not None and (now_ts - buf["last_seen"] > VOICE_SPLIT_TIMEOUT_S):
                         old_buf = voice_buffers.pop(buf_key)
                         if len(old_buf.get("frames", [])) >= MIN_VOICE_FRAMES:
                             threading.Thread(
@@ -2056,6 +2153,13 @@ def main():
                 "human_text": human_text,
             }
             emit_event(event, raw_pkt=pkt)
+            if pdu in ("D-TX CEASED", "D-RELEASE"):
+                flush_voice_buffer(
+                    (freq_str, usage_marker or ssi or 1),
+                    usage_marker=usage_marker,
+                    ssi=ssi,
+                    gssi=gssi,
+                )
             return
 
         if "LOCATION UPDATE" in pdu:

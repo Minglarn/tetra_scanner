@@ -46,20 +46,24 @@ RUN pip3 install --no-cache-dir \
     aiofiles
 
 RUN git clone https://gitlab.com/larryth/tetra-kit.git /opt/tetra-kit \
-    && cd /opt/tetra-kit \
-    && chmod +x build.sh \
-    && (./build.sh || true) \
-    && cd /opt/tetra-kit/decoder && make \
-    && (cd /opt/tetra-kit/recorder && make || true) \
-    && find /opt/tetra-kit -type f -name "cdecoder" -exec cp {} /usr/local/bin/cdecoder \; \
-    && find /opt/tetra-kit -type f -name "sdecoder" -exec cp {} /usr/local/bin/sdecoder \; \
-    && chmod +x /usr/local/bin/cdecoder /usr/local/bin/sdecoder 2>/dev/null || true
+    && cd /opt/tetra-kit/decoder \
+    && make clean \
+    && make \
+    && cd /opt/tetra-kit/codec \
+    && make clean \
+    && make \
+    && cp -f /opt/tetra-kit/codec/cdecoder /usr/local/bin/cdecoder \
+    && cp -f /opt/tetra-kit/codec/sdecoder /usr/local/bin/sdecoder \
+    && chmod +x /usr/local/bin/cdecoder /usr/local/bin/sdecoder \
+    && test -x /usr/local/bin/cdecoder \
+    && test -x /usr/local/bin/sdecoder \
+    && test -x /opt/tetra-kit/decoder/decoder
 
 RUN mkdir -p /app/src/templates /app/logs/audio /app/data \
     && ln -sfn /app/logs/audio /app/data/audio
 
-LABEL org.opencontainers.image.version="2026.11.04.14"
-ENV APP_VERSION=2026.11.04.14
+LABEL org.opencontainers.image.version="2026.11.04.15"
+ENV APP_VERSION=2026.11.04.15
 ENV APP_RELEASE_DATE=2026-11-04
 
 COPY src/tetra_multi_rtl.py /app/src/tetra_multi_rtl.py
