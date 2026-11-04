@@ -16,6 +16,7 @@ import logging
 import threading
 import subprocess
 from datetime import datetime, timezone
+import db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +30,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.30")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.31")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -854,6 +855,7 @@ def setup_mqtt():
 def main():
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(AUDIO_DIR, exist_ok=True)
+    db.init_db()
     channels = parse_channels(TETRA_CHANNELS_STR)
     udp_targets = parse_udp_targets(UDP_OUT_TARGETS_STR) if UDP_OUT_ENABLED else []
 
@@ -1062,6 +1064,8 @@ def main():
                 f.write(json.dumps(event_dict, ensure_ascii=False) + "\n")
         except Exception as exc:
             print(f"[parser] Log write error: {exc}", flush=True)
+
+        db.record_event(event_dict)
 
         if mqtt_client is not None:
             payload_str = json.dumps(event_dict, ensure_ascii=False)
@@ -2007,6 +2011,7 @@ def main():
         now_ts = time.time()
 
         stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
+        db.record_raw_packet_stat(freq_str, ch.get("la"), now_ts=now_ts)
 
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
@@ -2506,6 +2511,7 @@ def main():
         hb_interval = 60.0
         if now_ts - last_heartbeat >= hb_interval:
             first_hb_sent = True
+            db.flush_packet_stats_dict()
             hb_payload = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "host": HOST_NAME,
@@ -2534,6 +2540,7 @@ def main():
 
     flush_expired_sds(time.time(), force=True)
     flush_expired_voice_buffers(time.time(), force=True)
+    db.flush_packet_stats_dict()
     if mqtt_client is not None:
         mqtt_client.publish(
             f"{MQTT_BASE_TOPIC}/status", payload="offline", qos=1, retain=True

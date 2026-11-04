@@ -11,6 +11,7 @@ import threading
 import subprocess
 import statistics
 from datetime import datetime, timezone
+import db
 
 
 def parse_env_int(key, default):
@@ -221,6 +222,7 @@ def emit_system_event(human_text):
             f.flush()
     except Exception as exc:
         print(f"[scanner] Warning: failed writing system event: {exc}", flush=True)
+    db.record_event(event_obj)
 
 
 def clear_frequency_strikes(freq_list_hz):
@@ -694,6 +696,7 @@ def phase1_sweep_band(centers, cfg):
     p1_done_msg = "\n".join(done_lines)
     print(p1_done_msg, flush=True)
     emit_system_event(p1_done_msg)
+    db.record_rf_sweep_peaks(all_peaks)
     return all_peaks, merged_grid
 
 

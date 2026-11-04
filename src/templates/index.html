@@ -290,61 +290,247 @@
 
     </aside>
 
-    <!-- Main Panel: Real-time Event Stream (Newest First) -->
+    <!-- Main Panel: Live Stream / SQLite History Archive / Frequency & Unit Analytics -->
     <section class="lg:col-span-3 bg-gray-900 border border-gray-800 rounded-lg flex flex-col h-[85vh]">
-      <!-- Filter Bar -->
-      <div class="px-4 py-3 border-b border-gray-800 bg-gray-900/90 flex flex-wrap items-center justify-between gap-3">
-        <div class="flex flex-wrap items-center gap-4 text-xs">
-          <span class="text-gray-400 font-semibold uppercase tracking-wider">Filters:</span>
 
-          <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
-            <input type="checkbox" id="filter-triona" checked class="accent-emerald-500 rounded" />
-            <span class="text-gray-200">Show TrionaGateway</span>
-          </label>
-
-          <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
-            <input type="checkbox" id="filter-control" checked class="accent-emerald-500 rounded" />
-            <span class="text-gray-200">Show Control Frames</span>
-          </label>
-
-          <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
-            <input type="checkbox" id="filter-system" checked class="accent-emerald-500 rounded" />
-            <span class="text-gray-200">Show System Events</span>
-          </label>
-
-          <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
-            <input type="checkbox" id="filter-raw-mac" class="accent-emerald-500 rounded" />
-            <span class="text-gray-400">Show Raw Data (TETRA System Noise)</span>
-          </label>
-
-          <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-emerald-950/60 border border-emerald-700/70 px-2.5 py-1 rounded hover:border-emerald-500">
-            <input type="checkbox" id="autoplay-voice" checked class="accent-emerald-500 rounded" />
-            <span class="text-emerald-200">Auto-Play Voice</span>
-          </label>
-
-          <span class="text-[11px] text-gray-500 uppercase tracking-wider">Order: Newest First</span>
-        </div>
-
-        <div class="flex items-center gap-2">
-          <input
-            type="text"
-            id="search-input"
-            placeholder="Filter by SSI, frequency or text..."
-            class="bg-gray-950 border border-gray-700 rounded px-3 py-1 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-emerald-500 w-56"
-          />
-          <button
-            id="clear-log-btn"
-            class="text-xs px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition"
-          >
-            Clear
+      <!-- Top View Switcher -->
+      <div class="px-4 py-2.5 border-b border-gray-800 bg-gray-950/70 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div class="flex items-center gap-1.5">
+          <button id="main-tab-live" type="button" class="px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded bg-emerald-950/90 text-emerald-300 border border-emerald-700/70 transition">
+            Live Stream
           </button>
+          <button id="main-tab-history" type="button" class="px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded text-gray-400 hover:text-gray-200 border border-transparent transition">
+            History Archive (SQLite)
+          </button>
+          <button id="main-tab-analytics" type="button" class="px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded text-gray-400 hover:text-gray-200 border border-transparent transition">
+            Frequency &amp; Unit Analytics
+          </button>
+        </div>
+        <div class="text-[11px] text-gray-500">
+          Database: <span class="text-cyan-400 font-semibold">SQLite WAL</span> (<span id="db-size-label">-- KB</span>)
         </div>
       </div>
 
-      <!-- Log Stream Container -->
-      <div id="log-stream" class="flex-1 overflow-y-auto p-3 space-y-1.5 bg-gray-950/60 text-xs">
-        <div id="empty-log-placeholder" class="text-gray-500 italic py-8 text-center">
-          Waiting for real-time TETRA events...
+      <!-- VIEW 1: LIVE EVENT STREAM -->
+      <div id="main-view-live" class="flex-1 flex flex-col min-h-0">
+        <!-- Filter Bar -->
+        <div class="px-4 py-3 border-b border-gray-800 bg-gray-900/90 flex flex-wrap items-center justify-between gap-3">
+          <div class="flex flex-wrap items-center gap-4 text-xs">
+            <span class="text-gray-400 font-semibold uppercase tracking-wider">Filters:</span>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
+              <input type="checkbox" id="filter-triona" checked class="accent-emerald-500 rounded" />
+              <span class="text-gray-200">Show TrionaGateway</span>
+            </label>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
+              <input type="checkbox" id="filter-control" checked class="accent-emerald-500 rounded" />
+              <span class="text-gray-200">Show Control Frames</span>
+            </label>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
+              <input type="checkbox" id="filter-system" checked class="accent-emerald-500 rounded" />
+              <span class="text-gray-200">Show System Events</span>
+            </label>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
+              <input type="checkbox" id="filter-raw-mac" class="accent-emerald-500 rounded" />
+              <span class="text-gray-400">Show Raw Data (TETRA System Noise)</span>
+            </label>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-emerald-950/60 border border-emerald-700/70 px-2.5 py-1 rounded hover:border-emerald-500">
+              <input type="checkbox" id="autoplay-voice" checked class="accent-emerald-500 rounded" />
+              <span class="text-emerald-200">Auto-Play Voice</span>
+            </label>
+
+            <span class="text-[11px] text-gray-500 uppercase tracking-wider">Order: Newest First</span>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <input
+              type="text"
+              id="search-input"
+              placeholder="Filter by SSI, frequency or text..."
+              class="bg-gray-950 border border-gray-700 rounded px-3 py-1 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-emerald-500 w-56"
+            />
+            <button
+              id="clear-log-btn"
+              class="text-xs px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 rounded transition"
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+
+        <!-- Log Stream Container -->
+        <div id="log-stream" class="flex-1 overflow-y-auto p-3 space-y-1.5 bg-gray-950/60 text-xs">
+          <div id="empty-log-placeholder" class="text-gray-500 italic py-8 text-center">
+            Waiting for real-time TETRA events...
+          </div>
+        </div>
+      </div>
+
+      <!-- VIEW 2: HISTORY ARCHIVE (SQLITE) -->
+      <div id="main-view-history" class="hidden flex-1 flex-col min-h-0">
+        <div class="px-4 py-3 border-b border-gray-800 bg-gray-900/90 flex flex-wrap items-center justify-between gap-2 text-xs">
+          <div class="flex flex-wrap items-center gap-2">
+            <select id="hist-category" class="bg-gray-950 border border-gray-700 rounded px-2.5 py-1 text-gray-200 focus:outline-none focus:border-emerald-500">
+              <option value="ALL">All Payload Categories (No System)</option>
+              <option value="SDS,VOICE">Voice + SDS Text Only</option>
+              <option value="VOICE">VOICE Recordings Only</option>
+              <option value="SDS">SDS Text / Telemetry Only</option>
+              <option value="CALL">CALL Setup / Grants Only</option>
+              <option value="STATUS">STATUS Messages Only</option>
+              <option value="ROAMING">ROAMING Only</option>
+              <option value="NETWORK">NETWORK Discovery Only</option>
+              <option value="SYSTEM">SYSTEM Events Only</option>
+            </select>
+
+            <select id="hist-hours" class="bg-gray-950 border border-gray-700 rounded px-2.5 py-1 text-gray-200 focus:outline-none focus:border-emerald-500">
+              <option value="6">Last 6 Hours</option>
+              <option value="12">Last 12 Hours (Overnight)</option>
+              <option value="24" selected>Last 24 Hours</option>
+              <option value="72">Last 3 Days</option>
+              <option value="168">Last 7 Days</option>
+              <option value="0">All Saved History</option>
+            </select>
+
+            <input id="hist-freq" type="text" placeholder="Freq (e.g. 427.8500)" class="bg-gray-950 border border-gray-700 rounded px-2.5 py-1 text-gray-200 placeholder-gray-500 w-36 focus:outline-none focus:border-emerald-500" />
+            <input id="hist-ssi" type="text" placeholder="SSI / Train No..." class="bg-gray-950 border border-gray-700 rounded px-2.5 py-1 text-gray-200 placeholder-gray-500 w-36 focus:outline-none focus:border-emerald-500" />
+            <input id="hist-q" type="text" placeholder="Search text / message..." class="bg-gray-950 border border-gray-700 rounded px-2.5 py-1 text-gray-200 placeholder-gray-500 w-48 focus:outline-none focus:border-emerald-500" />
+
+            <button id="hist-search-btn" type="button" class="px-3 py-1 bg-emerald-800 hover:bg-emerald-700 text-white font-bold rounded border border-emerald-600 transition">
+              Search DB
+            </button>
+          </div>
+
+          <div class="text-[11px] text-gray-400">
+            Matched: <span id="hist-total-count" class="text-emerald-400 font-bold">0</span> records
+          </div>
+        </div>
+
+        <div id="hist-results" class="flex-1 overflow-y-auto p-3 space-y-1.5 bg-gray-950/60 text-xs">
+          <div class="text-gray-500 italic py-8 text-center">Select filters above to query the SQLite history archive.</div>
+        </div>
+      </div>
+
+      <!-- VIEW 3: FREQUENCY & UNIT ANALYTICS -->
+      <div id="main-view-analytics" class="hidden flex-1 flex-col min-h-0 overflow-y-auto p-4 space-y-4 bg-gray-950/50 text-xs">
+        <!-- Period Selector Bar -->
+        <div class="flex flex-wrap items-center justify-between gap-2 bg-gray-900 border border-gray-800 rounded p-3">
+          <div>
+            <h2 class="text-sm font-bold uppercase tracking-wider text-cyan-400">TETRA Spectrum &amp; Traffic Intelligence</h2>
+            <p class="text-[11px] text-gray-400">Aggregated from SQLite database across all monitored frequencies and radio units</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <label for="analytics-hours" class="text-gray-400">Time Window:</label>
+            <select id="analytics-hours" class="bg-gray-950 border border-gray-700 rounded px-2.5 py-1 text-gray-200 focus:outline-none focus:border-emerald-500">
+              <option value="6">Last 6 Hours</option>
+              <option value="12">Last 12 Hours (Overnight)</option>
+              <option value="24" selected>Last 24 Hours</option>
+              <option value="168">Last 7 Days</option>
+              <option value="720">Last 30 Days</option>
+            </select>
+            <button id="analytics-refresh-btn" type="button" class="px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 rounded transition">
+              Refresh Stats
+            </button>
+          </div>
+        </div>
+
+        <!-- KPI Summary Cards -->
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+          <div class="bg-gray-900 border border-gray-800 rounded p-3">
+            <div class="text-[10px] uppercase text-gray-400">Total TETRA Packets</div>
+            <div id="stat-total-pkts" class="text-lg font-bold text-gray-100 mt-0.5">0</div>
+          </div>
+          <div class="bg-gray-900 border border-blue-900/60 rounded p-3">
+            <div class="text-[10px] uppercase text-blue-300">SDS Text / Telemetry</div>
+            <div id="stat-total-sds" class="text-lg font-bold text-blue-300 mt-0.5">0</div>
+          </div>
+          <div class="bg-gray-900 border border-emerald-900/60 rounded p-3">
+            <div class="text-[10px] uppercase text-emerald-300">Voice Recordings</div>
+            <div id="stat-total-voice" class="text-lg font-bold text-emerald-400 mt-0.5">0 <span class="text-xs font-normal text-gray-400">(0s)</span></div>
+          </div>
+          <div class="bg-gray-900 border border-emerald-900/40 rounded p-3">
+            <div class="text-[10px] uppercase text-emerald-200">Call Grants / Setups</div>
+            <div id="stat-total-calls" class="text-lg font-bold text-emerald-200 mt-0.5">0</div>
+          </div>
+          <div class="bg-gray-900 border border-cyan-900/60 rounded p-3">
+            <div class="text-[10px] uppercase text-cyan-300">Active Frequencies</div>
+            <div id="stat-active-freqs" class="text-lg font-bold text-cyan-300 mt-0.5">0</div>
+          </div>
+          <div class="bg-gray-900 border border-purple-900/60 rounded p-3">
+            <div class="text-[10px] uppercase text-purple-300">Active Radio Units (SSI)</div>
+            <div id="stat-active-units" class="text-lg font-bold text-purple-300 mt-0.5">0</div>
+          </div>
+        </div>
+
+        <!-- Per-Frequency Deep Breakdown Table -->
+        <div class="bg-gray-900 border border-gray-800 rounded overflow-hidden">
+          <div class="px-4 py-2.5 border-b border-gray-800 flex items-center justify-between">
+            <span class="font-bold uppercase tracking-wider text-emerald-400">Frequency Traffic &amp; RF Signal Performance</span>
+            <span class="text-[11px] text-gray-500">Click any frequency to open its history</span>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse">
+              <thead>
+                <tr class="border-b border-gray-800 text-[11px] text-gray-400 bg-gray-950/60">
+                  <th class="py-2 px-3">Frequency</th>
+                  <th class="py-2 px-3">LA</th>
+                  <th class="py-2 px-3">RF Signal / SNR</th>
+                  <th class="py-2 px-3 text-right">Total Pkts</th>
+                  <th class="py-2 px-3 text-right">SDS Text</th>
+                  <th class="py-2 px-3 text-right">Voice (Dur)</th>
+                  <th class="py-2 px-3 text-right">Call Setups</th>
+                  <th class="py-2 px-3 text-right">Status / Roam</th>
+                  <th class="py-2 px-3 text-right">Last Active</th>
+                </tr>
+              </thead>
+              <tbody id="analytics-freq-tbody" class="divide-y divide-gray-800/70">
+                <tr><td colspan="9" class="py-4 text-center text-gray-500 italic">No frequency statistics recorded yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Two-Column Grid: Active Units/Trains + Recent Voice Recordings -->
+        <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+          <!-- Active Radio Units / Trains -->
+          <div class="bg-gray-900 border border-gray-800 rounded overflow-hidden flex flex-col">
+            <div class="px-4 py-2.5 border-b border-gray-800 flex items-center justify-between">
+              <span class="font-bold uppercase tracking-wider text-purple-300">Active Radio Units &amp; Trains (SSI Registry)</span>
+              <span class="text-[11px] text-gray-500">Click SSI to filter history</span>
+            </div>
+            <div class="overflow-x-auto max-h-72 overflow-y-auto">
+              <table class="w-full text-left border-collapse">
+                <thead>
+                  <tr class="border-b border-gray-800 text-[11px] text-gray-400 bg-gray-950/60">
+                    <th class="py-2 px-3">SSI</th>
+                    <th class="py-2 px-3">Train / MAC</th>
+                    <th class="py-2 px-3">Freq (LA)</th>
+                    <th class="py-2 px-3 text-right">SDS</th>
+                    <th class="py-2 px-3 text-right">Voice</th>
+                    <th class="py-2 px-3 text-right">Calls</th>
+                    <th class="py-2 px-3 text-right">Last Seen</th>
+                  </tr>
+                </thead>
+                <tbody id="analytics-units-tbody" class="divide-y divide-gray-800/70">
+                  <tr><td colspan="7" class="py-4 text-center text-gray-500 italic">No radio units recorded yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Saved Voice Recordings Archive -->
+          <div class="bg-gray-900 border border-gray-800 rounded overflow-hidden flex flex-col">
+            <div class="px-4 py-2.5 border-b border-gray-800 flex items-center justify-between">
+              <span class="font-bold uppercase tracking-wider text-emerald-300">Saved Voice Recordings</span>
+              <span class="text-[11px] text-gray-500">Stored in /app/logs/audio/</span>
+            </div>
+            <div id="analytics-voice-list" class="p-3 space-y-2 max-h-72 overflow-y-auto">
+              <div class="text-gray-500 italic py-4 text-center">No voice recordings in selected period.</div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -1260,13 +1446,307 @@
       };
     }
 
+    // Main Panel View Switcher (Live / History / Analytics)
+    const mainTabLive = document.getElementById("main-tab-live");
+    const mainTabHistory = document.getElementById("main-tab-history");
+    const mainTabAnalytics = document.getElementById("main-tab-analytics");
+    const mainViewLive = document.getElementById("main-view-live");
+    const mainViewHistory = document.getElementById("main-view-history");
+    const mainViewAnalytics = document.getElementById("main-view-analytics");
+    const dbSizeLabel = document.getElementById("db-size-label");
+
+    function formatDateTimeShort(isoStr) {
+      if (!isoStr) return "--";
+      try {
+        const d = new Date(isoStr);
+        if (isNaN(d.getTime())) return isoStr;
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        const t = d.toLocaleTimeString("en-GB", { hour12: false });
+        return `${mm}-${dd} ${t}`;
+      } catch (e) {
+        return isoStr;
+      }
+    }
+
+    function switchMainView(view) {
+      const activeBtnClass = "px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded bg-emerald-950/90 text-emerald-300 border border-emerald-700/70 transition";
+      const inactiveBtnClass = "px-3 py-1.5 text-xs font-bold uppercase tracking-wider rounded text-gray-400 hover:text-gray-200 border border-transparent transition";
+
+      mainViewLive.classList.add("hidden");
+      mainViewLive.classList.remove("flex");
+      mainViewHistory.classList.add("hidden");
+      mainViewHistory.classList.remove("flex");
+      mainViewAnalytics.classList.add("hidden");
+      mainViewAnalytics.classList.remove("flex");
+
+      mainTabLive.className = inactiveBtnClass;
+      mainTabHistory.className = inactiveBtnClass;
+      mainTabAnalytics.className = inactiveBtnClass;
+
+      if (view === "history") {
+        mainViewHistory.classList.remove("hidden");
+        mainViewHistory.classList.add("flex");
+        mainTabHistory.className = activeBtnClass;
+        loadHistoryArchive();
+      } else if (view === "analytics") {
+        mainViewAnalytics.classList.remove("hidden");
+        mainViewAnalytics.classList.add("flex");
+        mainTabAnalytics.className = activeBtnClass;
+        loadAnalyticsSummary();
+      } else {
+        mainViewLive.classList.remove("hidden");
+        mainViewLive.classList.add("flex");
+        mainTabLive.className = activeBtnClass;
+      }
+    }
+
+    mainTabLive.addEventListener("click", () => switchMainView("live"));
+    mainTabHistory.addEventListener("click", () => switchMainView("history"));
+    mainTabAnalytics.addEventListener("click", () => switchMainView("analytics"));
+
+    async function loadHistoryArchive() {
+      const cat = document.getElementById("hist-category").value;
+      const hours = document.getElementById("hist-hours").value;
+      const freq = document.getElementById("hist-freq").value.trim();
+      const ssi = document.getElementById("hist-ssi").value.trim();
+      const q = document.getElementById("hist-q").value.trim();
+      const resultsEl = document.getElementById("hist-results");
+      const totalCountEl = document.getElementById("hist-total-count");
+
+      const params = new URLSearchParams({
+        category: cat,
+        hours: hours,
+        freq_mhz: freq,
+        ssi: ssi,
+        q: q,
+        limit: "250"
+      });
+
+      try {
+        resultsEl.innerHTML = `<div class="text-gray-500 italic py-6 text-center">Querying SQLite archive...</div>`;
+        const res = await fetch(`/api/history?${params.toString()}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        totalCountEl.textContent = String(data.total || 0);
+        resultsEl.innerHTML = "";
+
+        const events = Array.isArray(data.events) ? data.events : [];
+        if (events.length === 0) {
+          resultsEl.innerHTML = `<div class="text-gray-500 italic py-8 text-center">No matching events found in SQLite database for this filter.</div>`;
+          return;
+        }
+
+        events.forEach((ev) => {
+          const category = (ev.category || "OTHER").toUpperCase();
+          const style = getCategoryStyle(category);
+          const freqMhz = ev.freq_mhz || "?.????";
+          const la = ev.la ? `LA${ev.la}` : "";
+          const humanText = ev.human_text || ev.sds_text || ev.pdu || "";
+          const timeStr = formatDateTimeShort(ev.ts_iso);
+
+          const row = document.createElement("div");
+          const baseRowBg = style.rowBg || "bg-gray-900/90 hover:bg-gray-800/80 border-gray-800/90";
+          row.className = `${baseRowBg} border ${style.rowBorder} rounded px-3 py-2 flex flex-wrap sm:flex-nowrap items-start gap-2.5 transition`;
+
+          const timeSpan = document.createElement("span");
+          timeSpan.className = "text-gray-400 shrink-0 select-all";
+          timeSpan.textContent = timeStr;
+
+          const catBadge = document.createElement("span");
+          catBadge.className = `px-2 py-0.5 rounded border text-[11px] font-bold shrink-0 ${style.badge}`;
+          catBadge.textContent = `[${category}]`;
+
+          const freqBadge = document.createElement("span");
+          freqBadge.className = "px-2 py-0.5 rounded bg-gray-800/90 border border-gray-700 text-cyan-300 shrink-0";
+          freqBadge.textContent = freqMhz === "SYS" ? "SYS" : (la ? `${freqMhz} MHz (${la})` : `${freqMhz} MHz`);
+
+          const contentCol = document.createElement("div");
+          contentCol.className = "flex-1 min-w-[200px]";
+
+          const msgSpan = document.createElement("span");
+          msgSpan.className = `whitespace-pre-line break-words block leading-relaxed ${style.text}`;
+          msgSpan.textContent = humanText;
+          contentCol.appendChild(msgSpan);
+
+          if (category === "VOICE" && ev.audio_url) {
+            const audioEl = document.createElement("audio");
+            audioEl.controls = true;
+            audioEl.src = ev.audio_url;
+            audioEl.className = "h-8 w-full mt-2";
+            contentCol.appendChild(audioEl);
+          }
+
+          row.appendChild(timeSpan);
+          row.appendChild(catBadge);
+          row.appendChild(freqBadge);
+          row.appendChild(contentCol);
+
+          if (ev.gps_lat !== null && ev.gps_lat !== undefined && ev.gps_lon !== null && ev.gps_lon !== undefined) {
+            const mapLink = document.createElement("a");
+            mapLink.href = `https://www.google.com/maps?q=${ev.gps_lat},${ev.gps_lon}`;
+            mapLink.target = "_blank";
+            mapLink.rel = "noopener noreferrer";
+            mapLink.className = "px-2 py-0.5 rounded bg-emerald-950 border border-emerald-700 text-emerald-300 hover:bg-emerald-900 text-[11px] shrink-0";
+            mapLink.textContent = "Map";
+            row.appendChild(mapLink);
+          }
+
+          resultsEl.appendChild(row);
+        });
+      } catch (e) {
+        resultsEl.innerHTML = `<div class="text-red-400 italic py-6 text-center">Failed to query history database.</div>`;
+      }
+    }
+
+    document.getElementById("hist-search-btn").addEventListener("click", loadHistoryArchive);
+    document.getElementById("hist-category").addEventListener("change", loadHistoryArchive);
+    document.getElementById("hist-hours").addEventListener("change", loadHistoryArchive);
+    document.getElementById("hist-q").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadHistoryArchive();
+    });
+    document.getElementById("hist-freq").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadHistoryArchive();
+    });
+    document.getElementById("hist-ssi").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") loadHistoryArchive();
+    });
+
+    async function loadAnalyticsSummary() {
+      const hours = document.getElementById("analytics-hours").value;
+      try {
+        const res = await fetch(`/api/analytics?hours=${encodeURIComponent(hours)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        if (dbSizeLabel && data.db_size_kb !== undefined) {
+          dbSizeLabel.textContent = `${data.db_size_kb} KB`;
+        }
+
+        const t = data.totals || {};
+        document.getElementById("stat-total-pkts").textContent = String(t.total_packets ?? 0);
+        document.getElementById("stat-total-sds").textContent = String(t.sds ?? 0);
+        document.getElementById("stat-total-voice").innerHTML = `${t.voice ?? 0} <span class="text-xs font-normal text-gray-400">(${t.voice_seconds ?? 0}s)</span>`;
+        document.getElementById("stat-total-calls").textContent = String(t.call ?? 0);
+        document.getElementById("stat-active-freqs").textContent = String(t.active_frequencies ?? 0);
+        document.getElementById("stat-active-units").textContent = String(t.active_units ?? 0);
+
+        // Render Frequency Table
+        const freqTbody = document.getElementById("analytics-freq-tbody");
+        freqTbody.innerHTML = "";
+        const freqs = Array.isArray(data.frequencies) ? data.frequencies : [];
+        if (freqs.length === 0) {
+          freqTbody.innerHTML = `<tr><td colspan="9" class="py-4 text-center text-gray-500 italic">No frequency activity recorded in this window.</td></tr>`;
+        } else {
+          freqs.forEach((f) => {
+            const tr = document.createElement("tr");
+            tr.className = "hover:bg-gray-800/50 cursor-pointer transition";
+            tr.title = "Click to filter History Archive for this frequency";
+            tr.addEventListener("click", () => {
+              document.getElementById("hist-freq").value = f.freq_mhz || "";
+              document.getElementById("hist-ssi").value = "";
+              switchMainView("history");
+            });
+
+            const rfStr = f.last_dbm !== null && f.last_dbm !== undefined
+              ? `${Number(f.last_dbm).toFixed(1)} dBm (+${Number(f.last_snr_db || 0).toFixed(1)} dB) [${f.rf_quality || ""}]`
+              : "Not swept yet";
+
+            tr.innerHTML = `
+              <td class="py-2 px-3 font-bold text-cyan-300">${f.freq_mhz} MHz</td>
+              <td class="py-2 px-3 text-gray-300">${f.la ? `LA ${f.la}` : "-"}</td>
+              <td class="py-2 px-3 text-gray-300">${rfStr}</td>
+              <td class="py-2 px-3 text-right font-semibold text-gray-100">${f.total_packets || 0}</td>
+              <td class="py-2 px-3 text-right text-blue-300 font-semibold">${f.sds_count || 0}</td>
+              <td class="py-2 px-3 text-right text-emerald-400 font-semibold">${f.voice_count || 0} (${f.voice_seconds || 0}s)</td>
+              <td class="py-2 px-3 text-right text-emerald-200">${f.call_count || 0}</td>
+              <td class="py-2 px-3 text-right text-purple-300">${(f.status_count || 0) + (f.roaming_count || 0)}</td>
+              <td class="py-2 px-3 text-right text-gray-400">${formatDateTimeShort(f.last_active_iso)}</td>
+            `;
+            freqTbody.appendChild(tr);
+          });
+        }
+
+        // Render Active Units Table
+        const unitsTbody = document.getElementById("analytics-units-tbody");
+        unitsTbody.innerHTML = "";
+        const units = Array.isArray(data.units) ? data.units : [];
+        if (units.length === 0) {
+          unitsTbody.innerHTML = `<tr><td colspan="7" class="py-4 text-center text-gray-500 italic">No active radio units recorded in this window.</td></tr>`;
+        } else {
+          units.forEach((u) => {
+            const tr = document.createElement("tr");
+            tr.className = "hover:bg-gray-800/50 cursor-pointer transition";
+            tr.title = u.last_human_text || "Click to filter History Archive for this SSI";
+            tr.addEventListener("click", () => {
+              document.getElementById("hist-ssi").value = String(u.ssi || "");
+              document.getElementById("hist-freq").value = "";
+              switchMainView("history");
+            });
+
+            const metaParts = [];
+            if (u.train_or_route_no) metaParts.push(`Train ${u.train_or_route_no}`);
+            if (u.device_mac) metaParts.push(u.device_mac);
+            const metaStr = metaParts.join(" | ") || "-";
+            const freqLa = u.last_freq_mhz ? `${u.last_freq_mhz}${u.last_la ? ` (LA${u.last_la})` : ""}` : "-";
+
+            tr.innerHTML = `
+              <td class="py-2 px-3 font-bold text-purple-300">${u.ssi}</td>
+              <td class="py-2 px-3 text-amber-200">${metaStr}</td>
+              <td class="py-2 px-3 text-cyan-300">${freqLa}</td>
+              <td class="py-2 px-3 text-right text-blue-300 font-semibold">${u.sds_count || 0}</td>
+              <td class="py-2 px-3 text-right text-emerald-400 font-semibold">${u.voice_count || 0} (${u.voice_seconds || 0}s)</td>
+              <td class="py-2 px-3 text-right text-emerald-200">${u.call_count || 0}</td>
+              <td class="py-2 px-3 text-right text-gray-400">${formatDateTimeShort(u.last_seen_iso)}</td>
+            `;
+            unitsTbody.appendChild(tr);
+          });
+        }
+
+        // Render Saved Voice Recordings
+        const voiceListEl = document.getElementById("analytics-voice-list");
+        voiceListEl.innerHTML = "";
+        const voices = Array.isArray(data.voice_recordings) ? data.voice_recordings : [];
+        if (voices.length === 0) {
+          voiceListEl.innerHTML = `<div class="text-gray-500 italic py-4 text-center">No voice recordings in selected period.</div>`;
+        } else {
+          voices.forEach((v) => {
+            const card = document.createElement("div");
+            card.className = "bg-gray-950/90 border border-emerald-800/60 rounded p-2.5 space-y-1.5";
+            const header = document.createElement("div");
+            header.className = "flex items-center justify-between gap-2 text-[11px]";
+            header.innerHTML = `
+              <span class="text-emerald-300 font-bold">${v.freq_mhz} MHz ${v.la ? `(LA${v.la})` : ""} | ${v.human_text || "Voice Call"}</span>
+              <span class="text-gray-400 shrink-0">${formatDateTimeShort(v.ts_iso)}</span>
+            `;
+            card.appendChild(header);
+            if (v.audio_url) {
+              const audioEl = document.createElement("audio");
+              audioEl.controls = true;
+              audioEl.src = v.audio_url;
+              audioEl.className = "h-8 w-full";
+              card.appendChild(audioEl);
+            }
+            voiceListEl.appendChild(card);
+          });
+        }
+      } catch (e) {
+        // Ignore transient network errors
+      }
+    }
+
+    document.getElementById("analytics-refresh-btn").addEventListener("click", loadAnalyticsSummary);
+    document.getElementById("analytics-hours").addEventListener("change", loadAnalyticsSummary);
+
     loadRuntimeConfig();
     loadNetworks();
     fetchWhitelist();
     fetchBlacklist();
+    loadAnalyticsSummary();
     setInterval(loadNetworks, 5000);
     setInterval(fetchWhitelist, 10000);
     setInterval(fetchBlacklist, 10000);
+    setInterval(loadAnalyticsSummary, 30000);
     connectWebSocket();
   </script>
 </body>

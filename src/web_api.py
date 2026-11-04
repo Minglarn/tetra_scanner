@@ -10,9 +10,10 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.30")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.31")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -32,6 +33,7 @@ TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 app = FastAPI(title="TETRA Scanner WebUI", version=APP_VERSION)
 app.mount("/api/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
+db.init_db()
 
 
 def get_default_config():
@@ -641,6 +643,37 @@ async def lock_to_whitelist(request: Request):
         "center_hz": center_hz,
         "tetra_channels": channels_str,
     }
+
+
+@app.get("/api/history", response_class=JSONResponse)
+async def get_history(
+    category: str = "ALL",
+    freq_mhz: str = "",
+    ssi: str = "",
+    q: str = "",
+    hours: float = 24.0,
+    limit: int = 150,
+    offset: int = 0,
+    include_system: bool = False,
+):
+    result = await asyncio.to_thread(
+        db.query_history,
+        category=category,
+        freq_mhz=freq_mhz,
+        ssi=ssi,
+        q=q,
+        hours=hours,
+        limit=limit,
+        offset=offset,
+        include_system=include_system,
+    )
+    return result
+
+
+@app.get("/api/analytics", response_class=JSONResponse)
+async def get_analytics(hours: float = 24.0):
+    result = await asyncio.to_thread(db.get_analytics_summary, hours=hours)
+    return result
 
 
 async def read_recent_lines(filepath: str, max_lines: int = 150):
