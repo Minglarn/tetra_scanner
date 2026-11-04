@@ -22,7 +22,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.12")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.13")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -56,7 +56,8 @@ UDP_OUT_INCLUDE_RAW = os.environ.get("UDP_OUT_INCLUDE_RAW", "false").lower() in 
 
 HOST_NAME = os.environ.get("HOST_NAME", "iridium")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
-AUDIO_DIR = os.environ.get("AUDIO_DIR", "/app/data/audio")
+AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
+MIN_VOICE_FRAMES = int(os.environ.get("MIN_VOICE_FRAMES", "12"))
 LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 DISCOVERED_NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
 WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
@@ -1236,13 +1237,15 @@ def main():
 
     def decode_and_emit_voice(buf):
         frames = buf.get("frames") or []
-        if not frames:
+        if len(frames) < MIN_VOICE_FRAMES:
             return
 
         freq_mhz = buf.get("freq_mhz", "?.????")
         la = buf.get("la")
         tn = buf.get("tn")
         ssi = buf.get("ssi")
+        if ssi == 16777215:
+            ssi = None
         gssi = buf.get("gssi")
         ssi_label = str(ssi) if ssi is not None else (f"TN{tn}" if tn else "UNKNOWN")
         safe_ssi = re.sub(r"[^A-Za-z0-9_-]", "", ssi_label) or "UNKNOWN"
@@ -1265,7 +1268,7 @@ def main():
             except Exception:
                 continue
 
-        if not raw_chunks:
+        if len(raw_chunks) < MIN_VOICE_FRAMES:
             return
 
         out_bytes = b"".join(raw_chunks)
@@ -1302,12 +1305,12 @@ def main():
                         check=False,
                     )
 
+            if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 1920:
+                return
+
+            pcm_bytes_len = os.path.getsize(raw_path)
             sox_bin = shutil.which("sox")
-            if (
-                sox_bin
-                and os.path.exists(raw_path)
-                and os.path.getsize(raw_path) > 0
-            ):
+            if sox_bin:
                 subprocess.run(
                     [
                         sox_bin,
@@ -1329,11 +1332,7 @@ def main():
                 )
 
             if not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
-                pcm_source = (
-                    open(raw_path, "rb").read()
-                    if (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0)
-                    else out_bytes
-                )
+                pcm_source = open(raw_path, "rb").read()
                 if len(pcm_source) % 2 == 1:
                     pcm_source += b"\x00"
                 with wave.open(wav_path, "wb") as wf:
@@ -1352,13 +1351,10 @@ def main():
                 except OSError:
                     pass
 
-        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 44:
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) <= 1964:
             return
 
-        duration_s = round(
-            max(0.2, float(buf.get("last_seen", now_ts) - buf.get("first_seen", now_ts))),
-            1,
-        )
+        duration_s = round(pcm_bytes_len / 16000.0, 1)
         badge = format_unit_badge(ssi, unit_registry) if ssi is not None else ""
         extra_parts = []
         if gssi is not None:
@@ -1452,11 +1448,14 @@ def main():
             frame_b64 = get_ci(pkt, ["frame"])
             if enc_mode == 0 and isinstance(frame_b64, str) and frame_b64.strip():
                 tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
-                usage_marker = to_int(get_ci(pkt, ["usage marker", "usage_marker"]))
+                usage_marker = to_int(
+                    get_ci(pkt, ["downlink usage marker", "usage marker", "usage_marker"])
+                )
                 pkt_ssi = to_int(
                     get_ci(
                         pkt,
                         [
+                            "actual ssi",
                             "ssi",
                             "calling party ssi",
                             "transmitting party ssi",
@@ -1464,6 +1463,9 @@ def main():
                         ],
                     )
                 )
+                if pkt_ssi == 16777215:
+                    pkt_ssi = None
+
                 ctx = None
                 if usage_marker is not None:
                     ctx = channel_call_context.get((freq_str, usage_marker))
@@ -1478,6 +1480,16 @@ def main():
                 buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or 1))
                 with voice_lock:
                     buf = voice_buffers.get(buf_key)
+                    if buf is not None and (now_ts - buf["last_seen"] > 0.6):
+                        old_buf = voice_buffers.pop(buf_key)
+                        if len(old_buf.get("frames", [])) >= MIN_VOICE_FRAMES:
+                            threading.Thread(
+                                target=decode_and_emit_voice,
+                                args=(old_buf,),
+                                daemon=True,
+                            ).start()
+                        buf = None
+
                     if buf is None:
                         buf = {
                             "freq_mhz": freq_str,

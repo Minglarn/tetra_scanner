@@ -12,9 +12,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.12")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.13")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
-AUDIO_DIR = os.environ.get("AUDIO_DIR", "/app/data/audio")
+AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
 EVENTS_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
 NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")

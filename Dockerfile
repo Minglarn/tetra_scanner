@@ -55,10 +55,11 @@ RUN git clone https://gitlab.com/larryth/tetra-kit.git /opt/tetra-kit \
     && find /opt/tetra-kit -type f -name "sdecoder" -exec cp {} /usr/local/bin/sdecoder \; \
     && chmod +x /usr/local/bin/cdecoder /usr/local/bin/sdecoder 2>/dev/null || true
 
-RUN mkdir -p /app/src/templates /app/logs /app/data/audio
+RUN mkdir -p /app/src/templates /app/logs/audio /app/data \
+    && ln -sfn /app/logs/audio /app/data/audio
 
-LABEL org.opencontainers.image.version="2026.11.04.12"
-ENV APP_VERSION=2026.11.04.12
+LABEL org.opencontainers.image.version="2026.11.04.13"
+ENV APP_VERSION=2026.11.04.13
 ENV APP_RELEASE_DATE=2026-11-04
 
 COPY src/tetra_multi_rtl.py /app/src/tetra_multi_rtl.py
