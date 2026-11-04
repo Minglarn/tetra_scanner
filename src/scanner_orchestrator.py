@@ -47,7 +47,7 @@ RELOAD_CONFIG_FLAG = "/tmp/reload_config.flag"
 SOFT_CONFIG_FLAG = "/tmp/soft_config.flag"
 
 FORCE_SWEEP_PENALTY_SEC = 900
-MAX_PEAKS = 6
+MAX_PEAKS = 8
 PTS_GRID_HZ = 25000
 MIN_PEAK_SEPARATION_HZ = 25000
 LOCAL_PEAK_RADIUS_HZ = 16000
@@ -216,8 +216,27 @@ def emit_system_event(human_text):
         print(f"[scanner] Warning: failed writing system event: {exc}", flush=True)
 
 
+def clear_frequency_strikes(freq_list_hz):
+    if not freq_list_hz:
+        return
+    bl = load_blacklist()
+    modified = False
+    for f_hz in freq_list_hz:
+        key = str(int(f_hz))
+        if key in bl:
+            del bl[key]
+            modified = True
+    if modified:
+        save_blacklist(bl)
+
+
 def add_frequencies_to_blacklist(
-    freq_list_hz, duration_sec, max_strikes, reason, immediate=False
+    freq_list_hz,
+    duration_sec,
+    max_strikes,
+    reason,
+    immediate=False,
+    force_even_if_whitelisted=False,
 ):
     bl = load_blacklist()
     wl = load_whitelist()
@@ -225,7 +244,7 @@ def add_frequencies_to_blacklist(
 
     for f_hz in freq_list_hz:
         key = str(int(f_hz))
-        if key in wl and not immediate:
+        if key in wl and not immediate and not force_even_if_whitelisted:
             msg = f"Keeping whitelisted frequency {int(f_hz) / 1e6:.4f} MHz (protected from Idle Timeout blacklist)"
             print(f"[scanner] {msg}", flush=True)
             emit_system_event(msg)
@@ -602,18 +621,30 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
             peaks_by_hz[f_hz]["source"] = "MEASURED+WHITELIST"
             if wl_la is not None:
                 peaks_by_hz[f_hz]["la"] = wl_la
-        elif not all_peaks:
+        else:
             grid_meas = measured_grid.get(f_hz)
-            peaks_by_hz[f_hz] = {
-                "freq_hz": f_hz,
-                "dbm": grid_meas["dbm"] if grid_meas else None,
-                "snr_db": grid_meas["snr_db"] if grid_meas else None,
-                "noise_floor": grid_meas["noise_floor"] if grid_meas else None,
-                "measured_peak": False,
-                "whitelisted": True,
-                "source": "WHITELIST",
-                "la": wl_la,
-            }
+            if grid_meas and grid_meas["dbm"] >= ABSOLUTE_MIN_DBM and grid_meas["snr_db"] >= 1.5:
+                peaks_by_hz[f_hz] = {
+                    "freq_hz": f_hz,
+                    "dbm": grid_meas["dbm"],
+                    "snr_db": grid_meas["snr_db"],
+                    "noise_floor": grid_meas["noise_floor"],
+                    "measured_peak": grid_meas["snr_db"] >= MIN_SNR_ABOVE_FLOOR_DB,
+                    "whitelisted": True,
+                    "source": "MEASURED+WHITELIST",
+                    "la": wl_la,
+                }
+            elif not all_peaks:
+                peaks_by_hz[f_hz] = {
+                    "freq_hz": f_hz,
+                    "dbm": grid_meas["dbm"] if grid_meas else None,
+                    "snr_db": grid_meas["snr_db"] if grid_meas else None,
+                    "noise_floor": grid_meas["noise_floor"] if grid_meas else None,
+                    "measured_peak": False,
+                    "whitelisted": True,
+                    "source": "WHITELIST",
+                    "la": wl_la,
+                }
 
     if not peaks_by_hz:
         return None, []
@@ -666,7 +697,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
 
     max_bandwidth_hz = MAX_WINDOW_SPAN_HZ
     best_window_peaks = []
-    best_score = (-1, -1, -1e9, -1e9)
+    best_score = (-1e9, -1, -1, -1e9, -1e9, -1e9)
 
     for freq_a_obj in unique_sorted:
         freq_a = freq_a_obj["freq_hz"]
@@ -682,7 +713,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
             in_window_strongest = sorted(
                 in_window,
                 key=lambda x: (
-                    1 if x.get("measured_peak") else 0,
+                    1 if (x.get("whitelisted") and (x.get("snr_db") or 0.0) >= 1.5) else 0,
                     x["snr_db"] if x.get("snr_db") is not None else -999.0,
                     x["dbm"] if x.get("dbm") is not None else -999.0,
                 ),
@@ -692,16 +723,46 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
         else:
             selected = in_window
 
-        measured_count = sum(1 for p in selected if p.get("measured_peak"))
-        density = len(selected)
+        wl_count = sum(
+            1
+            for p in selected
+            if p.get("whitelisted") and (p.get("snr_db") is None or p["snr_db"] >= 1.5)
+        )
+        strong_peaks = sum(
+            1 for p in selected if (p.get("snr_db") or 0.0) >= 6.0
+        )
         total_snr = round(
-            sum(p["snr_db"] for p in selected if p.get("snr_db") is not None), 2
+            sum(max(0.0, p["snr_db"]) for p in selected if p.get("snr_db") is not None),
+            2,
+        )
+        max_snr = round(
+            max((p["snr_db"] for p in selected if p.get("snr_db") is not None), default=0.0),
+            2,
         )
         total_dbm = round(
             sum(p["dbm"] for p in selected if p.get("dbm") is not None), 2
         )
 
-        score = (measured_count, density, total_snr, total_dbm)
+        weighted_score = 0.0
+        for p in selected:
+            snr = max(0.0, float(p.get("snr_db") or 0.0))
+            dbm = float(p.get("dbm") if p.get("dbm") is not None else -65.0)
+            dbm_bonus = max(0.0, (dbm + 45.0) * 0.4) if snr >= 5.0 else 0.0
+            if p.get("whitelisted") and (p.get("snr_db") is None or snr >= 1.5):
+                weighted_score += 25.0 + (snr * 2.5) + dbm_bonus
+            elif snr >= 6.0:
+                weighted_score += 8.0 + (snr * 2.0) + dbm_bonus
+            else:
+                weighted_score += snr * 0.6
+
+        score = (
+            round(weighted_score, 2),
+            wl_count,
+            strong_peaks,
+            total_snr,
+            max_snr,
+            total_dbm,
+        )
         if score > best_score:
             best_score = score
             best_window_peaks = selected
@@ -887,6 +948,11 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
         emit_system_event(sys_msg)
 
         last_activity = time.time()
+        chan_mhz_to_hz = {
+            f"{int(f) / 1e6:.4f}": int(f) for f in (active_frequencies or [])
+        }
+        verified_tetra_hz = set()
+        dead_blacklisted_hz = set()
 
         while RUNNING:
             try:
@@ -895,8 +961,80 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                 print(clean_line, flush=True)
                 if any(tag in clean_line for tag in PAYLOAD_TAGS):
                     last_activity = time.time()
+                    for mhz_str, hz_val in chan_mhz_to_hz.items():
+                        if mhz_str in clean_line:
+                            verified_tetra_hz.add(hz_val)
+                elif "[NETWORK]" in clean_line or "[WHITELIST]" in clean_line:
+                    for mhz_str, hz_val in chan_mhz_to_hz.items():
+                        if mhz_str in clean_line:
+                            verified_tetra_hz.add(hz_val)
                 elif clean_line.startswith("[heartbeat]"):
                     emit_system_event(clean_line)
+                    if is_scanner_mode and "per channel:" in clean_line and chan_mhz_to_hz:
+                        raw_dict_str = clean_line.split("per channel:", 1)[1].strip()
+                        per_chan = None
+                        try:
+                            per_chan = json.loads(raw_dict_str)
+                        except Exception:
+                            try:
+                                per_chan = json.loads(raw_dict_str.replace("'", '"'))
+                            except Exception:
+                                per_chan = None
+
+                        if isinstance(per_chan, dict):
+                            alive_in_hb = []
+                            dead_in_hb = []
+                            for mhz_str, pkt_cnt in per_chan.items():
+                                hz_val = chan_mhz_to_hz.get(str(mhz_str).strip())
+                                if hz_val is None:
+                                    continue
+                                try:
+                                    cnt = int(pkt_cnt)
+                                except (ValueError, TypeError):
+                                    cnt = 0
+                                if cnt > 0:
+                                    alive_in_hb.append(hz_val)
+                                else:
+                                    dead_in_hb.append(hz_val)
+
+                            if alive_in_hb:
+                                verified_tetra_hz.update(alive_in_hb)
+                                clear_frequency_strikes(alive_in_hb)
+
+                            if not alive_in_hb and not verified_tetra_hz and dead_in_hb:
+                                add_frequencies_to_blacklist(
+                                    dead_in_hb,
+                                    blacklist_time_sec,
+                                    blacklist_strikes,
+                                    "No TETRA sync (0 pkt/min)",
+                                    immediate=True,
+                                    force_even_if_whitelisted=True,
+                                )
+                                dead_blacklisted_hz.update(dead_in_hb)
+                                abort_msg = (
+                                    "All monitored channels in 1.8 MHz window reported 0 pkt/min "
+                                    "(no TETRA sync). Breaking dead window immediately..."
+                                )
+                                print(f"[scanner] {abort_msg}", flush=True)
+                                emit_system_event(abort_msg)
+                                break
+
+                            isolated_dead = [
+                                hz
+                                for hz in dead_in_hb
+                                if hz not in verified_tetra_hz
+                                and hz not in dead_blacklisted_hz
+                            ]
+                            if isolated_dead:
+                                add_frequencies_to_blacklist(
+                                    isolated_dead,
+                                    blacklist_time_sec,
+                                    blacklist_strikes,
+                                    "No TETRA sync (0 pkt/min)",
+                                    immediate=True,
+                                    force_even_if_whitelisted=True,
+                                )
+                                dead_blacklisted_hz.update(isolated_dead)
             except queue.Empty:
                 pass
 
@@ -963,13 +1101,30 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                 print(idle_msg, flush=True)
                 emit_system_event(idle_msg)
                 if active_frequencies:
-                    add_frequencies_to_blacklist(
-                        active_frequencies,
-                        blacklist_time_sec,
-                        blacklist_strikes,
-                        "Idle Timeout",
-                        immediate=False,
-                    )
+                    if verified_tetra_hz:
+                        kept_str = ", ".join(
+                            f"{hz / 1e6:.4f} MHz" for hz in sorted(verified_tetra_hz)
+                        )
+                        keep_msg = (
+                            f"Preserving verified TETRA base station(s) with active control frames "
+                            f"(>0 pkt/min): {kept_str}"
+                        )
+                        print(f"[scanner] {keep_msg}", flush=True)
+                        emit_system_event(keep_msg)
+                    unverified_idle = [
+                        hz
+                        for hz in active_frequencies
+                        if hz not in verified_tetra_hz
+                        and hz not in dead_blacklisted_hz
+                    ]
+                    if unverified_idle:
+                        add_frequencies_to_blacklist(
+                            unverified_idle,
+                            blacklist_time_sec,
+                            blacklist_strikes,
+                            "Idle Timeout",
+                            immediate=False,
+                        )
                 break
     finally:
         terminate_children()

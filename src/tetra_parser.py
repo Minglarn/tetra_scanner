@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.17")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.18")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -902,6 +902,7 @@ def main():
     channel_net_cache = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
     last_heartbeat = time.time()
+    first_hb_sent = False
     running = True
 
     def handle_sig(signum, frame):
@@ -1315,6 +1316,15 @@ def main():
         )
         if enc_mode is not None:
             state["encryption_mode"] = enc_mode
+
+        if state["packet_count"] >= 3 and (pdu or service):
+            register_whitelisted_carrier(
+                ch,
+                "NETWORK",
+                mcc=state.get("mcc"),
+                mnc=state.get("mnc"),
+                la=state.get("la"),
+            )
 
         persist_net_state(state, pdu or service, now_ts, emit_log_event=False)
 
@@ -2268,8 +2278,10 @@ def main():
 
         flush_expired_sds(now_ts)
 
-        if now_ts - last_heartbeat >= 60.0:
-            total_60s = sum(stats_60s.values())
+        total_60s = sum(stats_60s.values())
+        hb_interval = 45.0 if (not first_hb_sent and total_60s == 0) else 60.0
+        if now_ts - last_heartbeat >= hb_interval:
+            first_hb_sent = True
             hb_payload = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "host": HOST_NAME,
@@ -2289,7 +2301,7 @@ def main():
                 )
             send_udp_json(hb_payload)
             print(
-                f"[heartbeat] 60s total packets: {total_60s} | known units: {len(unit_registry)} | networks: {len(seen_networks)} | per channel: {stats_60s}",
+                f"[heartbeat] 60s total packets: {total_60s} | known units: {len(unit_registry)} | networks: {len(seen_networks)} | per channel: {json.dumps(stats_60s)}",
                 flush=True,
             )
             for k in stats_60s:
