@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.22")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.23")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -302,7 +302,17 @@ async def get_networks():
     except Exception:
         return []
 
-    result = list(networks_by_freq.values())
+    result = [
+        net
+        for net in networks_by_freq.values()
+        if not (
+            str(net.get("pdu") or "").upper() == "TCH_S"
+            and net.get("mcc") is None
+            and net.get("mnc") is None
+            and net.get("cell_id") is None
+            and not net.get("neighbours")
+        )
+    ]
     result.sort(
         key=lambda x: (
             1 if x.get("role") == "ACTIVE CELL" else 0,
@@ -556,13 +566,15 @@ async def lock_to_whitelist(request: Request):
     }
 
 
-async def read_recent_lines(filepath: str, max_lines: int = 100):
+async def read_recent_lines(filepath: str, max_lines: int = 150):
     if not os.path.exists(filepath):
         return []
-    important_buf = deque(maxlen=max_lines)
+    payload_buf = deque(maxlen=max_lines)
+    system_buf = deque(maxlen=25)
     try:
         file_size = os.path.getsize(filepath)
-        seek_pos = max(0, file_size - 524288)
+        seek_pos = max(0, file_size - 20 * 1024 * 1024)
+        idx = 0
         async with aiofiles.open(
             filepath, mode="r", encoding="utf-8", errors="replace"
         ) as f:
@@ -575,10 +587,15 @@ async def read_recent_lines(filepath: str, max_lines: int = 100):
                     continue
                 if '"category": "RAW_MAC"' in s or '"category":"RAW_MAC"' in s:
                     continue
-                important_buf.append(s)
+                idx += 1
+                if '"category": "SYSTEM"' in s or '"category":"SYSTEM"' in s:
+                    system_buf.append((idx, s))
+                else:
+                    payload_buf.append((idx, s))
     except Exception:
         return []
-    return list(important_buf)
+    merged = sorted(list(payload_buf) + list(system_buf), key=lambda item: item[0])
+    return [line_str for _, line_str in merged]
 
 
 @app.websocket("/ws/events")

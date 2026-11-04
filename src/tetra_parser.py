@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.22")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.23")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1291,15 +1291,21 @@ def main():
                 emit_event(net_event)
 
     def observe_channel_activity(ch, pkt, pdu, service, now_ts):
+        is_uplane = (pdu == "TCH_S" or service == "UPLANE")
         freq_str = ch["freq_mhz"]
         state = get_or_init_net_state(
             freq_str, ch["freq_hz"], default_la=ch.get("la"), role="ACTIVE CELL"
         )
-        state["packet_count"] = int(state.get("packet_count", 0)) + 1
-        if pdu:
-            state["last_pdu"] = pdu
-        elif service:
-            state["last_pdu"] = service
+        if is_uplane and not state.get("control_verified"):
+            return
+
+        if not is_uplane:
+            state["control_verified"] = True
+            state["packet_count"] = int(state.get("packet_count", 0)) + 1
+            if pdu:
+                state["last_pdu"] = pdu
+            elif service:
+                state["last_pdu"] = service
 
         tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
         if tn is not None and 1 <= tn <= 4:
@@ -1317,7 +1323,7 @@ def main():
         if enc_mode is not None:
             state["encryption_mode"] = enc_mode
 
-        if state["packet_count"] >= 3 and (pdu or service):
+        if state.get("control_verified") and state["packet_count"] >= 3 and (pdu or service):
             register_whitelisted_carrier(
                 ch,
                 "NETWORK",
@@ -1326,7 +1332,8 @@ def main():
                 la=state.get("la"),
             )
 
-        persist_net_state(state, pdu or service, now_ts, emit_log_event=False)
+        if state.get("control_verified"):
+            persist_net_state(state, pdu or service, now_ts, emit_log_event=False)
 
     def handle_network_discovery(ch, pkt, pdu, now_ts):
         freq_str = ch["freq_mhz"]
@@ -1505,7 +1512,24 @@ def main():
             decoded["sds_text"],
         )
         if is_duplicate(sig, now_ts, ttl=1.2):
+            logging.info(
+                "[DEBUG] Dropped duplicate SDS on %s MHz (SSI %s -> %s, Proto %s)",
+                ch["freq_mhz"],
+                ssi,
+                dest_ssi,
+                proto_id,
+            )
             return
+
+        logging.info(
+            "[DEBUG] Emitting SDS (%s) on %s MHz (SSI %s -> %s, Proto %s): %s",
+            decoded["sds_type"],
+            ch["freq_mhz"],
+            ssi,
+            dest_ssi,
+            proto_id,
+            human_text,
+        )
 
         event = {
             "timestamp": now_iso,
@@ -1945,11 +1969,13 @@ def main():
 
     def process_packet(ch, pkt):
         freq_str = ch["freq_mhz"]
-        stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
-
         service = str(get_ci(pkt, ["service"], "")).upper()
         pdu = str(get_ci(pkt, ["pdu"], "")).upper()
         now_ts = time.time()
+
+        if pdu != "TCH_S" and service != "UPLANE":
+            stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
+
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
@@ -2039,6 +2065,14 @@ def main():
                             ).start()
                         buf = None
 
+                    if buf is not None and buf.get("ssi") is None and buf.get("gssi") is None:
+                        if (
+                            (usage_marker > 0 and buf.get("usage_marker") != usage_marker)
+                            or (now_ts - buf["last_seen"] > 0.45)
+                        ) and len(buf.get("frames", [])) < MIN_VOICE_FRAMES:
+                            voice_buffers.pop(buf_key, None)
+                            buf = None
+
                     if buf is None:
                         logging.info(
                             "[DEBUG] Started TCH_S voice buffer on %s MHz (TN %s, UM %s, SSI %s, GSSI %s)",
@@ -2069,6 +2103,8 @@ def main():
                         if not buf.get("usage_marker") and usage_marker > 0:
                             buf["usage_marker"] = usage_marker
                     buf["frames"].append(frame_b64.strip())
+                    if len(buf["frames"]) >= 3:
+                        stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
 
             emit_raw_mac_event(ch, pkt)
             return
@@ -2127,13 +2163,20 @@ def main():
                 if not existing_tn_ctx or (now_ts - existing_tn_ctx.get("ts", 0) > 15.0):
                     channel_call_context[(freq_str, f"tn:{pkt_tn}")] = mac_ctx_obj
 
-        if pdu == "D-SDS-DATA":
+        if pdu == "D-SDS-DATA" or "SDS" in pdu:
             has_hex = get_ci(pkt, ["hex"]) is not None
+            has_infos = get_ci(pkt, ["infos"]) is not None
             key = (freq_str, mac_ssi if mac_ssi is not None else caller_ssi)
-            if not has_hex:
+            if not has_hex and not has_infos:
                 if key in pending_sds:
                     prev = pending_sds.pop(key)
                     build_and_emit_sds(prev["ch"], prev["pkt"], None)
+                logging.info(
+                    "[DEBUG] Buffered SDS header on %s MHz (SSI %s, Caller %s) waiting for payload...",
+                    freq_str,
+                    mac_ssi,
+                    caller_ssi,
+                )
                 pending_sds[key] = {"ts": now_ts, "ch": ch, "pkt": pkt}
                 return
             else:

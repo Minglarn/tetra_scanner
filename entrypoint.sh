@@ -3,11 +3,14 @@ set -e
 
 MODE="${MODE:-static}"
 WEB_PORT="${WEB_PORT:-8080}"
-VERSION="${APP_VERSION:-2026.11.04.22}"
+VERSION="${APP_VERSION:-2026.11.04.23}"
 RELEASE_DATE="${APP_RELEASE_DATE:-2026-11-04}"
 LOG_DIR="${LOG_DIR:-/app/logs}"
 
-rm -f "${LOG_DIR}/runtime_config.json" /tmp/reload_config.flag /tmp/soft_config.flag /tmp/force_sweep.flag
+if [ ! -f /app/.container_initialized ]; then
+    rm -f "${LOG_DIR}/runtime_config.json" /tmp/reload_config.flag /tmp/soft_config.flag /tmp/force_sweep.flag
+    touch /app/.container_initialized
+fi
 
 cat << 'EOF'
  ███████████ ██████████ ███████████ ███████████     █████████                                 
