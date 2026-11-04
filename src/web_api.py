@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.20")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.21")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -94,7 +94,7 @@ async def get_config():
     return cfg
 
 
-def compute_optimal_center_hz(freq_hz_list: list[int]) -> int:
+def compute_optimal_center_hz(freq_hz_list):
     if not freq_hz_list:
         return 427750000
     min_f = min(freq_hz_list)

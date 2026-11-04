@@ -4,7 +4,7 @@ Realtidsavkodare, nätverksskanner och WebUI för TETRA-basstationer med en enda
 - **Smart Auto-Tune Scanner (`MODE=scanner`)**: Gör ett högupplöst spektrumsvep (`2 kHz` steg, `25 kHz` PTS-raster), väljer ut det bästa 2 MHz-fönstret med flest och starkast TETRA-bärvågor, ställer in mottagaren och övervakar trafiken. Om ingen faktisk nyttolast (`SDS`, `CALL`, `STATUS`, `ROAMING`) avkodas inom `IDLE_TIMEOUT_SEC` (standard 900s / 15 min) startas ett nytt svep automatiskt.
 - **Static Mode (`MODE=static`)**: Lyssnar kontinuerligt på upp till 6 fasta TETRA-bärvågor inom ett 2.0 MHz-fönster (standard: MCC 240 / MNC 11 på `427.000-428.500 MHz`).
 
-Version (CalVer): `2026.11.04.20`
+Version (CalVer): `2026.11.04.21`
 
 ---
 
