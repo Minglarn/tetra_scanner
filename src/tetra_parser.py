@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.27")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.28")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -2005,7 +2005,7 @@ def main():
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
-            chan_verified = bool(net_states.get(freq_str, {}).get("control_verified"))
+            chan_verified = bool(channel_net_cache.get(freq_str, {}).get("control_verified"))
             raw_pkt_ssi = to_int(
                 get_ci(
                     pkt,
@@ -2151,7 +2151,7 @@ def main():
             return
 
         if service == "UPLANE":
-            if net_states.get(freq_str, {}).get("control_verified"):
+            if channel_net_cache.get(freq_str, {}).get("control_verified"):
                 emit_raw_mac_event(ch, pkt)
             return
         if pdu in IGNORED_PDUS:
