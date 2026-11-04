@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.13")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.14")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -209,7 +209,7 @@ async def get_networks():
     if not os.path.exists(NETWORKS_FILE):
         return []
 
-    networks_by_id = {}
+    networks_by_freq = {}
     try:
         async with aiofiles.open(
             NETWORKS_FILE, mode="r", encoding="utf-8", errors="replace"
@@ -224,13 +224,30 @@ async def get_networks():
                     continue
                 if not isinstance(item, dict):
                     continue
-                net_id = item.get("network_id") or f"{item.get('freq_mhz')}_{item.get('la')}"
-                networks_by_id[net_id] = item
+                key = item.get("freq_mhz") or item.get("network_id")
+                if not key:
+                    continue
+                existing = networks_by_freq.get(key)
+                if existing is None:
+                    networks_by_freq[key] = dict(item)
+                else:
+                    prev_role = existing.get("role")
+                    for k, v in item.items():
+                        if v is not None and v != [] and v != {}:
+                            existing[k] = v
+                    if prev_role == "ACTIVE CELL":
+                        existing["role"] = "ACTIVE CELL"
     except Exception:
         return []
 
-    result = list(networks_by_id.values())
-    result.sort(key=lambda x: x.get("seen_epoch") or 0, reverse=True)
+    result = list(networks_by_freq.values())
+    result.sort(
+        key=lambda x: (
+            1 if x.get("role") == "ACTIVE CELL" else 0,
+            x.get("seen_epoch") or 0,
+        ),
+        reverse=True,
+    )
     return result
 
 

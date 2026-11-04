@@ -364,6 +364,12 @@
             rowBorder: "border-l-2 border-l-purple-500",
             text: "text-purple-200"
           };
+        case "NETWORK":
+          return {
+            badge: "bg-cyan-950/80 text-cyan-300 border-cyan-700/70",
+            rowBorder: "border-l-2 border-l-cyan-500",
+            text: "text-cyan-200"
+          };
         case "SYSTEM":
           return {
             badge: "bg-blue-600 text-white border-blue-400",
@@ -561,33 +567,133 @@
         }
 
         list.forEach((net) => {
+          const isNeighbour = net.role === "NEIGHBOUR CELL";
           const card = document.createElement("div");
-          card.className = "bg-gray-950/80 border border-gray-800 rounded p-2.5 space-y-1";
+          card.className = isNeighbour
+            ? "bg-gray-950/60 border border-cyan-900/40 rounded p-2.5 space-y-1.5"
+            : "bg-gray-950/90 border border-gray-800 rounded p-2.5 space-y-1.5";
 
           const topRow = document.createElement("div");
-          topRow.className = "flex items-center justify-between";
+          topRow.className = "flex items-center justify-between gap-1.5 flex-wrap";
+
+          const leftGroup = document.createElement("div");
+          leftGroup.className = "flex items-center gap-1.5";
 
           const freqEl = document.createElement("span");
-          freqEl.className = "text-cyan-400 font-bold";
+          freqEl.className = isNeighbour ? "text-cyan-300 font-bold" : "text-cyan-400 font-bold";
           freqEl.textContent = `${net.freq_mhz || "?"} MHz`;
 
+          const roleBadge = document.createElement("span");
+          roleBadge.className = isNeighbour
+            ? "px-1.5 py-0.5 rounded bg-cyan-950/80 border border-cyan-800/70 text-cyan-300 text-[9px] font-bold uppercase"
+            : "px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700/70 text-emerald-300 text-[9px] font-bold uppercase";
+          roleBadge.textContent = isNeighbour ? "NEIGHBOUR" : "ACTIVE";
+
+          leftGroup.appendChild(freqEl);
+          leftGroup.appendChild(roleBadge);
+
+          const rightGroup = document.createElement("div");
+          rightGroup.className = "flex items-center gap-1";
+
+          if (net.encryption_mode !== undefined && net.encryption_mode !== null) {
+            const encBadge = document.createElement("span");
+            const isClear = Number(net.encryption_mode) === 0;
+            encBadge.className = isClear
+              ? "px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 text-[10px] font-bold"
+              : "px-1.5 py-0.5 rounded bg-amber-950/80 border border-amber-700/60 text-amber-300 text-[10px] font-bold";
+            encBadge.textContent = isClear ? "CLEAR (ENC 0)" : `ENC ${net.encryption_mode}`;
+            rightGroup.appendChild(encBadge);
+          }
+
           const laEl = document.createElement("span");
-          laEl.className = "px-1.5 py-0.5 rounded bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 text-[10px] font-bold";
-          laEl.textContent = `LA ${net.la !== undefined && net.la !== null ? net.la : "?"}`;
+          laEl.className = "px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 text-gray-200 text-[10px] font-bold";
+          const laStr = `LA ${net.la !== undefined && net.la !== null ? net.la : "?"}`;
+          const cellStr = net.cell_id !== undefined && net.cell_id !== null ? ` / Cell ${net.cell_id}` : "";
+          laEl.textContent = `${laStr}${cellStr}`;
+          rightGroup.appendChild(laEl);
 
-          topRow.appendChild(freqEl);
-          topRow.appendChild(laEl);
+          topRow.appendChild(leftGroup);
+          topRow.appendChild(rightGroup);
+          card.appendChild(topRow);
 
-          const metaRow = document.createElement("div");
-          metaRow.className = "text-gray-300 flex items-center justify-between text-[11px]";
-          metaRow.textContent = `MCC: ${net.mcc ?? "?"} | MNC: ${net.mnc ?? "?"}`;
+          const metaParts = [];
+          if (net.mcc !== undefined && net.mcc !== null) {
+            metaParts.push(`MCC: ${net.mcc}`);
+          }
+          if (net.mnc !== undefined && net.mnc !== null) {
+            metaParts.push(`MNC: ${net.mnc}`);
+          }
+          if (net.carrier_number !== undefined && net.carrier_number !== null) {
+            metaParts.push(`Ch #${net.carrier_number}`);
+          }
+          if (net.cell_load !== undefined && net.cell_load !== null) {
+            metaParts.push(`Load: ${Number(net.cell_load) === 0 ? "Low (0)" : net.cell_load}`);
+          }
+          if (net.synchronized !== undefined && net.synchronized !== null) {
+            metaParts.push(`Sync: ${net.synchronized ? "Yes" : "No"}`);
+          }
+          if (metaParts.length > 0) {
+            const metaRow = document.createElement("div");
+            metaRow.className = "text-gray-300 text-[11px]";
+            metaRow.textContent = metaParts.join(" | ");
+            card.appendChild(metaRow);
+          }
+
+          const slots = Array.isArray(net.active_timeslots) ? net.active_timeslots : [];
+          const markers = Array.isArray(net.usage_markers) ? net.usage_markers : [];
+          if (slots.length > 0 || markers.length > 0) {
+            const trafficRow = document.createElement("div");
+            trafficRow.className = "text-emerald-300/90 text-[11px]";
+            const tParts = [];
+            if (slots.length > 0) {
+              tParts.push(`Active Slots: TN ${slots.join(", ")}`);
+            }
+            if (markers.length > 0) {
+              tParts.push(`Usage Markers: ${markers.slice(0, 6).join(", ")}`);
+            }
+            trafficRow.textContent = tParts.join(" | ");
+            card.appendChild(trafficRow);
+          }
+
+          if (net.fast_reselect_threshold !== undefined && net.fast_reselect_threshold !== null) {
+            const reselectRow = document.createElement("div");
+            reselectRow.className = "text-gray-400 text-[10px]";
+            const hyst = net.fast_reselect_hysteresis !== undefined && net.fast_reselect_hysteresis !== null
+              ? ` (Hyst ${net.fast_reselect_hysteresis} dB)`
+              : "";
+            reselectRow.textContent = `Reselect: Fast ${net.fast_reselect_threshold} dB${hyst}`;
+            card.appendChild(reselectRow);
+          }
+
+          const neighbours = Array.isArray(net.neighbours) ? net.neighbours : [];
+          if (neighbours.length > 0) {
+            const nbBox = document.createElement("div");
+            nbBox.className = "mt-1 pt-1 border-t border-gray-800/80 space-y-0.5";
+            neighbours.forEach((nb) => {
+              const nbRow = document.createElement("div");
+              nbRow.className = "text-cyan-300/90 text-[10px]";
+              const nbFreq = nb.freq_mhz ? `${nb.freq_mhz} MHz` : `Ch #${nb.carrier_number ?? "?"}`;
+              const nbCh = nb.carrier_number ? ` (Ch #${nb.carrier_number})` : "";
+              const nbLa = nb.la !== undefined && nb.la !== null ? `LA ${nb.la}` : "LA ?";
+              const nbCid = nb.cell_id !== undefined && nb.cell_id !== null ? `Cell ${nb.cell_id}` : "";
+              const nbSync = nb.synchronized !== undefined && nb.synchronized !== null
+                ? `Sync: ${nb.synchronized ? "Yes" : "No"}`
+                : "";
+              const nbMeta = [nbLa, nbCid, nbSync].filter(Boolean).join(" | ");
+              nbRow.textContent = `Neighbour: ${nbFreq}${nbCh} -> ${nbMeta}`;
+              nbBox.appendChild(nbRow);
+            });
+            card.appendChild(nbBox);
+          }
 
           const timeRow = document.createElement("div");
-          timeRow.className = "text-gray-500 text-[10px]";
-          timeRow.textContent = `Seen: ${formatTime(net.timestamp)} via ${net.pdu || "SYSINFO"}`;
+          timeRow.className = "text-gray-500 text-[10px] flex items-center justify-between";
+          const viaText = net.reported_by && isNeighbour
+            ? `Reported by ${net.reported_by} MHz`
+            : `Seen: ${formatTime(net.timestamp)} via ${net.pdu || "ACTIVE"}`;
+          const pktText = net.packet_count ? `${net.packet_count} pkts` : "";
+          timeRow.textContent = pktText ? `${viaText} (${pktText})` : viaText;
 
-          card.appendChild(topRow);
-          card.appendChild(metaRow);
           card.appendChild(timeRow);
           networksContainer.appendChild(card);
         });
@@ -874,6 +980,10 @@
         try {
           const data = JSON.parse(event.data);
           appendEventRow(data);
+          if (data && data.category === "NETWORK" && wsInitialLoadDone) {
+            loadNetworks();
+            fetchWhitelist();
+          }
         } catch (e) {
           // Ignore malformed JSON line
         }
@@ -892,7 +1002,7 @@
     loadNetworks();
     fetchWhitelist();
     fetchBlacklist();
-    setInterval(loadNetworks, 15000);
+    setInterval(loadNetworks, 5000);
     setInterval(fetchWhitelist, 10000);
     setInterval(fetchBlacklist, 10000);
     connectWebSocket();

@@ -22,7 +22,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.13")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.14")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -65,7 +65,7 @@ BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
 NETWORK_LOG_COOLDOWN_S = 3600.0
 
 IGNORED_PDUS = {"D-CK CHANGE DEMAND"}
-NETWORK_PDUS = {"SYSINFO", "D-NWRK-BROADCAST"}
+NETWORK_PDUS = {"SYSINFO", "SYNC", "D-NWRK-BROADCAST"}
 CALL_PDUS = {
     "D-SETUP",
     "D-CONNECT",
@@ -1040,10 +1040,276 @@ def main():
         human = event_dict.get("human_text") or event_dict.get("pdu", "?")
         print(f"[{cat}] {freq} MHz (LA{la}) | {human}", flush=True)
 
+    def calc_carrier_number(freq_hz):
+        f_hz = int(freq_hz)
+        base_hz = 300_000_000 if f_hz < 400_000_000 else 400_000_000
+        if f_hz >= base_hz and (f_hz - base_hz) % 25_000 == 0:
+            return (f_hz - base_hz) // 25_000
+        return None
+
+    def extract_neighbour_cells(pkt, serving_freq_hz):
+        if not isinstance(pkt, dict):
+            return []
+        base_hz = 300_000_000 if int(serving_freq_hz) < 400_000_000 else 400_000_000
+        neighbours = []
+        for k, v in pkt.items():
+            k_low = str(k).lower().strip()
+            if not (k_low.startswith("cell ") or k_low.startswith("neighbour")):
+                continue
+            items_to_parse = []
+            if isinstance(v, list):
+                merged = {}
+                for elem in v:
+                    if isinstance(elem, dict):
+                        merged.update(elem)
+                if merged:
+                    items_to_parse.append(merged)
+            elif isinstance(v, dict):
+                items_to_parse.append(v)
+
+            for cdict in items_to_parse:
+                carrier_num = to_int(
+                    get_ci(cdict, ["main carrier number", "main_carrier_number", "carrier"])
+                )
+                cell_id = to_int(
+                    get_ci(cdict, ["cell identifier ca", "cell identifier", "cell_id"])
+                )
+                nb_la = to_int(get_ci(cdict, ["la", "location area"]))
+                cell_load = to_int(get_ci(cdict, ["cell load ca", "cell_load"]))
+                sync_val = to_int(
+                    get_ci(cdict, ["neighbour cell synchronized", "synchronized"])
+                )
+                reselect_types = to_int(
+                    get_ci(cdict, ["cell reselection types supported"])
+                )
+                nb_freq_hz = None
+                nb_freq_mhz = None
+                if carrier_num is not None and 0 < carrier_num < 4096:
+                    nb_freq_hz = base_hz + carrier_num * 25_000
+                    nb_freq_mhz = f"{nb_freq_hz / 1e6:.4f}"
+                if nb_freq_mhz or nb_la is not None or cell_id is not None:
+                    neighbours.append(
+                        {
+                            "cell_id": cell_id,
+                            "carrier_number": carrier_num,
+                            "freq_hz": nb_freq_hz,
+                            "freq_mhz": nb_freq_mhz,
+                            "la": nb_la,
+                            "cell_load": cell_load,
+                            "synchronized": bool(sync_val == 1)
+                            if sync_val is not None
+                            else None,
+                            "reselection_types": reselect_types,
+                        }
+                    )
+        return neighbours
+
+    def get_or_init_net_state(freq_mhz, freq_hz, default_la=None, role="ACTIVE CELL"):
+        state = channel_net_cache.get(freq_mhz)
+        if state is None:
+            state = {
+                "freq_mhz": freq_mhz,
+                "freq_hz": int(freq_hz) if freq_hz else 0,
+                "role": role,
+                "carrier_number": calc_carrier_number(freq_hz) if freq_hz else None,
+                "mcc": None,
+                "mnc": None,
+                "colour_code": None,
+                "la": default_la,
+                "cell_id": None,
+                "cell_load": None,
+                "encryption_mode": None,
+                "synchronized": None,
+                "fast_reselect_threshold": None,
+                "fast_reselect_hysteresis": None,
+                "slow_reselect_hysteresis": None,
+                "slow_reselect_threshold_above_fast": None,
+                "dl_freq": None,
+                "ul_freq": None,
+                "active_timeslots": set(),
+                "usage_markers": set(),
+                "neighbours": {},
+                "reported_by": None,
+                "packet_count": 0,
+                "last_pdu": None,
+                "last_emit_ts": 0.0,
+                "last_sig": None,
+            }
+            channel_net_cache[freq_mhz] = state
+        else:
+            if role == "ACTIVE CELL":
+                state["role"] = "ACTIVE CELL"
+            if state.get("la") is None and default_la is not None:
+                state["la"] = default_la
+            if not state.get("freq_hz") and freq_hz:
+                state["freq_hz"] = int(freq_hz)
+                state["carrier_number"] = calc_carrier_number(freq_hz)
+        return state
+
+    def persist_net_state(state, pdu_label, now_ts, emit_log_event=False):
+        freq_str = state["freq_mhz"]
+        active_slots = sorted(state["active_timeslots"])
+        usage_list = sorted(state["usage_markers"])[:12]
+        neighbours_list = list(state["neighbours"].values())
+
+        sig = (
+            state["role"],
+            state["mcc"],
+            state["mnc"],
+            state["la"],
+            state["cell_id"],
+            state["cell_load"],
+            state["encryption_mode"],
+            state["fast_reselect_threshold"],
+            state["fast_reselect_hysteresis"],
+            tuple(active_slots),
+            tuple(usage_list[:6]),
+            tuple(
+                (
+                    nb.get("freq_mhz"),
+                    nb.get("la"),
+                    nb.get("cell_id"),
+                    nb.get("synchronized"),
+                )
+                for nb in neighbours_list
+            ),
+        )
+
+        sig_changed = sig != state.get("last_sig")
+        if not sig_changed and (now_ts - state.get("last_emit_ts", 0.0)) < 15.0:
+            return
+
+        state["last_sig"] = sig
+        state["last_emit_ts"] = now_ts
+
+        net_id = f"NET_{freq_str}"
+        seen_networks[net_id] = now_ts
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        enc_mode = state.get("encryption_mode")
+        enc_str = (
+            "Clear (ENC 0)"
+            if enc_mode == 0
+            else (f"Encrypted (ENC {enc_mode})" if enc_mode is not None else "Unknown")
+        )
+        parts = [f"{state['role']} {freq_str} MHz"]
+        if state.get("la") is not None:
+            parts.append(f"LA={state['la']}")
+        if state.get("cell_id") is not None:
+            parts.append(f"Cell={state['cell_id']}")
+        if state.get("mcc") is not None or state.get("mnc") is not None:
+            parts.append(f"MCC={state.get('mcc') or '?'} MNC={state.get('mnc') or '?'}")
+        if enc_mode is not None:
+            parts.append(enc_str)
+        if state.get("cell_load") is not None:
+            parts.append(f"Load={state['cell_load']}")
+        if active_slots:
+            parts.append(f"Slots=TN{','.join(str(s) for s in active_slots)}")
+        if neighbours_list:
+            nb_strs = [
+                f"{nb.get('freq_mhz') or '?'} MHz (LA {nb.get('la')}, Cell {nb.get('cell_id')})"
+                for nb in neighbours_list
+            ]
+            parts.append(f"Neighbours=[{'; '.join(nb_strs)}]")
+
+        human_text = " | ".join(parts)
+
+        net_event = {
+            "timestamp": now_iso,
+            "time": now_iso,
+            "seen_epoch": round(now_ts, 3),
+            "host": HOST_NAME,
+            "category": "NETWORK",
+            "pdu": pdu_label or state.get("last_pdu") or "ACTIVE",
+            "network_id": net_id,
+            "role": state["role"],
+            "freq_mhz": freq_str,
+            "freq_hz": state["freq_hz"],
+            "carrier_number": state.get("carrier_number"),
+            "mcc": state.get("mcc"),
+            "mnc": state.get("mnc"),
+            "colour_code": state.get("colour_code"),
+            "la": state.get("la"),
+            "cell_id": state.get("cell_id"),
+            "cell_load": state.get("cell_load"),
+            "encryption_mode": enc_mode,
+            "synchronized": state.get("synchronized"),
+            "fast_reselect_threshold": state.get("fast_reselect_threshold"),
+            "fast_reselect_hysteresis": state.get("fast_reselect_hysteresis"),
+            "slow_reselect_hysteresis": state.get("slow_reselect_hysteresis"),
+            "slow_reselect_threshold_above_fast": state.get(
+                "slow_reselect_threshold_above_fast"
+            ),
+            "active_timeslots": active_slots,
+            "usage_markers": usage_list,
+            "neighbours": neighbours_list,
+            "reported_by": state.get("reported_by"),
+            "packet_count": state.get("packet_count", 0),
+            "dl_freq": state.get("dl_freq"),
+            "ul_freq": state.get("ul_freq"),
+            "human_text": human_text,
+        }
+
+        try:
+            with open(DISCOVERED_NETWORKS_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(net_event, ensure_ascii=False) + "\n")
+                f.flush()
+        except Exception as exc:
+            print(f"[parser] Failed writing {DISCOVERED_NETWORKS_FILE}: {exc}", flush=True)
+
+        if mqtt_client is not None:
+            payload_str = json.dumps(net_event, ensure_ascii=False)
+            mqtt_client.publish(
+                f"{MQTT_BASE_TOPIC}/NETWORK", payload_str, qos=0, retain=True
+            )
+
+        if emit_log_event and sig_changed:
+            cooldown_key = f"LOG_{freq_str}_{state.get('la')}_{len(neighbours_list)}"
+            last_log = seen_networks.get(cooldown_key, 0.0)
+            if (now_ts - last_log) >= 300.0:
+                seen_networks[cooldown_key] = now_ts
+                emit_event(net_event)
+
+    def observe_channel_activity(ch, pkt, pdu, service, now_ts):
+        freq_str = ch["freq_mhz"]
+        state = get_or_init_net_state(
+            freq_str, ch["freq_hz"], default_la=ch.get("la"), role="ACTIVE CELL"
+        )
+        state["packet_count"] = int(state.get("packet_count", 0)) + 1
+        if pdu:
+            state["last_pdu"] = pdu
+        elif service:
+            state["last_pdu"] = service
+
+        tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
+        if tn is not None and 1 <= tn <= 4:
+            state["active_timeslots"].add(tn)
+
+        um = to_int(
+            get_ci(pkt, ["downlink usage marker", "usage marker", "usage_marker"])
+        )
+        if um is not None and um > 0:
+            state["usage_markers"].add(um)
+
+        enc_mode = to_int(
+            get_ci(pkt, ["encryption mode", "encryption_mode", "encrypted"])
+        )
+        if enc_mode is not None:
+            state["encryption_mode"] = enc_mode
+
+        register_whitelisted_carrier(
+            ch,
+            pdu or service or "TRAFFIC",
+            mcc=state.get("mcc"),
+            mnc=state.get("mnc"),
+            la=state.get("la"),
+        )
+        persist_net_state(state, pdu or service, now_ts, emit_log_event=False)
+
     def handle_network_discovery(ch, pkt, pdu, now_ts):
         freq_str = ch["freq_mhz"]
-        state = channel_net_cache.setdefault(
-            freq_str, {"mcc": None, "mnc": None, "la": None}
+        state = get_or_init_net_state(
+            freq_str, ch["freq_hz"], default_la=ch.get("la"), role="ACTIVE CELL"
         )
 
         pkt_mcc = to_int(
@@ -1055,70 +1321,112 @@ def main():
         pkt_la = to_int(
             get_ci(pkt, ["la", "location area", "cell la"])
         )
+        pkt_colour = to_int(get_ci(pkt, ["colour code", "color code", "cc"]))
+        pkt_cell_id = to_int(
+            get_ci(pkt, ["cell identifier ca", "cell identifier", "cell_id"])
+        )
+        pkt_cell_load = to_int(get_ci(pkt, ["cell load ca", "cell_load"]))
+        pkt_fast_thr = to_int(
+            get_ci(pkt, ["fast_reselect_threshold", "fast reselect threshold"])
+        )
+        pkt_fast_hyst = to_int(
+            get_ci(pkt, ["fast_reselect_hysteresis", "fast reselect hysteresis"])
+        )
+        pkt_slow_hyst = to_int(
+            get_ci(pkt, ["slow_reselect hysteresis", "slow_reselect_hysteresis"])
+        )
+        pkt_slow_thr = to_int(
+            get_ci(
+                pkt,
+                [
+                    "slow_reselect_threshold_above_fast",
+                    "slow reselect threshold above fast",
+                ],
+            )
+        )
+        dl_f = get_ci(pkt, ["dl_freq", "downlink frequency"])
+        ul_f = get_ci(pkt, ["ul_freq", "uplink frequency"])
 
         if pkt_mcc is not None:
             state["mcc"] = pkt_mcc
         if pkt_mnc is not None:
             state["mnc"] = pkt_mnc
+        if pkt_colour is not None:
+            state["colour_code"] = pkt_colour
         if pkt_la is not None:
             state["la"] = pkt_la
             ch["la"] = pkt_la
+        if pkt_cell_id is not None:
+            state["cell_id"] = pkt_cell_id
+        if pkt_cell_load is not None:
+            state["cell_load"] = pkt_cell_load
+        if pkt_fast_thr is not None:
+            state["fast_reselect_threshold"] = pkt_fast_thr
+        if pkt_fast_hyst is not None:
+            state["fast_reselect_hysteresis"] = pkt_fast_hyst
+        if pkt_slow_hyst is not None:
+            state["slow_reselect_hysteresis"] = pkt_slow_hyst
+        if pkt_slow_thr is not None:
+            state["slow_reselect_threshold_above_fast"] = pkt_slow_thr
+        if dl_f is not None:
+            state["dl_freq"] = dl_f
+        if ul_f is not None:
+            state["ul_freq"] = ul_f
 
-        mcc = state["mcc"]
-        mnc = state["mnc"]
-        la = state["la"] if state["la"] is not None else ch["la"]
+        neighbours = extract_neighbour_cells(pkt, ch["freq_hz"])
+        for nb in neighbours:
+            nb_key = nb.get("freq_mhz") or f"CH_{nb.get('carrier_number')}"
+            state["neighbours"][nb_key] = nb
 
-        if mcc is None and mnc is None and pkt_la is None:
-            return
+            nb_freq_mhz = nb.get("freq_mhz")
+            nb_freq_hz = nb.get("freq_hz")
+            if nb_freq_mhz and nb_freq_hz:
+                nb_state = get_or_init_net_state(
+                    nb_freq_mhz,
+                    nb_freq_hz,
+                    default_la=nb.get("la"),
+                    role="NEIGHBOUR CELL",
+                )
+                if nb.get("la") is not None:
+                    nb_state["la"] = nb["la"]
+                    for ch_obj in channels:
+                        if ch_obj["freq_mhz"] == nb_freq_mhz:
+                            ch_obj["la"] = nb["la"]
+                if nb.get("cell_id") is not None:
+                    nb_state["cell_id"] = nb["cell_id"]
+                if nb.get("cell_load") is not None and nb_state.get("cell_load") is None:
+                    nb_state["cell_load"] = nb["cell_load"]
+                if nb.get("synchronized") is not None:
+                    nb_state["synchronized"] = nb["synchronized"]
+                if nb_state.get("mcc") is None and state.get("mcc") is not None:
+                    nb_state["mcc"] = state["mcc"]
+                if nb_state.get("mnc") is None and state.get("mnc") is not None:
+                    nb_state["mnc"] = state["mnc"]
+                nb_state["reported_by"] = freq_str
 
-        register_whitelisted_carrier(ch, "NETWORK", mcc=mcc, mnc=mnc, la=la)
+                nb_ch_proxy = {
+                    "freq_hz": nb_freq_hz,
+                    "freq_mhz": nb_freq_mhz,
+                    "la": nb.get("la"),
+                }
+                register_whitelisted_carrier(
+                    nb_ch_proxy,
+                    "NEIGHBOUR_BROADCAST",
+                    mcc=nb_state.get("mcc"),
+                    mnc=nb_state.get("mnc"),
+                    la=nb.get("la"),
+                )
+                persist_net_state(
+                    nb_state,
+                    f"NEIGHBOUR ({pdu})",
+                    now_ts,
+                    emit_log_event=False,
+                )
 
-        net_id = f"{freq_str}_{mcc}_{mnc}_{la}"
-        last_seen = seen_networks.get(net_id)
-        if last_seen is not None and (now_ts - last_seen) < NETWORK_LOG_COOLDOWN_S:
-            return
-
-        seen_networks[net_id] = now_ts
-        now_iso = datetime.now(timezone.utc).isoformat()
-        human_text = (
-            f"Discovered TETRA Network on {freq_str} MHz: "
-            f"MCC={mcc} MNC={mnc} LA={la} (via {pdu})"
+        register_whitelisted_carrier(
+            ch, "NETWORK", mcc=state.get("mcc"), mnc=state.get("mnc"), la=state.get("la")
         )
-
-        net_event = {
-            "timestamp": now_iso,
-            "seen_epoch": round(now_ts, 3),
-            "host": HOST_NAME,
-            "category": "NETWORK",
-            "pdu": pdu,
-            "network_id": net_id,
-            "freq_mhz": freq_str,
-            "freq_hz": ch["freq_hz"],
-            "mcc": mcc,
-            "mnc": mnc,
-            "la": la,
-            "dl_freq": get_ci(pkt, ["dl_freq", "downlink frequency"]),
-            "ul_freq": get_ci(pkt, ["ul_freq", "uplink frequency"]),
-            "human_text": human_text,
-        }
-
-        try:
-            with open(DISCOVERED_NETWORKS_FILE, "a", encoding="utf-8") as f:
-                f.write(json.dumps(net_event, ensure_ascii=False) + "\n")
-        except Exception as exc:
-            print(f"[parser] Failed writing {DISCOVERED_NETWORKS_FILE}: {exc}", flush=True)
-
-        if mqtt_client is not None:
-            payload_str = json.dumps(net_event, ensure_ascii=False)
-            mqtt_client.publish(
-                f"{MQTT_BASE_TOPIC}/NETWORK", payload_str, qos=0, retain=True
-            )
-            mqtt_client.publish(
-                f"{MQTT_BASE_TOPIC}/event", payload_str, qos=0, retain=False
-            )
-
-        send_udp_json(net_event)
-        print(f"[NETWORK] {freq_str} MHz (LA{la}) | {human_text}", flush=True)
+        persist_net_state(state, pdu, now_ts, emit_log_event=True)
 
     def build_and_emit_sds(ch, pkt1, pkt2=None):
         now_ts = time.time()
@@ -1439,6 +1747,7 @@ def main():
         service = str(get_ci(pkt, ["service"], "")).upper()
         pdu = str(get_ci(pkt, ["pdu"], "")).upper()
         now_ts = time.time()
+        observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
             enc_mode = to_int(
