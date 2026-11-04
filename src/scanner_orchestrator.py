@@ -727,6 +727,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
                 in_window,
                 key=lambda x: (
                     1 if x.get("whitelisted") else 0,
+                    -int(x.get("strikes") or 0),
                     x["snr_db"] if x.get("snr_db") is not None else -999.0,
                     x["dbm"] if x.get("dbm") is not None else -999.0,
                 ),
@@ -761,13 +762,14 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
             snr = max(0.0, float(p.get("snr_db") or 0.0))
             dbm = float(p.get("dbm") if p.get("dbm") is not None else -65.0)
             dbm_bonus = max(0.0, (dbm + 45.0) * 0.4) if snr >= 5.0 else 0.0
-            strike_penalty = int(p.get("strikes") or 0) * 15.0
+            strikes = int(p.get("strikes") or 0)
+            strike_factor = 0.25 ** strikes
             if p.get("whitelisted"):
                 weighted_score += 25.0 + (snr * 2.5) + dbm_bonus
             elif snr >= 6.0:
-                weighted_score += 8.0 + (snr * 2.0) + dbm_bonus - strike_penalty
+                weighted_score += (8.0 + (snr * 2.0) + dbm_bonus) * strike_factor
             else:
-                weighted_score += (snr * 0.6) - strike_penalty
+                weighted_score += max(0.1, snr * 0.6) * strike_factor
 
         score = (
             round(weighted_score, 2),
@@ -789,6 +791,33 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
     max_f = best_window_peaks[-1]["freq_hz"]
     raw_center = (min_f + max_f) // 2
     center_hz = int(round(raw_center / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
+
+    if len(best_window_peaks) < MAX_PEAKS:
+        existing_hz = {p["freq_hz"] for p in best_window_peaks}
+        half_span = max_bandwidth_hz // 2
+        extra_candidates = [
+            p
+            for p in unique_sorted
+            if p["freq_hz"] not in existing_hz
+            and abs(p["freq_hz"] - center_hz) <= half_span
+        ]
+        if extra_candidates:
+            extra_sorted = sorted(
+                extra_candidates,
+                key=lambda x: (
+                    1 if x.get("whitelisted") else 0,
+                    -int(x.get("strikes") or 0),
+                    x["snr_db"] if x.get("snr_db") is not None else -999.0,
+                ),
+                reverse=True,
+            )[: MAX_PEAKS - len(best_window_peaks)]
+            best_window_peaks.extend(extra_sorted)
+            best_window_peaks.sort(key=lambda x: x["freq_hz"])
+            min_f = best_window_peaks[0]["freq_hz"]
+            max_f = best_window_peaks[-1]["freq_hz"]
+            if (max_f - min_f) <= max_bandwidth_hz:
+                raw_center = (min_f + max_f) // 2
+                center_hz = int(round(raw_center / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
 
     for p in best_window_peaks:
         if abs(p["freq_hz"] - center_hz) < 12500:
@@ -971,7 +1000,11 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                         if isinstance(per_chan, dict):
                             hb_lines = ["[60s CHANNEL CHECK]"]
                             for m_str, p_cnt in per_chan.items():
-                                status_lbl = "ACTIVE TETRA" if int(p_cnt or 0) > 0 else "0 pkt/min (Silent/No Sync)"
+                                status_lbl = (
+                                    "ACTIVE TETRA (CRC Sync OK)"
+                                    if int(p_cnt or 0) > 0
+                                    else "Silent / No TETRA CRC Sync"
+                                )
                                 hb_lines.append(f"  - {m_str} MHz: {p_cnt} pkt/min ({status_lbl})")
                             emit_system_event("\n".join(hb_lines))
                         else:
@@ -1205,7 +1238,7 @@ def main():
 
             active_frequencies = [int(pk["freq_hz"]) for pk in best_peaks]
             channels_list = [
-                f"{pk['freq_hz']}:{pk.get('la') if pk.get('la') is not None else idx}"
+                f"{pk['freq_hz']}:{pk.get('la') if pk.get('la') is not None else '?'}"
                 for idx, pk in enumerate(best_peaks, start=1)
             ]
             channels_str = ",".join(channels_list)

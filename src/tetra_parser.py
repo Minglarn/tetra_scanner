@@ -29,7 +29,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.26")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.27")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -153,12 +153,11 @@ def parse_channels(channels_str):
     for idx, entry in enumerate(entries, start=1):
         parts = entry.split(":")
         freq_hz = int(parts[0])
+        la_part = parts[1].strip() if len(parts) > 1 else ""
         la = (
-            int(parts[1])
-            if len(parts) > 1 and parts[1].isdigit()
-            else parts[1]
-            if len(parts) > 1
-            else idx
+            int(la_part)
+            if la_part.isdigit()
+            else (la_part if la_part and la_part != "?" else None)
         )
         freq_mhz = f"{freq_hz / 1e6:.4f}"
         channels.append(
@@ -2006,6 +2005,7 @@ def main():
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
+            chan_verified = bool(net_states.get(freq_str, {}).get("control_verified"))
             raw_pkt_ssi = to_int(
                 get_ci(
                     pkt,
@@ -2023,7 +2023,8 @@ def main():
                     (freq_str, "dummy_16777215"),
                     f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Dummy broadcast SSI 16777215",
                 )
-                emit_raw_mac_event(ch, pkt)
+                if chan_verified:
+                    emit_raw_mac_event(ch, pkt)
                 return
 
             pkt_ssi = None if raw_pkt_ssi in (0, 16777215) else raw_pkt_ssi
@@ -2038,9 +2039,11 @@ def main():
                     (freq_str, f"enc_{enc_mode}"),
                     f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Encrypted (enc_mode={enc_mode})",
                 )
-                emit_raw_mac_event(ch, pkt)
+                if chan_verified:
+                    emit_raw_mac_event(ch, pkt)
                 return
 
+            emit_this_uplane_raw = chan_verified
             if isinstance(frame_b64, str) and frame_b64.strip():
                 tn = to_int(get_ci(pkt, ["tn", "timeslot"]))
                 dl_um = to_int(get_ci(pkt, ["downlink usage marker"]), default=0) or 0
@@ -2076,7 +2079,8 @@ def main():
                         (freq_str, f"no_ctx_tn_{tn}"),
                         f"[DEBUG] Dropped TCH_S on {freq_str} MHz (TN {tn}): No call context and usage_marker=0 (raw_ssi={raw_pkt_ssi})",
                     )
-                    emit_raw_mac_event(ch, pkt)
+                    if chan_verified:
+                        emit_raw_mac_event(ch, pkt)
                     return
 
                 buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or eff_gssi or 1))
@@ -2123,28 +2127,32 @@ def main():
                         if not buf.get("usage_marker") and usage_marker > 0:
                             buf["usage_marker"] = usage_marker
                     buf["frames"].append(frame_b64.strip())
-                    if not buf.get("logged_start") and (
+                    if (
                         len(buf["frames"]) >= 3
                         or buf.get("ssi") is not None
                         or buf.get("gssi") is not None
                     ):
-                        buf["logged_start"] = True
-                        logging.info(
-                            "[DEBUG] Started TCH_S voice buffer on %s MHz (TN %s, UM %s, SSI %s, GSSI %s)",
-                            freq_str,
-                            tn,
-                            buf.get("usage_marker"),
-                            buf.get("ssi"),
-                            buf.get("gssi"),
-                        )
+                        emit_this_uplane_raw = True
+                        if not buf.get("logged_start"):
+                            buf["logged_start"] = True
+                            logging.info(
+                                "[DEBUG] Started TCH_S voice buffer on %s MHz (TN %s, UM %s, SSI %s, GSSI %s)",
+                                freq_str,
+                                tn,
+                                buf.get("usage_marker"),
+                                buf.get("ssi"),
+                                buf.get("gssi"),
+                            )
                     if len(buf["frames"]) >= 3:
                         stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
 
-            emit_raw_mac_event(ch, pkt)
+            if emit_this_uplane_raw:
+                emit_raw_mac_event(ch, pkt)
             return
 
         if service == "UPLANE":
-            emit_raw_mac_event(ch, pkt)
+            if net_states.get(freq_str, {}).get("control_verified"):
+                emit_raw_mac_event(ch, pkt)
             return
         if pdu in IGNORED_PDUS:
             emit_raw_mac_event(ch, pkt)
