@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.32")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.33")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -651,7 +651,7 @@ async def lock_to_whitelist(request: Request):
 
 
 @app.get("/api/history", response_class=JSONResponse)
-async def get_history(
+def get_history(
     category: str = "ALL",
     freq_mhz: str = "",
     ssi: str = "",
@@ -661,8 +661,7 @@ async def get_history(
     offset: int = 0,
     include_system: bool = False,
 ):
-    result = await asyncio.to_thread(
-        db.query_history,
+    return db.query_history(
         category=category,
         freq_mhz=freq_mhz,
         ssi=ssi,
@@ -672,13 +671,11 @@ async def get_history(
         offset=offset,
         include_system=include_system,
     )
-    return result
 
 
 @app.get("/api/analytics", response_class=JSONResponse)
-async def get_analytics(hours: float = 24.0):
-    result = await asyncio.to_thread(db.get_analytics_summary, hours=hours)
-    return result
+def get_analytics(hours: float = 24.0):
+    return db.get_analytics_summary(hours=hours)
 
 
 async def read_recent_lines(filepath: str, max_lines: int = 150):
