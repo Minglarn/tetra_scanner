@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.33")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.01")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -313,8 +313,7 @@ async def get_networks():
         net
         for net in networks_by_freq.values()
         if not (
-            str(net.get("pdu") or "").upper() == "TCH_S"
-            and int(net.get("packet_count") or 0) < 3
+            str(net.get("pdu") or "").upper() in ("TCH_S", "UPLANE")
             and net.get("mcc") is None
             and net.get("mnc") is None
             and net.get("cell_id") is None
@@ -449,7 +448,15 @@ async def get_whitelist():
     except Exception:
         return []
 
-    valid_wl_categories = {"SDS", "CALL", "VOICE", "STATUS", "ROAMING", "NETWORK"}
+    valid_wl_categories = {
+        "SDS",
+        "CALL",
+        "VOICE",
+        "STATUS",
+        "ROAMING",
+        "NETWORK",
+        "NEIGHBOUR_BROADCAST",
+    }
     items = [
         v
         for v in data.values()

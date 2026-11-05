@@ -34,7 +34,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.04.33")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.01")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -233,9 +233,9 @@ def format_mac(hex_id):
     return None
 
 
-def extract_bits_signed(data_bytes, bit_offset, num_bits):
+def extract_bits_unsigned(data_bytes, bit_offset, num_bits):
     total_bits = len(data_bytes) * 8
-    if bit_offset + num_bits > total_bits:
+    if bit_offset < 0 or bit_offset + num_bits > total_bits or num_bits <= 0:
         return None
     val = 0
     for i in range(num_bits):
@@ -243,22 +243,54 @@ def extract_bits_signed(data_bytes, bit_offset, num_bits):
         bit_idx = 7 - ((bit_offset + i) % 8)
         bit = (data_bytes[byte_idx] >> bit_idx) & 1
         val = (val << 1) | bit
+    return val
+
+
+def extract_bits_signed(data_bytes, bit_offset, num_bits):
+    val = extract_bits_unsigned(data_bytes, bit_offset, num_bits)
+    if val is None:
+        return None
     if val & (1 << (num_bits - 1)):
         val -= 1 << num_bits
     return val
 
 
-def decode_lip_gps(raw_bytes):
+def decode_lip_velocity_kmh(vel_raw):
+    if vel_raw is None or vel_raw < 0 or vel_raw >= 127:
+        return None
+    if vel_raw <= 28:
+        return float(vel_raw)
+    import math
+    return round(16.0 * math.pow(1.038, vel_raw - 13), 1)
+
+
+def decode_lip_full(raw_bytes):
     if not raw_bytes:
-        return None, None
+        return None
     payload = (
         raw_bytes[1:] if len(raw_bytes) >= 8 and raw_bytes[0] == 0x0A else raw_bytes
     )
     if len(payload) < 7:
-        return None, None
+        return None
 
-    candidate_offsets = [8, 6, 4, 2, 0]
-    fallback_coords = None
+    pdu_type = extract_bits_unsigned(payload, 0, 2)
+    if pdu_type == 1 and len(payload) >= 8:
+        for ext_off in (6, 4, 2):
+            lon_raw = extract_bits_signed(payload, ext_off, 26)
+            lat_raw = extract_bits_signed(payload, ext_off + 26, 25)
+            if lon_raw is None or lat_raw is None:
+                continue
+            lon = (lon_raw * 360.0) / float(1 << 26)
+            lat = (lat_raw * 180.0) / float(1 << 25)
+            if 54.0 <= lat <= 70.5 and 10.0 <= lon <= 25.5:
+                return {
+                    "lat": round(lat, 6),
+                    "lon": round(lon, 6),
+                    "lip_type": "Long",
+                }
+
+    candidate_offsets = [4, 8, 6, 2, 0]
+    fallback_info = None
 
     for offset in candidate_offsets:
         lon_raw = extract_bits_signed(payload, offset, 25)
@@ -268,14 +300,39 @@ def decode_lip_gps(raw_bytes):
         lon = (lon_raw * 360.0) / float(1 << 25)
         lat = (lat_raw * 180.0) / float(1 << 24)
         if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0:
-            if fallback_coords is None:
-                fallback_coords = (round(lat, 6), round(lon, 6))
-            if 54.0 <= lat <= 70.0 and 10.0 <= lon <= 25.0:
-                return round(lat, 6), round(lon, 6)
+            speed_kmh = None
+            course_deg = None
+            vel_off = offset + 49 + 3
+            vel_raw = extract_bits_unsigned(payload, vel_off, 7)
+            if vel_raw is not None:
+                speed_kmh = decode_lip_velocity_kmh(vel_raw)
+            dir_raw = extract_bits_unsigned(payload, vel_off + 7, 4)
+            if dir_raw is not None and 0 <= dir_raw <= 15:
+                course_deg = round(dir_raw * 22.5, 1)
 
-    if fallback_coords is not None:
-        return fallback_coords
-    return None, None
+            info = {
+                "lat": round(lat, 6),
+                "lon": round(lon, 6),
+                "lip_type": "Short",
+            }
+            if speed_kmh is not None and 0.0 <= speed_kmh <= 350.0:
+                info["speed_kmh"] = speed_kmh
+            if course_deg is not None:
+                info["course_deg"] = course_deg
+
+            if fallback_info is None:
+                fallback_info = info
+            if 54.0 <= lat <= 70.5 and 10.0 <= lon <= 25.5:
+                return info
+
+    return fallback_info
+
+
+def decode_lip_gps(raw_bytes):
+    info = decode_lip_full(raw_bytes)
+    if not info:
+        return None, None
+    return info.get("lat"), info.get("lon")
 
 
 def scan_binary_for_nordic_coords(raw_bytes):
@@ -392,24 +449,195 @@ def parse_nmea_sentence(text):
     }
 
 
+GSM7_CHARS = (
+    "@£$¥èéùìòÇ\nØø\rÅå"
+    "Δ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ"
+    " !\"#¤%&'()*+,-./"
+    "0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNO"
+    "PQRSTUVWXYZÄÖÑÜ§"
+    "¿abcdefghijklmno"
+    "pqrstuvwxyzäöñüà"
+)
+
+GSM7_EXT = {
+    0x0A: "\f",
+    0x14: "^",
+    0x28: "{",
+    0x29: "}",
+    0x2F: "\\",
+    0x3C: "[",
+    0x3D: "~",
+    0x3E: "]",
+    0x40: "|",
+    0x65: "€",
+}
+
+
+def unpack_gsm7bit(data, septet_count=None, bit_offset=0):
+    if not data:
+        return ""
+    total_bits = len(data) * 8 - bit_offset
+    if total_bits < 7:
+        return ""
+    max_septets = total_bits // 7
+    if septet_count is None or septet_count > max_septets:
+        septet_count = max_septets
+
+    septets = []
+    for i in range(septet_count):
+        bit_pos = bit_offset + i * 7
+        byte_idx = bit_pos // 8
+        bit_in_byte = bit_pos % 8
+        if byte_idx >= len(data):
+            break
+        val = (data[byte_idx] >> bit_in_byte) & 0x7F
+        if bit_in_byte > 1 and (byte_idx + 1) < len(data):
+            remaining_bits = 7 - (8 - bit_in_byte)
+            mask = (1 << remaining_bits) - 1
+            next_bits = (data[byte_idx + 1] & mask) << (8 - bit_in_byte)
+            val = ((data[byte_idx] >> bit_in_byte) | next_bits) & 0x7F
+        septets.append(val)
+
+    chars = []
+    escape = False
+    for s in septets:
+        if escape:
+            chars.append(GSM7_EXT.get(s, " "))
+            escape = False
+        elif s == 0x1B:
+            escape = True
+        elif 0 <= s < len(GSM7_CHARS):
+            chars.append(GSM7_CHARS[s])
+        else:
+            chars.append(" ")
+    return "".join(chars).rstrip("\x00\r\n ")
+
+
+def unpack_gsm7bit_with_udh(data):
+    if not data or len(data) < 2:
+        return ""
+    udhl = data[0]
+    header_bytes = 1 + udhl
+    if header_bytes >= len(data):
+        return ""
+    header_bits = header_bytes * 8
+    fill_bits = (7 - (header_bits % 7)) % 7
+    bit_offset = header_bits + fill_bits
+    return unpack_gsm7bit(data, bit_offset=bit_offset)
+
+
+def is_printable_text(text, threshold=0.78):
+    if not text:
+        return False
+    cleaned = text.strip()
+    if len(cleaned) < 2:
+        return False
+    printable = sum(1 for c in cleaned if c.isprintable() or c in ("\n", "\r", "\t"))
+    if printable / float(len(cleaned)) < threshold:
+        return False
+    alnum_or_space = sum(
+        1 for c in cleaned if c.isalnum() or c in (" ", "-", "_", ":", ",", ".", "*", "#", "/", "(", ")")
+    )
+    return (alnum_or_space / float(len(cleaned))) >= 0.65
+
+
 def extract_ascii_strings(raw_bytes, min_len=3):
     text = "".join(chr(b) if 32 <= b <= 126 else "\x00" for b in raw_bytes)
     parts = [p.strip() for p in text.split("\x00") if len(p.strip()) >= min_len]
     return " ".join(parts) if parts else None
 
 
-def decode_sds_tl_hex(raw_bytes):
+def decode_text_by_coding_scheme(payload_bytes, scheme):
+    if not payload_bytes:
+        return None
+    scheme_low = scheme & 0x1F
+    if scheme_low == 0x00:
+        txt = unpack_gsm7bit(payload_bytes)
+        if is_printable_text(txt):
+            return txt.strip()
+    elif scheme_low in (0x01, 0x03, 0x04, 0x05):
+        for enc in ("utf-8", "iso-8859-1"):
+            try:
+                txt = payload_bytes.decode(enc)
+                if is_printable_text(txt):
+                    return txt.strip()
+            except Exception:
+                pass
+    elif scheme_low in (0x02, 0x08, 0x18):
+        even_bytes = payload_bytes[: (len(payload_bytes) // 2) * 2]
+        if len(even_bytes) >= 4:
+            try:
+                txt = even_bytes.decode("utf-16-be")
+                if is_printable_text(txt):
+                    return txt.strip()
+            except Exception:
+                pass
+    return None
+
+
+def decode_sds_tl_hex(raw_bytes, proto_id=130):
     if not raw_bytes:
         return None
-    candidates = [raw_bytes]
-    if len(raw_bytes) > 2:
-        candidates.append(raw_bytes[2:])
-    if len(raw_bytes) > 3:
-        candidates.append(raw_bytes[3:])
+
+    body = raw_bytes
+    if len(body) >= 2 and body[0] in (0x82, 0x83, 0x89, 0x02, 0x03, 0x06, 0x07, 0x09, 0x0C):
+        body = body[1:]
+
+    if proto_id in (130, 131, 137) and len(body) >= 1:
+        tl_hdr = body[0]
+        msg_type = (tl_hdr >> 4) & 0x0F
+        if msg_type == 1:
+            return "SDS-REPORT (Delivery Receipt)"
+        if msg_type == 2:
+            return "SDS-ACK"
+        if msg_type == 0 and len(body) >= 2:
+            has_ts = bool(tl_hdr & 0x01)
+            scheme_offsets = [4, 1] if (has_ts and len(body) > 5) else ([1, 4] if len(body) > 5 else [1])
+            for s_off in scheme_offsets:
+                if s_off < len(body):
+                    scheme = body[s_off]
+                    payload = body[s_off + 1 :]
+                    decoded_txt = decode_text_by_coding_scheme(payload, scheme)
+                    if decoded_txt:
+                        return decoded_txt
+
+    candidates = [body]
+    if body is not raw_bytes:
+        candidates.append(raw_bytes)
+    for base in (body, raw_bytes):
+        if len(base) > 1:
+            candidates.append(base[1:])
+        if len(base) > 2:
+            candidates.append(base[2:])
+        if len(base) > 3:
+            candidates.append(base[3:])
+        if len(base) > 4:
+            candidates.append(base[4:])
+
     for cand in candidates:
-        printable = sum(1 for b in cand if 32 <= b <= 126 or b in (10, 13))
-        if len(cand) >= 3 and printable / float(len(cand)) >= 0.75:
+        if len(cand) < 2:
+            continue
+        printable_ascii = sum(1 for b in cand if 32 <= b <= 126 or b in (10, 13))
+        if len(cand) >= 3 and printable_ascii / float(len(cand)) >= 0.78:
             return "".join(chr(b) for b in cand if 32 <= b <= 126).strip()
+        try:
+            latin_txt = cand.decode("iso-8859-1")
+            if len(cand) >= 3 and is_printable_text(latin_txt, threshold=0.82):
+                return latin_txt.strip()
+        except Exception:
+            pass
+
+    if proto_id in (7, 130, 131):
+        for cand in candidates[:4]:
+            if len(cand) >= 3:
+                gsm_txt = unpack_gsm7bit(cand)
+                if len(gsm_txt) >= 3 and is_printable_text(gsm_txt, threshold=0.85):
+                    return gsm_txt.strip()
+                udh_txt = unpack_gsm7bit_with_udh(cand)
+                if len(udh_txt) >= 3 and is_printable_text(udh_txt, threshold=0.85):
+                    return udh_txt.strip()
+
     return extract_ascii_strings(raw_bytes, min_len=3)
 
 
@@ -540,22 +768,21 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
 
     if proto_id == 10:
         sds_type = "LIP_GPS"
-        gps_lat, gps_lon = decode_lip_gps(raw_bytes)
-        if gps_lat is not None and gps_lon is not None:
+        lip_info = decode_lip_full(raw_bytes)
+        if lip_info and lip_info.get("lat") is not None and lip_info.get("lon") is not None:
+            gps_lat = lip_info["lat"]
+            gps_lon = lip_info["lon"]
             sds_text = f"GPS {gps_lat:.6f}, {gps_lon:.6f}"
-            parsed_data = {
-                "lat": gps_lat,
-                "lon": gps_lon,
-                "maps_url": f"https://www.google.com/maps?q={gps_lat},{gps_lon}",
-            }
+            parsed_data = dict(lip_info)
+            parsed_data["maps_url"] = f"https://www.google.com/maps?q={gps_lat},{gps_lon}"
         elif infos_text:
             sds_text = infos_text
-    elif proto_id == 130:
+    elif proto_id in (2, 3, 6, 7, 9, 12, 130, 131, 137):
         sds_type = "TEXT"
         if infos_text:
             sds_text = infos_text
         elif raw_bytes:
-            sds_text = decode_sds_tl_hex(raw_bytes) or clean_hex
+            sds_text = decode_sds_tl_hex(raw_bytes, proto_id=proto_id) or clean_hex
     elif proto_id == 245:
         sds_type = "AVL_TELEMETRY"
         body = raw_bytes[3:] if len(raw_bytes) > 3 else raw_bytes
@@ -591,7 +818,7 @@ def decode_sds_payload(proto_id, hex_str, infos_list):
             sds_type = "TEXT"
             sds_text = infos_text
         elif raw_bytes:
-            ascii_str = decode_sds_tl_hex(raw_bytes)
+            ascii_str = decode_sds_tl_hex(raw_bytes, proto_id=proto_id)
             if ascii_str:
                 sds_type = "TEXT"
                 sds_text = ascii_str
@@ -893,21 +1120,180 @@ def main():
     voice_lock = threading.Lock()
     unit_registry = {}
     seen_networks = load_seen_networks(DISCOVERED_NETWORKS_FILE)
+    channel_net_cache = {}
+    unverified_tch_hz = set()
+    verified_net_hz = set()
+    if os.path.exists(DISCOVERED_NETWORKS_FILE):
+        try:
+            kept_lines = []
+            by_freq_records = {}
+            with open(DISCOVERED_NETWORKS_FILE, "r", encoding="utf-8", errors="replace") as nf:
+                for raw_line in nf:
+                    s_line = raw_line.strip()
+                    if not s_line:
+                        continue
+                    try:
+                        n_obj = json.loads(s_line)
+                    except Exception:
+                        continue
+                    if not isinstance(n_obj, dict):
+                        continue
+                    f_mhz = n_obj.get("freq_mhz")
+                    if f_mhz:
+                        by_freq_records.setdefault(f_mhz, []).append((s_line, n_obj))
+
+            pruned_any_net = False
+            for f_mhz, recs in by_freq_records.items():
+                has_control = False
+                f_hz_val = 0
+                for _, r_obj in recs:
+                    f_hz_val = int(r_obj.get("freq_hz") or f_hz_val or 0)
+                    r_pdu = str(r_obj.get("pdu") or "").upper()
+                    if (
+                        r_pdu not in ("TCH_S", "UPLANE", "")
+                        or r_obj.get("mcc") is not None
+                        or r_obj.get("mnc") is not None
+                        or r_obj.get("cell_id") is not None
+                        or bool(r_obj.get("neighbours"))
+                    ):
+                        has_control = True
+                if has_control:
+                    if f_hz_val > 0:
+                        verified_net_hz.add(str(f_hz_val))
+                    last_obj = recs[-1][1]
+                    channel_net_cache[f_mhz] = {
+                        "freq_mhz": f_mhz,
+                        "freq_hz": f_hz_val,
+                        "role": last_obj.get("role") or "ACTIVE CELL",
+                        "carrier_number": last_obj.get("carrier_number"),
+                        "mcc": last_obj.get("mcc"),
+                        "mnc": last_obj.get("mnc"),
+                        "colour_code": last_obj.get("colour_code"),
+                        "la": last_obj.get("la"),
+                        "cell_id": last_obj.get("cell_id"),
+                        "cell_load": last_obj.get("cell_load"),
+                        "encryption_mode": last_obj.get("encryption_mode"),
+                        "synchronized": last_obj.get("synchronized"),
+                        "fast_reselect_threshold": last_obj.get("fast_reselect_threshold"),
+                        "fast_reselect_hysteresis": last_obj.get("fast_reselect_hysteresis"),
+                        "slow_reselect_hysteresis": last_obj.get("slow_reselect_hysteresis"),
+                        "slow_reselect_threshold_above_fast": last_obj.get(
+                            "slow_reselect_threshold_above_fast"
+                        ),
+                        "dl_freq": last_obj.get("dl_freq"),
+                        "ul_freq": last_obj.get("ul_freq"),
+                        "active_timeslots": set(last_obj.get("active_timeslots") or []),
+                        "usage_markers": set(last_obj.get("usage_markers") or []),
+                        "neighbours": {
+                            (nb.get("freq_mhz") or f"CH_{nb.get('carrier_number')}"): nb
+                            for nb in (last_obj.get("neighbours") or [])
+                            if isinstance(nb, dict)
+                        },
+                        "reported_by": last_obj.get("reported_by"),
+                        "packet_count": int(last_obj.get("packet_count") or 0),
+                        "last_pdu": last_obj.get("pdu"),
+                        "last_emit_ts": float(last_obj.get("seen_epoch") or 0.0),
+                        "last_sig": None,
+                        "control_verified": True,
+                    }
+                    for s_line, _ in recs:
+                        kept_lines.append(s_line)
+                else:
+                    pruned_any_net = True
+                    if f_hz_val > 0:
+                        unverified_tch_hz.add(str(f_hz_val))
+                    print(
+                        f"[parser] Pruned unverified TCH_S-only ghost carrier {f_mhz} MHz from discovered_networks.jsonl",
+                        flush=True,
+                    )
+            if pruned_any_net:
+                tmp_nf = f"{DISCOVERED_NETWORKS_FILE}.tmp"
+                with open(tmp_nf, "w", encoding="utf-8") as wf:
+                    for kl in kept_lines:
+                        wf.write(kl + "\n")
+                os.replace(tmp_nf, DISCOVERED_NETWORKS_FILE)
+        except Exception as exc:
+            print(f"[parser] Warning pruning discovered_networks.jsonl: {exc}", flush=True)
+
     raw_whitelist_data = load_json_dict(WHITELIST_FILE)
-    valid_wl_categories = {"SDS", "CALL", "VOICE", "STATUS", "ROAMING", "NETWORK"}
-    whitelist_data = {
-        k: v
-        for k, v in raw_whitelist_data.items()
-        if isinstance(v, dict)
-        and str(v.get("last_category", "")).upper() in valid_wl_categories
+    valid_wl_categories = {
+        "SDS",
+        "CALL",
+        "VOICE",
+        "STATUS",
+        "ROAMING",
+        "NETWORK",
+        "NEIGHBOUR_BROADCAST",
     }
+    whitelist_data = {}
+    for k, v in raw_whitelist_data.items():
+        if not isinstance(v, dict):
+            continue
+        cat_up = str(v.get("last_category", "")).upper()
+        if cat_up not in valid_wl_categories:
+            continue
+        if k in unverified_tch_hz and v.get("mcc") is None and v.get("mnc") is None:
+            print(
+                f"[parser] Removed unverified TCH_S-only ghost carrier {v.get('freq_mhz', k)} MHz from whitelist.json",
+                flush=True,
+            )
+            continue
+        whitelist_data[k] = v
     if len(whitelist_data) != len(raw_whitelist_data):
         save_json_dict(WHITELIST_FILE, whitelist_data)
+    if unverified_tch_hz:
+        rt_cfg_path = os.path.join(LOG_DIR, "runtime_config.json")
+        rt_cfg = load_json_dict(rt_cfg_path)
+        if isinstance(rt_cfg, dict) and str(rt_cfg.get("TETRA_CHANNELS") or ""):
+            cur_ch_str = str(rt_cfg.get("TETRA_CHANNELS") or "")
+            if any(bad_hz in cur_ch_str for bad_hz in unverified_tch_hz) and whitelist_data:
+                wl_sorted = sorted(
+                    whitelist_data.values(), key=lambda x: int(x.get("freq_hz") or 0)
+                )
+                best_cluster = []
+                best_score = (-1, -1)
+                for st_it in wl_sorted:
+                    f_st = int(st_it.get("freq_hz") or 0)
+                    in_w = [
+                        it
+                        for it in wl_sorted
+                        if f_st <= int(it.get("freq_hz") or 0) <= f_st + 1_800_000
+                    ]
+                    if len(in_w) > 8:
+                        in_w = sorted(
+                            in_w, key=lambda x: int(x.get("hit_count") or 0), reverse=True
+                        )[:8]
+                        in_w.sort(key=lambda x: int(x.get("freq_hz") or 0))
+                    sc = (len(in_w), sum(int(it.get("hit_count") or 1) for it in in_w))
+                    if sc > best_score:
+                        best_score = sc
+                        best_cluster = in_w
+                if best_cluster:
+                    f_list = [int(it["freq_hz"]) for it in best_cluster]
+                    mid_raw = (min(f_list) + max(f_list)) // 2
+                    opt_center = int(round(mid_raw / 25_000.0) * 25_000)
+                    if any(abs(opt_center - f) < 5_000 for f in f_list):
+                        opt_center += 12_500
+                    new_ch_parts = [
+                        f"{int(it['freq_hz'])}:{it.get('la') if it.get('la') is not None else idx}"
+                        for idx, it in enumerate(best_cluster, start=1)
+                    ]
+                    rt_cfg["CENTER_FREQ"] = opt_center
+                    rt_cfg["TETRA_CHANNELS"] = ",".join(new_ch_parts)
+                    save_json_dict(rt_cfg_path, rt_cfg)
+                    try:
+                        with open("/tmp/reload_config.flag", "w", encoding="utf-8") as rf:
+                            rf.write(str(time.time()))
+                    except Exception:
+                        pass
+                    print(
+                        f"[parser] Auto-cleaned ghost channels from runtime_config.json -> Center {opt_center / 1e6:.4f} MHz, Channels: {rt_cfg['TETRA_CHANNELS']}",
+                        flush=True,
+                    )
     whitelist_last_save = {}
     whitelist_disk_mtime = (
         os.path.getmtime(WHITELIST_FILE) if os.path.exists(WHITELIST_FILE) else 0.0
     )
-    channel_net_cache = {}
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
     last_heartbeat = time.time()
     first_hb_sent = False
@@ -1329,9 +1715,11 @@ def main():
         state = get_or_init_net_state(
             freq_str, ch["freq_hz"], default_la=ch.get("la"), role="ACTIVE CELL"
         )
-        state["packet_count"] = int(state.get("packet_count", 0)) + 1
         if not is_uplane:
             state["control_verified"] = True
+        if not state.get("control_verified"):
+            return
+        state["packet_count"] = int(state.get("packet_count", 0)) + 1
         if pdu:
             state["last_pdu"] = pdu
         elif service:
@@ -1353,7 +1741,7 @@ def main():
         if enc_mode is not None:
             state["encryption_mode"] = enc_mode
 
-        if (state.get("control_verified") or state["packet_count"] >= 3) and (pdu or service):
+        if state.get("control_verified") and (pdu or service):
             register_whitelisted_carrier(
                 ch,
                 "NETWORK",
@@ -1795,6 +2183,29 @@ def main():
                 )
                 return
 
+            cod_size = os.path.getsize(cod_path)
+            if cod_size >= 276:
+                with open(cod_path, "rb") as cf:
+                    cod_bytes = cf.read()
+                total_cod_frames = len(cod_bytes) // 276
+                good_cod_frames = 0
+                for f_idx in range(total_cod_frames):
+                    bfi1 = struct.unpack_from("<h", cod_bytes, f_idx * 276)[0]
+                    if bfi1 == 0:
+                        good_cod_frames += 1
+                if total_cod_frames > 0 and (
+                    good_cod_frames < max(2, MIN_VOICE_FRAMES // 2)
+                    or (good_cod_frames / float(total_cod_frames)) < 0.25
+                ):
+                    logging.info(
+                        "[DEBUG] Dropped Voice on %s MHz (SSI %s): Corrupted BFI frames (%d/%d valid)",
+                        freq_mhz,
+                        ssi_label,
+                        good_cod_frames,
+                        total_cod_frames,
+                    )
+                    return
+
             sdec_res = subprocess.run(
                 [sdecoder_bin, cod_path, raw_path],
                 stdout=subprocess.PIPE,
@@ -1838,6 +2249,19 @@ def main():
                     pcm_bytes_len,
                 )
                 return
+
+            num_samples = pcm_bytes_len // 2
+            if num_samples > 0:
+                samples = struct.unpack(f"<{num_samples}h", pcm_source[: num_samples * 2])
+                max_amp = max(abs(s) for s in samples)
+                if max_amp < 150:
+                    logging.info(
+                        "[DEBUG] Dropped Voice on %s MHz (SSI %s): Silent/zero-energy PCM output (max_amp=%d)",
+                        freq_mhz,
+                        ssi_label,
+                        max_amp,
+                    )
+                    return
 
             if pcm_bytes_len % 2 == 1:
                 pcm_source += b"\x00"
@@ -2013,6 +2437,31 @@ def main():
         service = str(get_ci(pkt, ["service"], "")).upper()
         pdu = str(get_ci(pkt, ["pdu"], "")).upper()
         now_ts = time.time()
+        is_uplane = (pdu == "TCH_S" or service == "UPLANE")
+
+        if is_uplane:
+            raw_pkt_ssi = to_int(
+                get_ci(
+                    pkt,
+                    [
+                        "actual ssi",
+                        "ssi",
+                        "calling party ssi",
+                        "transmitting party ssi",
+                        "source ssi",
+                    ],
+                )
+            )
+            is_verified_cell = bool(
+                channel_net_cache.get(freq_str, {}).get("control_verified")
+            )
+            if not is_verified_cell and raw_pkt_ssi in (None, 0, 16777215):
+                log_throttled_debug(
+                    (freq_str, "unverified_tch_s"),
+                    f"[DEBUG] Ignored unverified TCH_S noise burst on {freq_str} MHz (no control-plane CRC sync on channel)",
+                    interval_s=30.0,
+                )
+                return
 
         stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
         db.record_raw_packet_stat(freq_str, ch.get("la"), now_ts=now_ts)
