@@ -1443,12 +1443,29 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
         }
         verified_tetra_hz = set()
         dead_blacklisted_hz = set()
+        tuner_diag_lines = []
 
         while RUNNING:
             try:
                 line = line_queue.get(timeout=0.5)
                 clean_line = line.rstrip("\r\n")
                 print(clean_line, flush=True)
+                if any(
+                    k in clean_line
+                    for k in (
+                        "Using device #",
+                        "Found Rafael Micro",
+                        "RTL-SDR Blog V4",
+                        "[R82XX] PLL not locked!",
+                    )
+                ):
+                    tuner_diag_lines.append(clean_line)
+                elif clean_line.startswith("[gnuradio] R82XX Tuner locked:"):
+                    tuner_diag_lines.append(clean_line)
+                    emit_system_event(
+                        "[SDR TUNER INIT]\n  " + "\n  ".join(tuner_diag_lines)
+                    )
+                    tuner_diag_lines.clear()
                 if (
                     "usb_claim_interface error" in clean_line
                     or "LIBUSB_ERROR" in clean_line

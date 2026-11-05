@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     build-essential \
     pkg-config \
+    libusb-1.0-0-dev \
     librtlsdr-dev \
     rtl-sdr \
     gnuradio-dev \
@@ -37,6 +38,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     patch \
     && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/rtlsdrblog/rtl-sdr-blog.git /tmp/rtl-sdr-blog \
+    && mkdir -p /tmp/rtl-sdr-blog/build \
+    && cd /tmp/rtl-sdr-blog/build \
+    && cmake ../ \
+        -DINSTALL_UDEV_RULES=ON \
+        -DDETACH_KERNEL_DRIVER=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib/x86_64-linux-gnu \
+    && make -j$(nproc) \
+    && rm -f /usr/lib/x86_64-linux-gnu/librtlsdr.so* \
+    && make install \
+    && ldconfig \
+    && grep -qa "RTL-SDR Blog V4" /usr/lib/x86_64-linux-gnu/librtlsdr.so.0 \
+    && rm -rf /tmp/rtl-sdr-blog
 
 RUN pip3 install --no-cache-dir \
     fastapi \
@@ -62,8 +78,8 @@ RUN git clone https://gitlab.com/larryth/tetra-kit.git /opt/tetra-kit \
 RUN mkdir -p /app/src/templates /app/logs/audio /app/data \
     && ln -sfn /app/logs/audio /app/data/audio
 
-LABEL org.opencontainers.image.version="2026.11.05.09"
-ENV APP_VERSION=2026.11.05.09
+LABEL org.opencontainers.image.version="2026.11.05.10"
+ENV APP_VERSION=2026.11.05.10
 ENV APP_RELEASE_DATE=2026-11-05
 ENV PYTHONPATH=/app:/app/src
 
