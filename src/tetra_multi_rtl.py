@@ -113,7 +113,9 @@ def resolve_osmosdr_device_args(raw_device_spec, explicit_serial=""):
     else:
         rtl_selector = "0"
 
-    dev_args = f"numchan=1 rtl={rtl_selector},buffers=32,buflen=16384"
+    # Use 32 USB bulk buffers of 131072 bytes (128 KB = ~32.8 ms per transfer at 2 MS/s,
+    # >1.0s total ring buffer) to prevent USB micro-drops that break TDMA/DQPSK sync.
+    dev_args = f"numchan=1 rtl={rtl_selector},buffers=32,buflen=131072"
     return dev_args, resolved_index, resolved_serial
 
 
@@ -130,7 +132,10 @@ class tetra_chan(gr.hier_block2):
         channel_rate = 36000
         sps = 2
 
-        taps = firdes.low_pass(1.0, samp_rate, 18000, 5000, firdes.WIN_HAMMING)
+        # TETRA pi/4-DQPSK (18 ksym/s, alpha=0.35) occupies +/-12.15 kHz.
+        # Passband +/-13.5 kHz accommodates +/-1.35 kHz frequency offset while
+        # rejecting adjacent 25 kHz channels and out-of-band noise before AGC/FLL.
+        taps = firdes.low_pass(1.0, samp_rate, 13500, 3500, firdes.WIN_HAMMING)
         self.xlating = filter.freq_xlating_fir_filter_ccc(
             decim, taps, freq_hz - center_freq, samp_rate
         )
@@ -208,55 +213,40 @@ class tetra_multi_rtl(gr.top_block):
 
         # 1. Open osmosdr source and allow USB control pipe + I2C repeater to settle
         self.src = osmosdr.source(args=dev_args)
-        time.sleep(0.18)
+        time.sleep(0.15)
 
         # 2. Configure baseband sample rate first and let RTL2832U DDC/PLL clock settle
         self.src.set_sample_rate(samp_rate)
-        time.sleep(0.15)
+        time.sleep(0.10)
 
-        # 3. Disable software DC offset / IQ balance overrides
+        # 3. Tune center frequency and apply PPM correction so librtlsdr applies
+        #    PPM to both sample rate and active LO frequency in Scanner and Static modes
+        self.src.set_center_freq(center_freq, 0)
+        time.sleep(0.10)
+        self.src.set_freq_corr(ppm, 0)
+        time.sleep(0.05)
+
+        # 4. Disable software DC offset / IQ balance overrides
         self.src.set_dc_offset_mode(0, 0)
         self.src.set_iq_balance_mode(0, 0)
 
-        # 4. Apply frequency correction (PPM) BEFORE tuning center frequency
-        #    (only call set_freq_corr when ppm != 0 to avoid redundant R82XX I2C re-tune)
-        if ppm != 0:
-            self.src.set_freq_corr(ppm, 0)
-            time.sleep(0.10)
-
-        # 5. Disable hardware AGC and set manual LNA/Mixer/VGA tuner gain table
-        #    (Do NOT overwrite R82XX IF/BB VGA registers with hardcoded 20 dB afterwards,
-        #    which causes IF stage saturation / pure noise on R820T/R820T2/R828D tuners)
+        # 5. Balanced R820T/R828D gain staging:
+        #    Set IF/BB VGA stage (16 dB) BEFORE set_gain(gain, 0) so the baseband I/Q
+        #    level entering freq_xlating_fir_filter has full dynamic range without
+        #    overwriting the calibrated LNA/Mixer gain table.
         self.src.set_gain_mode(False, 0)
-        time.sleep(0.08)
+        time.sleep(0.05)
+        self.src.set_if_gain(16, 0)
+        self.src.set_bb_gain(16, 0)
+        time.sleep(0.05)
         self.src.set_gain(gain, 0)
-        time.sleep(0.12)
-
-        # 6. Two-step R82XX VCO & PLL stabilization sequence:
-        #    Tune 1.0 MHz below target first so the R82XX synthesizer crosses a VCO
-        #    capacitor bank boundary and runs full VCO autocalibration, then lock to
-        #    target center_freq.
-        pre_tune_hz = max(24_000_000, center_freq - 1_000_000)
-        self.src.set_center_freq(pre_tune_hz, 0)
-        time.sleep(0.12)
-        self.src.set_center_freq(center_freq, 0)
-        time.sleep(0.20)
+        time.sleep(0.10)
 
         actual_freq = int(round(self.src.get_center_freq(0)))
-        if abs(actual_freq - center_freq) > 5000:
-            print(
-                f"[gnuradio] Warning: initial center_freq readback={actual_freq} Hz != target {center_freq} Hz; retrying PLL lock...",
-                flush=True,
-            )
-            time.sleep(0.15)
-            self.src.set_center_freq(center_freq, 0)
-            time.sleep(0.20)
-            actual_freq = int(round(self.src.get_center_freq(0)))
-
         actual_gain = self.src.get_gain(0)
         print(
             f"[gnuradio] R82XX Tuner locked: freq={actual_freq} Hz ({actual_freq / 1e6:.4f} MHz), "
-            f"gain={actual_gain:.1f} dB (requested {gain:.1f} dB)",
+            f"gain={actual_gain:.1f} dB (requested {gain:.1f} dB, IF=16 dB), ppm={ppm}",
             flush=True,
         )
 
