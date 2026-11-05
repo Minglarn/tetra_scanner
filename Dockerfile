@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     socat \
     jq \
     python3-paho-mqtt \
+    python3-numpy \
     python3-pip \
     procps \
     ca-certificates \
@@ -78,8 +79,8 @@ RUN git clone https://gitlab.com/larryth/tetra-kit.git /opt/tetra-kit \
 RUN mkdir -p /app/src/templates /app/logs/audio /app/data \
     && ln -sfn /app/logs/audio /app/data/audio
 
-LABEL org.opencontainers.image.version="2026.11.05.10"
-ENV APP_VERSION=2026.11.05.10
+LABEL org.opencontainers.image.version="2026.11.05.11"
+ENV APP_VERSION=2026.11.05.11
 ENV APP_RELEASE_DATE=2026-11-05
 ENV PYTHONPATH=/app:/app/src
 

@@ -34,7 +34,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.10")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.11")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1194,7 +1194,7 @@ def main():
                         "last_pdu": last_obj.get("pdu"),
                         "last_emit_ts": float(last_obj.get("seen_epoch") or 0.0),
                         "last_sig": None,
-                        "control_verified": True,
+                        "control_verified": False,
                     }
                     for s_line, _ in recs:
                         kept_lines.append(s_line)
@@ -1860,7 +1860,6 @@ def main():
                 if nb_state.get("mnc") is None and state.get("mnc") is not None:
                     nb_state["mnc"] = state["mnc"]
                 nb_state["reported_by"] = freq_str
-                nb_state["control_verified"] = True
                 nb_ch_proxy = {
                     "freq_hz": nb_freq_hz,
                     "freq_mhz": nb_freq_mhz,
@@ -2466,31 +2465,16 @@ def main():
 
         if is_uplane:
             ch_pdu_stat["tch_s"] = int(ch_pdu_stat.get("tch_s", 0)) + 1
-            raw_pkt_ssi = to_int(
-                get_ci(
-                    pkt,
-                    [
-                        "actual ssi",
-                        "ssi",
-                        "calling party ssi",
-                        "transmitting party ssi",
-                        "source ssi",
-                    ],
-                )
-            )
             is_verified_cell = bool(
                 channel_net_cache.get(freq_str, {}).get("control_verified")
             )
-            if not is_verified_cell and raw_pkt_ssi in (None, 0, 16777215):
+            if not is_verified_cell:
                 log_throttled_debug(
                     (freq_str, "unverified_tch_s"),
                     f"[DEBUG] Ignored unverified TCH_S noise burst on {freq_str} MHz (no control-plane CRC sync on channel)",
                     interval_s=30.0,
                 )
                 return
-            ch_pdu_stat["crc_ok"] = int(ch_pdu_stat.get("crc_ok", 0)) + 1
-            stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
-            db.record_raw_packet_stat(freq_str, ch.get("la"), now_ts=now_ts)
         else:
             ch_pdu_stat["crc_ok"] = int(ch_pdu_stat.get("crc_ok", 0)) + 1
             if pdu in ("SYSINFO", "D-NWRK-BROADCAST"):
@@ -2510,6 +2494,11 @@ def main():
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
         if pdu == "TCH_S" or (service == "UPLANE" and get_ci(pkt, ["frame"]) is not None):
+            is_verified_cell = bool(
+                channel_net_cache.get(freq_str, {}).get("control_verified")
+            )
+            if not is_verified_cell:
+                return
             raw_pkt_ssi = to_int(
                 get_ci(
                     pkt,
@@ -2527,7 +2516,8 @@ def main():
                     (freq_str, "dummy_16777215"),
                     f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Dummy broadcast SSI 16777215",
                 )
-                emit_raw_mac_event(ch, pkt)
+                if is_verified_cell:
+                    emit_raw_mac_event(ch, pkt)
                 return
 
             pkt_ssi = None if raw_pkt_ssi in (0, 16777215) else raw_pkt_ssi
@@ -2542,7 +2532,8 @@ def main():
                     (freq_str, f"enc_{enc_mode}"),
                     f"[DEBUG] Dropped TCH_S on {freq_str} MHz: Encrypted (enc_mode={enc_mode})",
                 )
-                emit_raw_mac_event(ch, pkt)
+                if is_verified_cell:
+                    emit_raw_mac_event(ch, pkt)
                 return
 
             if isinstance(frame_b64, str) and frame_b64.strip():
@@ -2575,12 +2566,13 @@ def main():
                 eff_ssi = pkt_ssi if pkt_ssi is not None else ctx_ssi
                 eff_gssi = ctx_gssi
 
-                if eff_ssi is None and eff_gssi is None and usage_marker <= 0:
+                if not is_verified_cell or (eff_ssi is None and eff_gssi is None and usage_marker <= 0):
                     log_throttled_debug(
                         (freq_str, f"no_ctx_tn_{tn}"),
                         f"[DEBUG] Dropped TCH_S on {freq_str} MHz (TN {tn}): No call context and usage_marker=0 (raw_ssi={raw_pkt_ssi})",
                     )
-                    emit_raw_mac_event(ch, pkt)
+                    if is_verified_cell:
+                        emit_raw_mac_event(ch, pkt)
                     return
 
                 buf_key = (freq_str, tn if tn is not None else (usage_marker or eff_ssi or eff_gssi or 1))
@@ -3032,6 +3024,10 @@ def main():
             for k in stats_60s:
                 stats_60s[k] = 0
             for k in pdu_stats_60s:
+                st_bd = pdu_stats_60s[k]
+                if int(st_bd.get("sysinfo", 0)) == 0 and int(st_bd.get("sync", 0)) == 0:
+                    if k in channel_net_cache:
+                        channel_net_cache[k]["control_verified"] = False
                 pdu_stats_60s[k] = {
                     "crc_ok": 0,
                     "sysinfo": 0,

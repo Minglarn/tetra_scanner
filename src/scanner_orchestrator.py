@@ -64,7 +64,7 @@ DC_SPIKE_GUARD_HZ = 10000
 EDGE_GUARD_HZ = 15000
 MAX_WINDOW_SPAN_HZ = 1800000
 MIN_SNR_ABOVE_FLOOR_DB = parse_env_float("SCAN_MIN_SNR_DB", 1.8)
-ABSOLUTE_MIN_DBM = parse_env_float("SCAN_MIN_DBM", -65.0)
+ABSOLUTE_MIN_DBM = parse_env_float("SCAN_MIN_DBM", -75.0)
 
 PAYLOAD_TAGS = ("[SDS]", "[CALL]", "[VOICE]", "[STATUS]", "[ROAMING]")
 
@@ -86,11 +86,8 @@ def get_default_config():
     return {
         "RTL_DEVICE_INDEX": parse_env_device("RTL_DEVICE_INDEX", "0"),
         "RTL_SERIAL": parse_env_str("RTL_SERIAL", ""),
-        "RTL_GAIN": parse_env_float("RTL_GAIN", 20.7),
+        "RTL_GAIN": parse_env_float("RTL_GAIN", 28.0),
         "RTL_PPM": parse_env_int("RTL_PPM", 0),
-        "TETRA_DECIM": parse_env_int("TETRA_DECIM", 25),
-        "TETRA_FILTER_CUTOFF": parse_env_float("TETRA_FILTER_CUTOFF", 12500.0),
-        "TETRA_FILTER_TRANS": parse_env_float("TETRA_FILTER_TRANS", 10000.0),
         "MODE": parse_env_str("MODE", "scanner").lower(),
         "SCAN_START_MHZ": parse_env_float("SCAN_START_MHZ", 420.0),
         "SCAN_END_MHZ": parse_env_float("SCAN_END_MHZ", 430.0),
@@ -380,30 +377,46 @@ def resolve_rtl_device_spec(cfg, serial_override=None):
     else:
         parsed_index = int(raw_spec)
 
-    if parsed_index is not None and not parsed_serial:
-        return str(parsed_index), parsed_index, None
-
     rtlsdr = _load_librtlsdr()
     resolved_index = parsed_index
     resolved_serial = parsed_serial
 
-    if rtlsdr is not None and resolved_serial:
+    if rtlsdr is not None:
         try:
             dev_count = int(rtlsdr.rtlsdr_get_device_count())
         except Exception:
             dev_count = 0
 
         if dev_count > 0:
-            try:
-                idx = int(
-                    rtlsdr.rtlsdr_get_index_by_serial(
-                        resolved_serial.encode("utf-8")
+            if resolved_serial and resolved_index is None:
+                try:
+                    idx = int(
+                        rtlsdr.rtlsdr_get_index_by_serial(
+                            resolved_serial.encode("utf-8")
+                        )
                     )
-                )
-                if idx >= 0:
-                    resolved_index = idx
-            except Exception:
-                pass
+                    if idx >= 0:
+                        resolved_index = idx
+                except Exception:
+                    pass
+            elif resolved_index is not None and not resolved_serial and 0 <= resolved_index < dev_count:
+                try:
+                    m_buf = ctypes.create_string_buffer(256)
+                    p_buf = ctypes.create_string_buffer(256)
+                    s_buf = ctypes.create_string_buffer(256)
+                    if (
+                        int(
+                            rtlsdr.rtlsdr_get_device_usb_strings(
+                                int(resolved_index), m_buf, p_buf, s_buf
+                            )
+                        )
+                        == 0
+                    ):
+                        s_val = s_buf.value.decode("utf-8", errors="ignore").strip()
+                        if s_val:
+                            resolved_serial = s_val
+                except Exception:
+                    pass
 
     cli_arg = (
         str(resolved_index)
@@ -416,16 +429,14 @@ def resolve_rtl_device_spec(cfg, serial_override=None):
 def reset_rtl_usb_device(cfg, center_hz=None, perform_usb_ioctl=True):
     """
     Pre-initialization USB Reset & R82XX Tuner Wakeup:
-      1. Issues Linux kernel USBDEVFS_RESET (0x5514) ioctl on the target RTL-SDR's
-         /dev/bus/usb/<bus>/<dev> node to clear dirty USB bulk endpoints or wedged
-         I2C repeater states left behind by rtl_power or previous crashes.
+      1. Issues Linux kernel USBDEVFS_RESET (0x5514) ioctl ONLY on the target RTL-SDR's
+         /dev/bus/usb/<bus>/<dev> node verified by its exact USB serial number in sysfs.
       2. Runs an isolated librtlsdr open -> sample_rate -> center_freq -> reset_buffer
-         -> close sequence in a subprocess so the R820T/R828D PLL is calibrated and
-         unlocked cleanly before gr-osmosdr starts.
+         -> close sequence in a subprocess.
     """
     cli_arg, resolved_idx, resolved_ser = resolve_rtl_device_spec(cfg)
     target_freq = int(center_hz or cfg.get("CENTER_FREQ") or 427750000)
-    gain_tenths = int(round(float(cfg.get("RTL_GAIN", 24.0)) * 10))
+    gain_tenths = int(round(float(cfg.get("RTL_GAIN", 28.0)) * 10))
 
     usb_reset_done = False
     if perform_usb_ioctl:
@@ -470,16 +481,19 @@ def reset_rtl_usb_device(cfg, center_hz=None, perform_usb_ioctl=True):
             chosen_node = None
             if resolved_ser:
                 for node_p, u_ser in rtl_usb_nodes:
-                    if u_ser and u_ser.lower() == resolved_ser.lower():
+                    if u_ser and u_ser.strip().lower() == resolved_ser.strip().lower():
                         chosen_node = (node_p, u_ser)
                         break
-            if chosen_node is None and rtl_usb_nodes:
-                idx_pick = (
-                    resolved_idx
-                    if (resolved_idx is not None and 0 <= resolved_idx < len(rtl_usb_nodes))
-                    else 0
+                if chosen_node is None:
+                    print(
+                        f"[scanner] [USB RESET] Skipping ioctl USBDEVFS_RESET: serial={resolved_ser} not matched in sysfs",
+                        flush=True,
+                    )
+            else:
+                print(
+                    f"[scanner] [USB RESET] Skipping ioctl USBDEVFS_RESET: could not resolve exact USB serial for index={resolved_idx}",
+                    flush=True,
                 )
-                chosen_node = rtl_usb_nodes[idx_pick]
 
             if chosen_node is not None:
                 node_path, node_ser = chosen_node
@@ -489,7 +503,7 @@ def reset_rtl_usb_device(cfg, center_hz=None, perform_usb_ioctl=True):
                     fcntl.ioctl(fd, USBDEVFS_RESET, 0)
                     usb_reset_done = True
                     print(
-                        f"[scanner] [USB RESET] Issued kernel USBDEVFS_RESET on {node_path} (serial={node_ser or resolved_ser or 'auto'})",
+                        f"[scanner] [USB RESET] Issued kernel USBDEVFS_RESET on {node_path} (serial={node_ser})",
                         flush=True,
                     )
                 finally:
@@ -523,8 +537,6 @@ def reset_rtl_usb_device(cfg, center_hz=None, perform_usb_ioctl=True):
         "lib.rtlsdr_set_tuner_gain_mode(dev, 1)\n"
         f"lib.rtlsdr_set_tuner_gain(dev, {gain_tenths})\n"
         "time.sleep(0.05)\n"
-        f"lib.rtlsdr_set_center_freq(dev, {max(24000000, target_freq - 1000000)})\n"
-        "time.sleep(0.08)\n"
         f"lib.rtlsdr_set_center_freq(dev, {target_freq})\n"
         "time.sleep(0.10)\n"
         "lib.rtlsdr_reset_buffer(dev)\n"
@@ -647,26 +659,64 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
         pass
 
     cli_dev_arg, resolved_idx, resolved_ser = resolve_rtl_device_spec(cfg)
-    cmd = [
-        "rtl_power",
-        "-d",
-        str(cli_dev_arg),
-        "-f",
-        f"{start_hz}:{end_hz}:2k",
-        "-g",
-        str(cfg["RTL_GAIN"]),
-        "-p",
-        str(cfg["RTL_PPM"]),
-        "-i",
-        "10",
-        "-1",
-        csv_path,
-    ]
+    center_hz = int(round(center_mhz * 1_000_000))
+    gain_val = float(cfg["RTL_GAIN"])
+    ppm_val = int(float(cfg.get("RTL_PPM", 0)))
+
+    gr_sweep_code = (
+        "import time, gc, sys, numpy as np\n"
+        "from gnuradio import gr, blocks\n"
+        "import osmosdr\n"
+        "tb = gr.top_block()\n"
+        f"src = osmosdr.source(args='numchan=1 rtl={cli_dev_arg}')\n"
+        "src.set_sample_rate(2000000)\n"
+        f"src.set_freq_corr({ppm_val}, 0)\n"
+        "src.set_dc_offset_mode(0, 0)\n"
+        "src.set_iq_balance_mode(0, 0)\n"
+        "src.set_gain_mode(False, 0)\n"
+        f"src.set_center_freq({center_hz}, 0)\n"
+        f"src.set_gain({gain_val}, 0)\n"
+        "s2v = blocks.stream_to_vector(gr.sizeof_gr_complex, 1024)\n"
+        "keep = blocks.keep_one_in_n(gr.sizeof_gr_complex * 1024, 20)\n"
+        "sink = blocks.vector_sink_c(1024)\n"
+        "tb.connect(src, s2v, keep, sink)\n"
+        "tb.start()\n"
+        "time.sleep(1.0)\n"
+        f"src.set_center_freq({center_hz}, 0)\n"
+        f"src.set_gain({gain_val}, 0)\n"
+        "time.sleep(0.25)\n"
+        "sink.reset()\n"
+        "time.sleep(2.0)\n"
+        "tb.stop()\n"
+        "tb.wait()\n"
+        "raw = np.asarray(sink.data(), dtype=np.complex64)\n"
+        "tb.disconnect_all()\n"
+        "src = None\n"
+        "del tb\n"
+        "gc.collect()\n"
+        "time.sleep(0.15)\n"
+        "nvec = len(raw) // 1024\n"
+        "if nvec <= 0:\n"
+        "    sys.exit(2)\n"
+        "vecs = raw[:nvec * 1024].reshape((nvec, 1024))\n"
+        "win = np.hanning(1024).astype(np.float32)\n"
+        "win /= np.sum(win)\n"
+        "spec = np.fft.fftshift(np.fft.fft(vecs * win, axis=1), axes=1)\n"
+        "pwr = np.mean(np.abs(spec) ** 2, axis=0)\n"
+        "dbm = 10.0 * np.log10(np.maximum(pwr, 1e-12))\n"
+        "step_hz = 2000000.0 / 1024.0\n"
+        f"low_hz = {center_hz} - 1000000.0\n"
+        f"high_hz = {center_hz} + 1000000.0 - step_hz\n"
+        "vals_str = ', '.join(f'{v:.2f}' for v in dbm)\n"
+        f"with open({repr(csv_path)}, 'w', encoding='utf-8') as f:\n"
+        "    f.write(f'2026-11-05, 00:00:00, {low_hz:.0f}, {high_hz:.0f}, {step_hz:.2f}, {nvec * 1024}, {vals_str}\\n')\n"
+    )
+    cmd = ["python3", "-c", gr_sweep_code]
     scan_msg = (
         f"[PHASE 1] Sweeping {start_hz / 1e6:.3f} - {end_hz / 1e6:.3f} MHz "
         f"(Device: {cli_dev_arg}"
         + (f" [SN:{resolved_ser}]" if resolved_ser else "")
-        + f", Gain: {cfg['RTL_GAIN']} dB, 10s)"
+        + f", Gain: {cfg['RTL_GAIN']} dB, post-start retune)"
     )
     print(f"[scanner] {scan_msg}", flush=True)
     emit_system_event(scan_msg)
@@ -682,11 +732,11 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
         if res.returncode != 0:
             err_str = (res.stderr or "").strip()
             print(
-                f"[scanner] rtl_power exited with code {res.returncode}: {err_str}",
+                f"[scanner] Phase 1 sweep exited with code {res.returncode}: {err_str}",
                 flush=True,
             )
-            if "usb_claim_interface" in err_str.lower() or "pll not locked" in err_str.lower() or res.returncode != 0:
-                print("[scanner] Attempting USB reset and retry for rtl_power block...", flush=True)
+            if "usb_claim_interface" in err_str.lower() or res.returncode != 0:
+                print("[scanner] Attempting USB reset and retry for Phase 1 block...", flush=True)
                 reset_rtl_usb_device(cfg, center_hz=int(center_mhz * 1e6), perform_usb_ioctl=True)
                 res_retry = subprocess.run(
                     cmd,
@@ -698,11 +748,11 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
                 )
                 if res_retry.returncode != 0:
                     print(
-                        f"[scanner] rtl_power retry exited with code {res_retry.returncode}: {(res_retry.stderr or '').strip()}",
+                        f"[scanner] Phase 1 sweep retry exited with code {res_retry.returncode}: {(res_retry.stderr or '').strip()}",
                         flush=True,
                     )
     except Exception as exc:
-        print(f"[scanner] Failed running rtl_power: {exc}", flush=True)
+        print(f"[scanner] Failed running Phase 1 sweep: {exc}", flush=True)
         return None
 
     if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
@@ -727,7 +777,7 @@ def classify_noise_floor(noise_floor):
         return "HIGH / OVERLOAD"
     if noise_floor > -34.5:
         return "ELEVATED"
-    if noise_floor >= -44.0:
+    if noise_floor >= -62.0:
         return "OPTIMAL"
     return "LOW"
 
@@ -1320,15 +1370,6 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
     os.environ["RTL_PPM"] = str(cfg["RTL_PPM"])
     os.environ["CENTER_FREQ"] = str(center_hz)
     os.environ["TETRA_CHANNELS"] = channels_str
-    for opt_key in (
-        "RTL_IF_GAIN",
-        "RTL_BB_GAIN",
-        "TETRA_DECIM",
-        "TETRA_FILTER_CUTOFF",
-        "TETRA_FILTER_TRANS",
-    ):
-        if opt_key in cfg and cfg[opt_key] is not None:
-            os.environ[opt_key] = str(cfg[opt_key])
     child_env = os.environ.copy()
 
     raw_chans = [c.strip() for c in channels_str.split(",") if c.strip()]
