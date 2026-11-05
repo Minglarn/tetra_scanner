@@ -342,15 +342,19 @@ def _load_librtlsdr():
     return None
 
 
-def resolve_rtl_device_spec(cfg):
+def resolve_rtl_device_spec(cfg, serial_override=None):
     """
     Resolve RTL_DEVICE_INDEX and/or RTL_SERIAL into:
       (cli_device_arg, resolved_index, resolved_serial)
     Supports index (0, 1), serial ('00000202', '00000222'), or osmosdr string
     ('rtl=0,serial=00000222').
     """
-    raw_spec = str(cfg.get("RTL_DEVICE_INDEX", "0")).strip()
-    serial_cfg = str(cfg.get("RTL_SERIAL", "") or "").strip()
+    if isinstance(cfg, dict):
+        raw_spec = str(cfg.get("RTL_DEVICE_INDEX", "0")).strip()
+        serial_cfg = str(serial_override if serial_override is not None else (cfg.get("RTL_SERIAL", "") or "")).strip()
+    else:
+        raw_spec = str(cfg if cfg is not None else "0").strip()
+        serial_cfg = str(serial_override or "").strip()
 
     parsed_index = None
     parsed_serial = serial_cfg if serial_cfg else None
@@ -1331,9 +1335,7 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
     global ACTIVE_PROCS, GR_PROC_REF, RUNNING
 
     # Resolve RTL-SDR device index/serial without forcing a cold USB port reset on normal transitions
-    cli_dev_arg, resolved_idx, resolved_ser = resolve_rtl_device_spec(
-        cfg["RTL_DEVICE_INDEX"], cfg.get("RTL_SERIAL", "")
-    )
+    cli_dev_arg, resolved_idx, resolved_ser = resolve_rtl_device_spec(cfg)
     needs_usb_recovery = False
 
     os.environ["RTL_DEVICE_INDEX"] = str(cfg["RTL_DEVICE_INDEX"])
