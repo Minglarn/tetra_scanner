@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.02")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.03")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)

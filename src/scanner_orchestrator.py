@@ -1330,10 +1330,11 @@ def stdout_reader_worker(proc, line_queue):
 def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, active_frequencies=None):
     global ACTIVE_PROCS, GR_PROC_REF, RUNNING
 
-    # Pre-initialize & reset RTL-SDR USB interface + R82XX PLL before GNU Radio / gr-osmosdr opens it
-    cli_dev_arg, resolved_idx, resolved_ser = reset_rtl_usb_device(
-        cfg, center_hz=center_hz, perform_usb_ioctl=True
+    # Resolve RTL-SDR device index/serial without forcing a cold USB port reset on normal transitions
+    cli_dev_arg, resolved_idx, resolved_ser = resolve_rtl_device_spec(
+        cfg["RTL_DEVICE_INDEX"], cfg.get("RTL_SERIAL", "")
     )
+    needs_usb_recovery = False
 
     os.environ["RTL_DEVICE_INDEX"] = str(cfg["RTL_DEVICE_INDEX"])
     os.environ["RTL_SERIAL"] = str(resolved_ser or cfg.get("RTL_SERIAL", "")).strip()
@@ -1462,16 +1463,18 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                 clean_line = line.rstrip("\r\n")
                 print(clean_line, flush=True)
                 if (
-                    "PLL not locked" in clean_line
-                    or "usb_claim_interface error" in clean_line
+                    "usb_claim_interface error" in clean_line
+                    or "LIBUSB_ERROR" in clean_line
                     or "Failed to open rtlsdr device" in clean_line
+                    or "No supported devices found" in clean_line
                 ):
-                    pll_msg = (
-                        f"[SDR HARDWARE RECOVERY] Detected tuner/USB fault ({clean_line}). "
-                        f"Performing USB hardware reset and restarting pipeline..."
+                    usb_err_msg = (
+                        f"[SDR HARDWARE RECOVERY] Detected fatal USB/driver fault ({clean_line}). "
+                        f"Scheduling USB hardware reset and restarting pipeline..."
                     )
-                    print(f"[scanner] {pll_msg}", flush=True)
-                    emit_system_event(pll_msg)
+                    print(f"[scanner] {usb_err_msg}", flush=True)
+                    emit_system_event(usb_err_msg)
+                    needs_usb_recovery = True
                     break
                 if any(tag in clean_line for tag in PAYLOAD_TAGS):
                     last_activity = time.time()
@@ -1612,10 +1615,13 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                 break
 
             if gr_proc.poll() is not None:
-                print(
-                    "[scanner] Warning: tetra_multi_rtl.py exited unexpectedly. Restarting pipeline...",
-                    flush=True,
+                crash_msg = (
+                    "[SDR HARDWARE RECOVERY] tetra_multi_rtl.py exited unexpectedly. "
+                    "Performing fallback USB reset and restarting pipeline..."
                 )
+                print(f"[scanner] {crash_msg}", flush=True)
+                emit_system_event(crash_msg)
+                needs_usb_recovery = True
                 break
 
             if parser_proc.poll() is not None and line_queue.empty():
@@ -1657,6 +1663,8 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                 break
     finally:
         terminate_children()
+        if needs_usb_recovery and RUNNING:
+            reset_rtl_usb_device(cfg, center_hz=center_hz, perform_usb_ioctl=True)
         time.sleep(1.5)
 
 
