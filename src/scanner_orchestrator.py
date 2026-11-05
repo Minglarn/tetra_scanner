@@ -377,17 +377,20 @@ def resolve_rtl_device_spec(cfg, serial_override=None):
     else:
         parsed_index = int(raw_spec)
 
+    if parsed_index is not None and not parsed_serial:
+        return str(parsed_index), parsed_index, None
+
     rtlsdr = _load_librtlsdr()
     resolved_index = parsed_index
     resolved_serial = parsed_serial
 
-    if rtlsdr is not None:
+    if rtlsdr is not None and resolved_serial:
         try:
             dev_count = int(rtlsdr.rtlsdr_get_device_count())
         except Exception:
             dev_count = 0
 
-        if resolved_serial and dev_count > 0:
+        if dev_count > 0:
             try:
                 idx = int(
                     rtlsdr.rtlsdr_get_index_by_serial(
@@ -396,36 +399,6 @@ def resolve_rtl_device_spec(cfg, serial_override=None):
                 )
                 if idx >= 0:
                     resolved_index = idx
-            except Exception:
-                pass
-
-        if resolved_index is not None and 0 <= resolved_index < dev_count:
-            try:
-                mfg = ctypes.create_string_buffer(256)
-                prod = ctypes.create_string_buffer(256)
-                ser = ctypes.create_string_buffer(256)
-                rc = int(
-                    rtlsdr.rtlsdr_get_device_usb_strings(
-                        int(resolved_index), mfg, prod, ser
-                    )
-                )
-                if rc == 0:
-                    hw_ser = ser.value.decode("utf-8", errors="ignore").strip()
-                    if hw_ser and not resolved_serial:
-                        resolved_serial = hw_ser
-            except Exception:
-                pass
-        elif resolved_index is not None and dev_count == 1 and resolved_index >= dev_count:
-            # Fallback if only 1 RTL-SDR stick is plugged in at index 0
-            resolved_index = 0
-            try:
-                mfg = ctypes.create_string_buffer(256)
-                prod = ctypes.create_string_buffer(256)
-                ser = ctypes.create_string_buffer(256)
-                if int(rtlsdr.rtlsdr_get_device_usb_strings(0, mfg, prod, ser)) == 0:
-                    hw_ser = ser.value.decode("utf-8", errors="ignore").strip()
-                    if hw_ser and not resolved_serial:
-                        resolved_serial = hw_ser
             except Exception:
                 pass
 
