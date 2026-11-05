@@ -1462,8 +1462,16 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                             verified_tetra_hz.add(hz_val)
                 elif clean_line.startswith("[heartbeat]"):
                     if "per channel:" in clean_line:
-                        raw_dict_str = clean_line.split("per channel:", 1)[1].strip()
+                        after_per_chan = clean_line.split("per channel:", 1)[1].strip()
+                        raw_dict_str = after_per_chan
+                        raw_bd_str = None
+                        if "| pdu_breakdown:" in after_per_chan:
+                            raw_dict_str, raw_bd_str = [
+                                s.strip()
+                                for s in after_per_chan.split("| pdu_breakdown:", 1)
+                            ]
                         per_chan = None
+                        pdu_bd = {}
                         try:
                             per_chan = json.loads(raw_dict_str)
                         except Exception:
@@ -1471,16 +1479,45 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
                                 per_chan = json.loads(raw_dict_str.replace("'", '"'))
                             except Exception:
                                 per_chan = None
+                        if raw_bd_str:
+                            try:
+                                pdu_bd = json.loads(raw_bd_str)
+                            except Exception:
+                                pdu_bd = {}
 
                         if isinstance(per_chan, dict):
                             hb_lines = ["[60s CHANNEL CHECK]"]
                             for m_str, p_cnt in per_chan.items():
+                                crc_cnt = int(p_cnt or 0)
+                                ch_bd = (
+                                    pdu_bd.get(m_str, {})
+                                    if isinstance(pdu_bd, dict)
+                                    else {}
+                                )
+                                sys_c = int(ch_bd.get("sysinfo", 0) or 0)
+                                sync_c = int(ch_bd.get("sync", 0) or 0)
+                                mac_c = int(ch_bd.get("mac", 0) or 0)
+                                sds_c = int(ch_bd.get("sds", 0) or 0)
+                                call_c = int(ch_bd.get("call", 0) or 0)
+                                tch_c = int(ch_bd.get("tch_s", 0) or 0)
+
                                 status_lbl = (
                                     "ACTIVE TETRA (CRC Sync OK)"
-                                    if int(p_cnt or 0) > 0
+                                    if crc_cnt > 0
                                     else "Silent / No TETRA CRC Sync"
                                 )
-                                hb_lines.append(f"  - {m_str} MHz: {p_cnt} pkt/min ({status_lbl})")
+                                if crc_cnt > 0:
+                                    bd_tag = (
+                                        f" [SYSINFO:{sys_c}, SYNC:{sync_c}, "
+                                        f"MAC:{mac_c}, SDS:{sds_c}, CALL:{call_c} | TCH_S:{tch_c}]"
+                                    )
+                                elif tch_c > 0:
+                                    bd_tag = f" [SYSINFO:0, SYNC:0 | TCH_S noise:{tch_c}]"
+                                else:
+                                    bd_tag = ""
+                                hb_lines.append(
+                                    f"  - {m_str} MHz: {crc_cnt} pkt/min{bd_tag} ({status_lbl})"
+                                )
                             emit_system_event("\n".join(hb_lines))
                         else:
                             emit_system_event(clean_line)

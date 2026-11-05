@@ -34,7 +34,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.05")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.06")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1194,7 +1194,7 @@ def main():
                         "last_pdu": last_obj.get("pdu"),
                         "last_emit_ts": float(last_obj.get("seen_epoch") or 0.0),
                         "last_sig": None,
-                        "control_verified": True,
+                        "control_verified": False,
                     }
                     for s_line, _ in recs:
                         kept_lines.append(s_line)
@@ -1295,6 +1295,18 @@ def main():
         os.path.getmtime(WHITELIST_FILE) if os.path.exists(WHITELIST_FILE) else 0.0
     )
     stats_60s = {ch["freq_mhz"]: 0 for ch in channels}
+    pdu_stats_60s = {
+        ch["freq_mhz"]: {
+            "crc_ok": 0,
+            "sysinfo": 0,
+            "sync": 0,
+            "sds": 0,
+            "call": 0,
+            "mac": 0,
+            "tch_s": 0,
+        }
+        for ch in channels
+    }
     last_heartbeat = time.time()
     first_hb_sent = False
     running = True
@@ -2438,8 +2450,21 @@ def main():
         pdu = str(get_ci(pkt, ["pdu"], "")).upper()
         now_ts = time.time()
         is_uplane = (pdu == "TCH_S" or service == "UPLANE")
+        ch_pdu_stat = pdu_stats_60s.setdefault(
+            freq_str,
+            {
+                "crc_ok": 0,
+                "sysinfo": 0,
+                "sync": 0,
+                "sds": 0,
+                "call": 0,
+                "mac": 0,
+                "tch_s": 0,
+            },
+        )
 
         if is_uplane:
+            ch_pdu_stat["tch_s"] = int(ch_pdu_stat.get("tch_s", 0)) + 1
             raw_pkt_ssi = to_int(
                 get_ci(
                     pkt,
@@ -2462,9 +2487,21 @@ def main():
                     interval_s=30.0,
                 )
                 return
+        else:
+            ch_pdu_stat["crc_ok"] = int(ch_pdu_stat.get("crc_ok", 0)) + 1
+            if pdu in ("SYSINFO", "D-NWRK-BROADCAST"):
+                ch_pdu_stat["sysinfo"] = int(ch_pdu_stat.get("sysinfo", 0)) + 1
+            elif pdu == "SYNC":
+                ch_pdu_stat["sync"] = int(ch_pdu_stat.get("sync", 0)) + 1
+            elif pdu == "D-SDS-DATA" or "SDS" in pdu:
+                ch_pdu_stat["sds"] = int(ch_pdu_stat.get("sds", 0)) + 1
+            elif pdu in CALL_PDUS:
+                ch_pdu_stat["call"] = int(ch_pdu_stat.get("call", 0)) + 1
+            else:
+                ch_pdu_stat["mac"] = int(ch_pdu_stat.get("mac", 0)) + 1
 
-        stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
-        db.record_raw_packet_stat(freq_str, ch.get("la"), now_ts=now_ts)
+            stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
+            db.record_raw_packet_stat(freq_str, ch.get("la"), now_ts=now_ts)
 
         observe_channel_activity(ch, pkt, pdu, service, now_ts)
 
@@ -2974,6 +3011,7 @@ def main():
                 "known_units": len(unit_registry),
                 "discovered_networks": len(seen_networks),
                 "channels_60s": dict(stats_60s),
+                "pdu_breakdown_60s": {k: dict(v) for k, v in pdu_stats_60s.items()},
             }
             if mqtt_client is not None:
                 mqtt_client.publish(
@@ -2984,11 +3022,21 @@ def main():
                 )
             send_udp_json(hb_payload)
             print(
-                f"[heartbeat] 60s total packets: {total_60s} | known units: {len(unit_registry)} | networks: {len(seen_networks)} | per channel: {json.dumps(stats_60s)}",
+                f"[heartbeat] 60s total packets: {total_60s} | known units: {len(unit_registry)} | networks: {len(seen_networks)} | per channel: {json.dumps(stats_60s)} | pdu_breakdown: {json.dumps(pdu_stats_60s)}",
                 flush=True,
             )
             for k in stats_60s:
                 stats_60s[k] = 0
+            for k in pdu_stats_60s:
+                pdu_stats_60s[k] = {
+                    "crc_ok": 0,
+                    "sysinfo": 0,
+                    "sync": 0,
+                    "sds": 0,
+                    "call": 0,
+                    "mac": 0,
+                    "tch_s": 0,
+                }
             last_heartbeat = now_ts
 
     flush_expired_sds(time.time(), force=True)

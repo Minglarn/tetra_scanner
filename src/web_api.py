@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.05")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.06")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -698,6 +698,57 @@ def get_history(
 @app.get("/api/analytics", response_class=JSONResponse)
 def get_analytics(hours: float = 24.0):
     return db.get_analytics_summary(hours=hours)
+
+
+@app.get("/api/sdr-devices", response_class=JSONResponse)
+def get_sdr_devices():
+    import ctypes
+
+    devices = []
+    rtlsdr = None
+    for lib_name in ("librtlsdr.so.0", "librtlsdr.so"):
+        try:
+            rtlsdr = ctypes.CDLL(lib_name)
+            break
+        except Exception:
+            continue
+
+    if rtlsdr is None:
+        return {"count": 0, "devices": [], "error": "librtlsdr not available"}
+
+    try:
+        rtlsdr.rtlsdr_get_device_name.restype = ctypes.c_char_p
+        dev_count = int(rtlsdr.rtlsdr_get_device_count())
+        for idx in range(dev_count):
+            name_ptr = rtlsdr.rtlsdr_get_device_name(idx)
+            name = (
+                name_ptr.decode("utf-8", errors="ignore")
+                if name_ptr
+                else f"RTL-SDR #{idx}"
+            )
+            mfg = ctypes.create_string_buffer(256)
+            prod = ctypes.create_string_buffer(256)
+            ser = ctypes.create_string_buffer(256)
+            rc = int(rtlsdr.rtlsdr_get_device_usb_strings(idx, mfg, prod, ser))
+            devices.append(
+                {
+                    "index": idx,
+                    "name": name,
+                    "manufacturer": mfg.value.decode("utf-8", errors="ignore").strip()
+                    if rc == 0
+                    else "",
+                    "product": prod.value.decode("utf-8", errors="ignore").strip()
+                    if rc == 0
+                    else "",
+                    "serial": ser.value.decode("utf-8", errors="ignore").strip()
+                    if rc == 0
+                    else "",
+                }
+            )
+    except Exception as exc:
+        return {"count": len(devices), "devices": devices, "error": str(exc)}
+
+    return {"count": len(devices), "devices": devices}
 
 
 async def read_recent_lines(filepath: str, max_lines: int = 150):

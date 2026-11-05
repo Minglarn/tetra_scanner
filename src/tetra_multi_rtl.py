@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import os
 import re
+import gc
 import sys
 import math
 import cmath
 import signal
+import time
 import threading
 from gnuradio import gr
 from gnuradio import filter
@@ -44,8 +46,8 @@ class tetra_chan(gr.hier_block2):
         channel_rate = 36000
         sps = 2
 
-        taps = firdes.low_pass(1.0, samp_rate, 18000, 5000, firdes.WIN_HAMMING)
-        self.xlating = filter.freq_xlating_fir_filter_ccc(
+        taps = firdes.low_pass(1.0, samp_rate, 18000, 10000, firdes.WIN_HAMMING)
+        self.xlating = filter.freq_xlating_fir_filter_ccf(
             decim, taps, freq_hz - center_freq, samp_rate
         )
         self.resamp = filter.mmse_resampler_cc(
@@ -111,21 +113,51 @@ class tetra_multi_rtl(gr.top_block):
         )
 
         samp_rate = 2000000
+        dev_args = f"numchan=1 rtl={rtl_id}"
 
         print(
-            f"[gnuradio] Initializing RTL-SDR rtl={rtl_id} "
+            f"[gnuradio] Initializing RTL-SDR args='{dev_args}' "
             f"center={center_freq} Hz rate={samp_rate} S/s gain={gain} dB ppm={ppm}",
             flush=True,
         )
 
-        self.src = osmosdr.source(args=f"numchan=1 rtl={rtl_id}")
+        self.src = osmosdr.source(args=dev_args)
+        time.sleep(0.18)
+
         self.src.set_sample_rate(samp_rate)
-        self.src.set_center_freq(center_freq, 0)
-        self.src.set_freq_corr(ppm, 0)
+        time.sleep(0.15)
+
         self.src.set_dc_offset_mode(0, 0)
         self.src.set_iq_balance_mode(0, 0)
+
+        if ppm != 0:
+            self.src.set_freq_corr(ppm, 0)
+            time.sleep(0.10)
+
         self.src.set_gain_mode(False, 0)
+        time.sleep(0.08)
         self.src.set_gain(gain, 0)
+        time.sleep(0.12)
+
+        pre_tune_hz = max(24_000_000, center_freq - 1_000_000)
+        self.src.set_center_freq(pre_tune_hz, 0)
+        time.sleep(0.12)
+        self.src.set_center_freq(center_freq, 0)
+        time.sleep(0.20)
+
+        actual_freq = int(round(self.src.get_center_freq(0)))
+        if abs(actual_freq - center_freq) > 5000:
+            time.sleep(0.15)
+            self.src.set_center_freq(center_freq, 0)
+            time.sleep(0.20)
+            actual_freq = int(round(self.src.get_center_freq(0)))
+
+        actual_gain = self.src.get_gain(0)
+        print(
+            f"[gnuradio] R82XX Tuner locked: freq={actual_freq} Hz ({actual_freq / 1e6:.4f} MHz), "
+            f"gain={actual_gain:.1f} dB (requested {gain:.1f} dB)",
+            flush=True,
+        )
 
         self.channels = []
         raw_entries = [c.strip() for c in channels_str.split(",") if c.strip()]
@@ -148,7 +180,10 @@ def main():
 
     def sig_handler(signum, frame):
         if not stop_event.is_set():
-            print("[gnuradio] Stopping flowgraph...", flush=True)
+            print(
+                f"[gnuradio] Received signal {signum}, stopping flowgraph cleanly...",
+                flush=True,
+            )
             stop_event.set()
 
     signal.signal(signal.SIGINT, sig_handler)
@@ -161,8 +196,21 @@ def main():
     except KeyboardInterrupt:
         stop_event.set()
     finally:
-        tb.stop()
-        tb.wait()
+        try:
+            tb.stop()
+            tb.wait()
+        except Exception as exc:
+            print(f"[gnuradio] Warning during tb.stop()/wait(): {exc}", flush=True)
+        try:
+            tb.disconnect_all()
+            tb.channels.clear()
+            tb.src = None
+            del tb
+            gc.collect()
+            time.sleep(0.20)
+        except Exception:
+            pass
+        print("[gnuradio] Flowgraph stopped and RTL-SDR USB handle released.", flush=True)
 
 
 if __name__ == "__main__":
