@@ -46,12 +46,12 @@ class tetra_chan(gr.hier_block2):
         channel_rate = 36000
         sps = 2
 
-        cutoff_hz = float(os.environ.get("TETRA_FILTER_CUTOFF", "15000"))
+        cutoff_hz = float(os.environ.get("TETRA_FILTER_CUTOFF", "18000"))
         trans_hz = float(os.environ.get("TETRA_FILTER_TRANS", "10000"))
         taps = firdes.low_pass(
             1.0, samp_rate, cutoff_hz, trans_hz, firdes.WIN_HAMMING
         )
-        self.xlating = filter.freq_xlating_fir_filter_ccf(
+        self.xlating = filter.freq_xlating_fir_filter_ccc(
             decim, taps, freq_hz - center_freq, samp_rate
         )
         self.resamp = filter.mmse_resampler_cc(
@@ -109,8 +109,8 @@ class tetra_multi_rtl(gr.top_block):
             os.environ.get("RTL_SERIAL", ""),
         )
         gain = float(os.environ.get("RTL_GAIN", "24.0"))
-        if_gain = float(os.environ.get("RTL_IF_GAIN", "20.0"))
-        bb_gain = float(os.environ.get("RTL_BB_GAIN", "20.0"))
+        if_gain = float(os.environ.get("RTL_IF_GAIN", "-1.0"))
+        bb_gain = float(os.environ.get("RTL_BB_GAIN", "-1.0"))
         ppm = int(float(os.environ.get("RTL_PPM", "0")))
         center_freq = int(float(os.environ.get("CENTER_FREQ", "427750000")))
         channels_str = os.environ.get(
@@ -156,29 +156,12 @@ class tetra_multi_rtl(gr.top_block):
         self.src.set_center_freq(center_freq, 0)
         time.sleep(0.20)
 
-        if ppm != 0:
-            self.src.set_freq_corr(0, 0)
-            time.sleep(0.05)
-            self.src.set_freq_corr(ppm, 0)
-            time.sleep(0.12)
-
         actual_freq = int(round(self.src.get_center_freq(0)))
         if abs(actual_freq - center_freq) > 5000:
             time.sleep(0.15)
             self.src.set_center_freq(center_freq, 0)
             time.sleep(0.20)
-            if ppm != 0:
-                self.src.set_freq_corr(0, 0)
-                time.sleep(0.05)
-                self.src.set_freq_corr(ppm, 0)
-                time.sleep(0.10)
             actual_freq = int(round(self.src.get_center_freq(0)))
-
-        self.src.set_gain(gain, 0)
-        if if_gain >= 0:
-            self.src.set_if_gain(if_gain, 0)
-        if bb_gain >= 0:
-            self.src.set_bb_gain(bb_gain, 0)
 
         actual_gain = self.src.get_gain(0)
         actual_corr = self.src.get_freq_corr(0)
