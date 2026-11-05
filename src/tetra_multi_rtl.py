@@ -20,17 +20,37 @@ import osmosdr
 def parse_rtl_id(raw_spec, explicit_serial=""):
     spec = str(raw_spec if raw_spec is not None else "0").strip()
     ser = str(explicit_serial or "").strip()
-    if ser:
-        return ser
-    if "serial=" in spec.lower():
-        m = re.search(r"serial=([A-Za-z0-9_-]+)", spec, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    if "rtl=" in spec.lower():
-        m = re.search(r"rtl=([A-Za-z0-9_-]+)", spec, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-    return spec or "0"
+    candidate = ser
+    if not candidate:
+        if "serial=" in spec.lower():
+            m = re.search(r"serial=([A-Za-z0-9_-]+)", spec, re.IGNORECASE)
+            if m:
+                candidate = m.group(1).strip()
+        elif "rtl=" in spec.lower():
+            m = re.search(r"rtl=([A-Za-z0-9_-]+)", spec, re.IGNORECASE)
+            if m:
+                candidate = m.group(1).strip()
+        else:
+            candidate = spec or "0"
+
+    if candidate.isdigit() and len(candidate) <= 2:
+        return candidate
+
+    try:
+        import ctypes
+
+        rtlsdr = ctypes.CDLL("librtlsdr.so.0")
+        rtlsdr.rtlsdr_get_index_by_serial.argtypes = [ctypes.c_char_p]
+        rtlsdr.rtlsdr_get_index_by_serial.restype = ctypes.c_int
+        idx = rtlsdr.rtlsdr_get_index_by_serial(candidate.encode("utf-8"))
+        if idx >= 0:
+            return str(idx)
+    except Exception:
+        pass
+
+    if spec.isdigit() and len(spec) <= 2:
+        return spec
+    return "0"
 
 
 class tetra_chan(gr.hier_block2):
@@ -46,7 +66,7 @@ class tetra_chan(gr.hier_block2):
         channel_rate = 36000
         sps = 2
 
-        cutoff_hz = float(os.environ.get("TETRA_FILTER_CUTOFF", "18000"))
+        cutoff_hz = float(os.environ.get("TETRA_FILTER_CUTOFF", "12500"))
         trans_hz = float(os.environ.get("TETRA_FILTER_TRANS", "10000"))
         taps = firdes.low_pass(
             1.0, samp_rate, cutoff_hz, trans_hz, firdes.WIN_HAMMING
@@ -108,7 +128,7 @@ class tetra_multi_rtl(gr.top_block):
             os.environ.get("RTL_DEVICE_INDEX", "0"),
             os.environ.get("RTL_SERIAL", ""),
         )
-        gain = float(os.environ.get("RTL_GAIN", "24.0"))
+        gain = float(os.environ.get("RTL_GAIN", "20.7"))
         if_gain = float(os.environ.get("RTL_IF_GAIN", "-1.0"))
         bb_gain = float(os.environ.get("RTL_BB_GAIN", "-1.0"))
         ppm = int(float(os.environ.get("RTL_PPM", "0")))
@@ -137,10 +157,6 @@ class tetra_multi_rtl(gr.top_block):
         self.src.set_dc_offset_mode(0, 0)
         self.src.set_iq_balance_mode(0, 0)
 
-        if ppm != 0:
-            self.src.set_freq_corr(ppm, 0)
-            time.sleep(0.10)
-
         self.src.set_gain_mode(False, 0)
         time.sleep(0.08)
         self.src.set_gain(gain, 0)
@@ -155,6 +171,10 @@ class tetra_multi_rtl(gr.top_block):
         time.sleep(0.12)
         self.src.set_center_freq(center_freq, 0)
         time.sleep(0.20)
+
+        if ppm != 0:
+            self.src.set_freq_corr(ppm, 0)
+            time.sleep(0.15)
 
         actual_freq = int(round(self.src.get_center_freq(0)))
         if abs(actual_freq - center_freq) > 5000:

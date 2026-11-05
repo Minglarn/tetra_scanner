@@ -34,7 +34,7 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.08")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.09")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1194,7 +1194,7 @@ def main():
                         "last_pdu": last_obj.get("pdu"),
                         "last_emit_ts": float(last_obj.get("seen_epoch") or 0.0),
                         "last_sig": None,
-                        "control_verified": False,
+                        "control_verified": True,
                     }
                     for s_line, _ in recs:
                         kept_lines.append(s_line)
@@ -1627,7 +1627,10 @@ def main():
         )
 
         sig_changed = sig != state.get("last_sig")
-        if not sig_changed and (now_ts - state.get("last_emit_ts", 0.0)) < 15.0:
+        cooldown_key = f"LOG_{freq_str}_{state.get('la')}_{len(neighbours_list)}"
+        last_log = seen_networks.get(cooldown_key, 0.0)
+        need_log = bool(emit_log_event and (sig_changed or (now_ts - last_log) >= 300.0))
+        if not sig_changed and not need_log and (now_ts - state.get("last_emit_ts", 0.0)) < 15.0:
             return
 
         state["last_sig"] = sig
@@ -1714,12 +1717,9 @@ def main():
                 f"{MQTT_BASE_TOPIC}/NETWORK", payload_str, qos=0, retain=True
             )
 
-        if emit_log_event and sig_changed:
-            cooldown_key = f"LOG_{freq_str}_{state.get('la')}_{len(neighbours_list)}"
-            last_log = seen_networks.get(cooldown_key, 0.0)
-            if (now_ts - last_log) >= 300.0:
-                seen_networks[cooldown_key] = now_ts
-                emit_event(net_event)
+        if need_log:
+            seen_networks[cooldown_key] = now_ts
+            emit_event(net_event)
 
     def observe_channel_activity(ch, pkt, pdu, service, now_ts):
         is_uplane = (pdu == "TCH_S" or service == "UPLANE")
@@ -1753,7 +1753,7 @@ def main():
         if enc_mode is not None:
             state["encryption_mode"] = enc_mode
 
-        if state.get("control_verified") and (pdu or service):
+        if state.get("control_verified") and (pdu or service) and pdu not in NETWORK_PDUS:
             register_whitelisted_carrier(
                 ch,
                 "NETWORK",
@@ -1860,6 +1860,7 @@ def main():
                 if nb_state.get("mnc") is None and state.get("mnc") is not None:
                     nb_state["mnc"] = state["mnc"]
                 nb_state["reported_by"] = freq_str
+                nb_state["control_verified"] = True
                 nb_ch_proxy = {
                     "freq_hz": nb_freq_hz,
                     "freq_mhz": nb_freq_mhz,
@@ -2487,6 +2488,9 @@ def main():
                     interval_s=30.0,
                 )
                 return
+            ch_pdu_stat["crc_ok"] = int(ch_pdu_stat.get("crc_ok", 0)) + 1
+            stats_60s[freq_str] = stats_60s.get(freq_str, 0) + 1
+            db.record_raw_packet_stat(freq_str, ch.get("la"), now_ts=now_ts)
         else:
             ch_pdu_stat["crc_ok"] = int(ch_pdu_stat.get("crc_ok", 0)) + 1
             if pdu in ("SYSINFO", "D-NWRK-BROADCAST"):

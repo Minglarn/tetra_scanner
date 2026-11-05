@@ -86,8 +86,11 @@ def get_default_config():
     return {
         "RTL_DEVICE_INDEX": parse_env_device("RTL_DEVICE_INDEX", "0"),
         "RTL_SERIAL": parse_env_str("RTL_SERIAL", ""),
-        "RTL_GAIN": parse_env_float("RTL_GAIN", 24.0),
+        "RTL_GAIN": parse_env_float("RTL_GAIN", 20.7),
         "RTL_PPM": parse_env_int("RTL_PPM", 0),
+        "TETRA_DECIM": parse_env_int("TETRA_DECIM", 25),
+        "TETRA_FILTER_CUTOFF": parse_env_float("TETRA_FILTER_CUTOFF", 12500.0),
+        "TETRA_FILTER_TRANS": parse_env_float("TETRA_FILTER_TRANS", 10000.0),
         "MODE": parse_env_str("MODE", "scanner").lower(),
         "SCAN_START_MHZ": parse_env_float("SCAN_START_MHZ", 420.0),
         "SCAN_END_MHZ": parse_env_float("SCAN_END_MHZ", 430.0),
