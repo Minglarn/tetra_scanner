@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.01")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.02")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -41,13 +41,23 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 db.init_db()
 
 
+def _parse_device_spec(val, default=0):
+    raw = str(val if val is not None else default).split("#", 1)[0].strip()
+    if not raw:
+        return default
+    if raw.isdigit() and len(raw) < 4:
+        return int(raw)
+    return raw
+
+
 def get_default_config():
     def _clean(key, default):
         raw = os.environ.get(key, str(default))
         return str(raw).split("#", 1)[0].strip() or str(default)
 
     return {
-        "RTL_DEVICE_INDEX": int(float(_clean("RTL_DEVICE_INDEX", 1))),
+        "RTL_DEVICE_INDEX": _parse_device_spec(_clean("RTL_DEVICE_INDEX", 0), default=0),
+        "RTL_SERIAL": _clean("RTL_SERIAL", ""),
         "RTL_GAIN": float(_clean("RTL_GAIN", 24.0)),
         "RTL_PPM": int(float(_clean("RTL_PPM", 0))),
         "MODE": _clean("MODE", "scanner").lower(),
@@ -159,7 +169,11 @@ async def update_config(request: Request):
 
     try:
         if "RTL_DEVICE_INDEX" in body:
-            new_cfg["RTL_DEVICE_INDEX"] = int(body["RTL_DEVICE_INDEX"])
+            new_cfg["RTL_DEVICE_INDEX"] = _parse_device_spec(
+                body["RTL_DEVICE_INDEX"], default=0
+            )
+        if "RTL_SERIAL" in body:
+            new_cfg["RTL_SERIAL"] = str(body["RTL_SERIAL"]).strip()
         if "RTL_GAIN" in body:
             new_cfg["RTL_GAIN"] = float(body["RTL_GAIN"])
         if "RTL_PPM" in body:
@@ -208,6 +222,7 @@ async def update_config(request: Request):
 
     hard_keys = (
         "RTL_DEVICE_INDEX",
+        "RTL_SERIAL",
         "RTL_GAIN",
         "RTL_PPM",
         "MODE",

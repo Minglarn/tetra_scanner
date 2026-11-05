@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import os
+import re
+import gc
 import sys
 import math
 import cmath
+import ctypes
 import signal
 import time
+import threading
 from gnuradio import gr
 from gnuradio import filter
 from gnuradio import analog
@@ -12,6 +16,105 @@ from gnuradio import digital
 from gnuradio import blocks
 from gnuradio.filter import firdes
 import osmosdr
+
+
+def _load_librtlsdr():
+    for lib_name in ("librtlsdr.so.0", "librtlsdr.so"):
+        try:
+            return ctypes.CDLL(lib_name)
+        except Exception:
+            continue
+    return None
+
+
+def resolve_osmosdr_device_args(raw_device_spec, explicit_serial=""):
+    """
+    Resolve an RTL-SDR device index, serial number, or full gr-osmosdr string
+    (e.g. '0', '1', '00000222', 'rtl=0,serial=00000222') into a deterministic
+    osmosdr.source device argument string locked to the target dongle's serial
+    (when available) or index.
+    """
+    spec = str(raw_device_spec or "0").strip()
+    serial_cfg = str(explicit_serial or "").strip()
+
+    parsed_index = None
+    parsed_serial = serial_cfg if serial_cfg else None
+
+    if "serial=" in spec.lower() or "rtl=" in spec.lower():
+        m_ser = re.search(r"serial=([A-Za-z0-9_-]+)", spec, re.IGNORECASE)
+        if m_ser and not parsed_serial:
+            parsed_serial = m_ser.group(1).strip()
+        m_rtl = re.search(r"rtl=([A-Za-z0-9_-]+)", spec, re.IGNORECASE)
+        if m_rtl:
+            rtl_tok = m_rtl.group(1).strip()
+            if len(rtl_tok) >= 4 or not rtl_tok.isdigit():
+                if not parsed_serial:
+                    parsed_serial = rtl_tok
+            else:
+                parsed_index = int(rtl_tok)
+    elif len(spec) >= 4 or not spec.isdigit():
+        if not parsed_serial:
+            parsed_serial = spec
+    else:
+        parsed_index = int(spec)
+
+    rtlsdr = _load_librtlsdr()
+    resolved_index = parsed_index
+    resolved_serial = parsed_serial
+
+    if rtlsdr is not None:
+        try:
+            dev_count = int(rtlsdr.rtlsdr_get_device_count())
+        except Exception:
+            dev_count = 0
+
+        if resolved_serial and dev_count > 0:
+            try:
+                idx = int(
+                    rtlsdr.rtlsdr_get_index_by_serial(
+                        resolved_serial.encode("utf-8")
+                    )
+                )
+                if idx >= 0:
+                    resolved_index = idx
+                else:
+                    print(
+                        f"[gnuradio] Warning: serial '{resolved_serial}' not found by rtlsdr_get_index_by_serial (rc={idx}), scanning {dev_count} device(s)...",
+                        flush=True,
+                    )
+            except Exception:
+                pass
+
+        if resolved_index is not None and 0 <= resolved_index < dev_count:
+            try:
+                mfg = ctypes.create_string_buffer(256)
+                prod = ctypes.create_string_buffer(256)
+                ser = ctypes.create_string_buffer(256)
+                rc = int(
+                    rtlsdr.rtlsdr_get_device_usb_strings(
+                        int(resolved_index), mfg, prod, ser
+                    )
+                )
+                if rc == 0:
+                    hw_serial = ser.value.decode("utf-8", errors="ignore").strip()
+                    if hw_serial and not resolved_serial:
+                        resolved_serial = hw_serial
+            except Exception:
+                pass
+
+    # In gr-osmosdr's rtl_source_c.cc, dict["rtl"] is first passed to
+    # rtlsdr_get_index_by_serial(val), and if that fails, lexical_cast<uint>(val).
+    # Passing the resolved serial (when non-empty and >= 3 chars) or index locks
+    # gr-osmosdr deterministically to the target physical stick.
+    if resolved_serial and len(resolved_serial) >= 3:
+        rtl_selector = resolved_serial
+    elif resolved_index is not None:
+        rtl_selector = str(resolved_index)
+    else:
+        rtl_selector = "0"
+
+    dev_args = f"numchan=1 rtl={rtl_selector},buffers=32,buflen=16384"
+    return dev_args, resolved_index, resolved_serial
 
 
 class tetra_chan(gr.hier_block2):
@@ -81,33 +184,81 @@ class tetra_multi_rtl(gr.top_block):
     def __init__(self):
         gr.top_block.__init__(self, "TETRA Multi-Channel Receiver")
 
-        device_index = int(os.environ.get("RTL_DEVICE_INDEX", "1"))
+        raw_device_spec = os.environ.get("RTL_DEVICE_INDEX", "0").strip()
+        explicit_serial = os.environ.get("RTL_SERIAL", "").strip()
         gain = float(os.environ.get("RTL_GAIN", "24.0"))
-        ppm = int(os.environ.get("RTL_PPM", "0"))
-        center_freq = int(os.environ.get("CENTER_FREQ", "427750000"))
+        ppm = int(float(os.environ.get("RTL_PPM", "0")))
+        center_freq = int(float(os.environ.get("CENTER_FREQ", "427750000")))
         channels_str = os.environ.get(
             "TETRA_CHANNELS",
             "427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7",
         )
 
         samp_rate = 2000000
+        dev_args, resolved_idx, resolved_ser = resolve_osmosdr_device_args(
+            raw_device_spec, explicit_serial
+        )
 
         print(
-            f"[gnuradio] Initializing RTL-SDR index={device_index} "
+            f"[gnuradio] Initializing RTL-SDR args='{dev_args}' "
+            f"(resolved_index={resolved_idx}, serial={resolved_ser or 'auto'}) "
             f"center={center_freq} Hz rate={samp_rate} S/s gain={gain} dB ppm={ppm}",
             flush=True,
         )
 
-        self.src = osmosdr.source(args=f"numchan=1 rtl={device_index}")
+        # 1. Open osmosdr source and allow USB control pipe + I2C repeater to settle
+        self.src = osmosdr.source(args=dev_args)
+        time.sleep(0.18)
+
+        # 2. Configure baseband sample rate first and let RTL2832U DDC/PLL clock settle
         self.src.set_sample_rate(samp_rate)
-        self.src.set_center_freq(center_freq, 0)
-        self.src.set_freq_corr(ppm, 0)
+        time.sleep(0.15)
+
+        # 3. Disable software DC offset / IQ balance overrides
         self.src.set_dc_offset_mode(0, 0)
         self.src.set_iq_balance_mode(0, 0)
+
+        # 4. Apply frequency correction (PPM) BEFORE tuning center frequency
+        #    (only call set_freq_corr when ppm != 0 to avoid redundant R82XX I2C re-tune)
+        if ppm != 0:
+            self.src.set_freq_corr(ppm, 0)
+            time.sleep(0.10)
+
+        # 5. Disable hardware AGC and set manual LNA/Mixer/VGA tuner gain table
+        #    (Do NOT overwrite R82XX IF/BB VGA registers with hardcoded 20 dB afterwards,
+        #    which causes IF stage saturation / pure noise on R820T/R820T2/R828D tuners)
         self.src.set_gain_mode(False, 0)
+        time.sleep(0.08)
         self.src.set_gain(gain, 0)
-        self.src.set_if_gain(20, 0)
-        self.src.set_bb_gain(20, 0)
+        time.sleep(0.12)
+
+        # 6. Two-step R82XX VCO & PLL stabilization sequence:
+        #    Tune 1.0 MHz below target first so the R82XX synthesizer crosses a VCO
+        #    capacitor bank boundary and runs full VCO autocalibration, then lock to
+        #    target center_freq.
+        pre_tune_hz = max(24_000_000, center_freq - 1_000_000)
+        self.src.set_center_freq(pre_tune_hz, 0)
+        time.sleep(0.12)
+        self.src.set_center_freq(center_freq, 0)
+        time.sleep(0.20)
+
+        actual_freq = int(round(self.src.get_center_freq(0)))
+        if abs(actual_freq - center_freq) > 5000:
+            print(
+                f"[gnuradio] Warning: initial center_freq readback={actual_freq} Hz != target {center_freq} Hz; retrying PLL lock...",
+                flush=True,
+            )
+            time.sleep(0.15)
+            self.src.set_center_freq(center_freq, 0)
+            time.sleep(0.20)
+            actual_freq = int(round(self.src.get_center_freq(0)))
+
+        actual_gain = self.src.get_gain(0)
+        print(
+            f"[gnuradio] R82XX Tuner locked: freq={actual_freq} Hz ({actual_freq / 1e6:.4f} MHz), "
+            f"gain={actual_gain:.1f} dB (requested {gain:.1f} dB)",
+            flush=True,
+        )
 
         self.channels = []
         raw_entries = [c.strip() for c in channels_str.split(",") if c.strip()]
@@ -125,23 +276,42 @@ class tetra_multi_rtl(gr.top_block):
 
 
 def main():
+    stop_event = threading.Event()
     tb = tetra_multi_rtl()
 
     def sig_handler(signum, frame):
-        print("[gnuradio] Stopping flowgraph...", flush=True)
-        tb.stop()
+        if not stop_event.is_set():
+            print(
+                f"[gnuradio] Received signal {signum}, stopping flowgraph cleanly...",
+                flush=True,
+            )
+            stop_event.set()
 
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
     tb.start()
     try:
-        while True:
-            time.sleep(1.0)
+        while not stop_event.is_set():
+            stop_event.wait(timeout=0.5)
     except KeyboardInterrupt:
-        pass
-    tb.stop()
-    tb.wait()
+        stop_event.set()
+    finally:
+        try:
+            tb.stop()
+            tb.wait()
+        except Exception as exc:
+            print(f"[gnuradio] Warning during tb.stop()/wait(): {exc}", flush=True)
+        try:
+            tb.disconnect_all()
+            tb.channels.clear()
+            tb.src = None
+            del tb
+            gc.collect()
+            time.sleep(0.20)
+        except Exception:
+            pass
+        print("[gnuradio] Flowgraph stopped and RTL-SDR USB handle released.", flush=True)
 
 
 if __name__ == "__main__":
