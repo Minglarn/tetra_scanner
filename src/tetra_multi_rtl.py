@@ -140,7 +140,15 @@ class tetra_multi_rtl(gr.top_block):
             flush=True,
         )
 
-        self.src = osmosdr.source(args=dev_args)
+        self.src = None
+        for _att in range(3):
+            try:
+                self.src = osmosdr.source(args=dev_args)
+                break
+            except RuntimeError:
+                if _att == 2:
+                    raise
+                time.sleep(0.6)
         self.src.set_sample_rate(samp_rate)
         self.src.set_freq_corr(ppm, 0)
         self.src.set_dc_offset_mode(0, 0)

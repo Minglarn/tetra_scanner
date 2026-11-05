@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.11")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.12")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -172,6 +172,8 @@ async def update_config(request: Request):
             new_cfg["RTL_DEVICE_INDEX"] = _parse_device_spec(
                 body["RTL_DEVICE_INDEX"], default=0
             )
+            if "RTL_SERIAL" not in body and isinstance(new_cfg["RTL_DEVICE_INDEX"], int):
+                new_cfg["RTL_SERIAL"] = ""
         if "RTL_SERIAL" in body:
             new_cfg["RTL_SERIAL"] = str(body["RTL_SERIAL"]).strip()
         if "RTL_GAIN" in body:
@@ -715,8 +717,11 @@ def get_analytics(hours: float = 24.0):
     return db.get_analytics_summary(hours=hours)
 
 
+_SDR_USB_STRINGS_CACHE = {}
+
+
 @app.get("/api/sdr-devices", response_class=JSONResponse)
-def get_sdr_devices():
+def get_sdr_devices(refresh: int = 0):
     import ctypes
 
     devices = []
@@ -734,6 +739,8 @@ def get_sdr_devices():
     try:
         rtlsdr.rtlsdr_get_device_name.restype = ctypes.c_char_p
         dev_count = int(rtlsdr.rtlsdr_get_device_count())
+        if refresh or len(_SDR_USB_STRINGS_CACHE) != dev_count:
+            _SDR_USB_STRINGS_CACHE.clear()
         for idx in range(dev_count):
             name_ptr = rtlsdr.rtlsdr_get_device_name(idx)
             name = (
@@ -741,25 +748,30 @@ def get_sdr_devices():
                 if name_ptr
                 else f"RTL-SDR #{idx}"
             )
+            cached = _SDR_USB_STRINGS_CACHE.get(idx)
+            if cached and cached.get("name") == name and cached.get("serial"):
+                devices.append(dict(cached))
+                continue
             mfg = ctypes.create_string_buffer(256)
             prod = ctypes.create_string_buffer(256)
             ser = ctypes.create_string_buffer(256)
             rc = int(rtlsdr.rtlsdr_get_device_usb_strings(idx, mfg, prod, ser))
-            devices.append(
-                {
-                    "index": idx,
-                    "name": name,
-                    "manufacturer": mfg.value.decode("utf-8", errors="ignore").strip()
-                    if rc == 0
-                    else "",
-                    "product": prod.value.decode("utf-8", errors="ignore").strip()
-                    if rc == 0
-                    else "",
-                    "serial": ser.value.decode("utf-8", errors="ignore").strip()
-                    if rc == 0
-                    else "",
-                }
-            )
+            entry = {
+                "index": idx,
+                "name": name,
+                "manufacturer": mfg.value.decode("utf-8", errors="ignore").strip()
+                if rc == 0
+                else (cached.get("manufacturer", "") if cached else ""),
+                "product": prod.value.decode("utf-8", errors="ignore").strip()
+                if rc == 0
+                else (cached.get("product", "") if cached else ""),
+                "serial": ser.value.decode("utf-8", errors="ignore").strip()
+                if rc == 0
+                else (cached.get("serial", "") if cached else ""),
+            }
+            if rc == 0:
+                _SDR_USB_STRINGS_CACHE[idx] = dict(entry)
+            devices.append(entry)
     except Exception as exc:
         return {"count": len(devices), "devices": devices, "error": str(exc)}
 
