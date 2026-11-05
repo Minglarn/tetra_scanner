@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.06")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.07")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -176,8 +176,18 @@ async def update_config(request: Request):
             new_cfg["RTL_SERIAL"] = str(body["RTL_SERIAL"]).strip()
         if "RTL_GAIN" in body:
             new_cfg["RTL_GAIN"] = float(body["RTL_GAIN"])
+        if "RTL_IF_GAIN" in body:
+            new_cfg["RTL_IF_GAIN"] = float(body["RTL_IF_GAIN"])
+        if "RTL_BB_GAIN" in body:
+            new_cfg["RTL_BB_GAIN"] = float(body["RTL_BB_GAIN"])
         if "RTL_PPM" in body:
             new_cfg["RTL_PPM"] = int(body["RTL_PPM"])
+        if "TETRA_DECIM" in body:
+            new_cfg["TETRA_DECIM"] = max(1, int(body["TETRA_DECIM"]))
+        if "TETRA_FILTER_CUTOFF" in body:
+            new_cfg["TETRA_FILTER_CUTOFF"] = float(body["TETRA_FILTER_CUTOFF"])
+        if "TETRA_FILTER_TRANS" in body:
+            new_cfg["TETRA_FILTER_TRANS"] = float(body["TETRA_FILTER_TRANS"])
         if "MODE" in body:
             m = str(body["MODE"]).strip().lower()
             if m in ("scanner", "static"):
@@ -224,7 +234,12 @@ async def update_config(request: Request):
         "RTL_DEVICE_INDEX",
         "RTL_SERIAL",
         "RTL_GAIN",
+        "RTL_IF_GAIN",
+        "RTL_BB_GAIN",
         "RTL_PPM",
+        "TETRA_DECIM",
+        "TETRA_FILTER_CUTOFF",
+        "TETRA_FILTER_TRANS",
         "MODE",
         "SCAN_START_MHZ",
         "SCAN_END_MHZ",

@@ -1317,6 +1317,15 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
     os.environ["RTL_PPM"] = str(cfg["RTL_PPM"])
     os.environ["CENTER_FREQ"] = str(center_hz)
     os.environ["TETRA_CHANNELS"] = channels_str
+    for opt_key in (
+        "RTL_IF_GAIN",
+        "RTL_BB_GAIN",
+        "TETRA_DECIM",
+        "TETRA_FILTER_CUTOFF",
+        "TETRA_FILTER_TRANS",
+    ):
+        if opt_key in cfg and cfg[opt_key] is not None:
+            os.environ[opt_key] = str(cfg[opt_key])
     child_env = os.environ.copy()
 
     raw_chans = [c.strip() for c in channels_str.split(",") if c.strip()]
