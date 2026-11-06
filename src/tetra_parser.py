@@ -34,7 +34,69 @@ except ImportError:
     mqtt = None
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.01")
+ETSI_OFFSET_HZ = {
+    0: 0,
+    1: 6250,    # +6.25 kHz
+    2: -6250,   # -6.25 kHz
+    3: 12500,   # +12.5 kHz (Standard for Swedish Rakel 380-395 MHz)
+}
+
+
+def normalize_tetra_freq_hz(freq_hz, serving_freq_hz=None, explicit_offset_code=None):
+    if freq_hz is None:
+        return None
+    try:
+        f_val = float(freq_hz)
+        f_hz = int(round(f_val * 1_000_000)) if 0 < f_val < 100000.0 else int(round(f_val))
+    except (ValueError, TypeError):
+        return None
+    if f_hz <= 0:
+        return None
+
+    if explicit_offset_code is not None:
+        try:
+            off_c = int(explicit_offset_code)
+            if off_c in ETSI_OFFSET_HZ and (f_hz % 25_000) == 0:
+                return f_hz + ETSI_OFFSET_HZ[off_c]
+        except (ValueError, TypeError):
+            pass
+
+    if (f_hz % 25_000) == 0:
+        serving_is_12k5 = (
+            serving_freq_hz is not None and (int(serving_freq_hz) % 25_000) == 12_500
+        )
+        if (380_000_000 <= f_hz <= 395_000_000) or serving_is_12k5:
+            return f_hz + 12_500
+    return f_hz
+
+
+def compute_safe_center_hz(freq_hz_list, min_dc_guard_hz=25_000):
+    if not freq_hz_list:
+        return 427_750_000
+    freqs = sorted(set(int(f) for f in freq_hz_list if f))
+    if not freqs:
+        return 427_750_000
+    min_f = freqs[0]
+    max_f = freqs[-1]
+    raw_center = (min_f + max_f) // 2
+    base_center = int(round(raw_center / 12_500.0) * 12_500)
+
+    for guard_hz in (37_500, min_dc_guard_hz):
+        for step in range(0, 40):
+            for sign in (1, -1) if step > 0 else (1,):
+                cand = base_center + sign * step * 12_500
+                if all(abs(cand - f) >= guard_hz for f in freqs):
+                    if (cand - min_f) <= 950_000 and (max_f - cand) <= 950_000:
+                        return cand
+    for step in range(0, 40):
+        for sign in (1, -1) if step > 0 else (1,):
+            cand = base_center + sign * step * 12_500
+            if all(abs(cand - f) >= min_dc_guard_hz for f in freqs):
+                return cand
+    return base_center + 50_000
+
+
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.02")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1127,6 +1189,7 @@ def main():
         try:
             kept_lines = []
             by_freq_records = {}
+            migrated_any_net = False
             with open(DISCOVERED_NETWORKS_FILE, "r", encoding="utf-8", errors="replace") as nf:
                 for raw_line in nf:
                     s_line = raw_line.strip()
@@ -1138,11 +1201,59 @@ def main():
                         continue
                     if not isinstance(n_obj, dict):
                         continue
+
+                    f_hz_raw = int(n_obj.get("freq_hz") or 0)
+                    f_mhz_raw = str(n_obj.get("freq_mhz") or "").strip()
+                    if not f_hz_raw and f_mhz_raw:
+                        try:
+                            f_hz_raw = int(round(float(f_mhz_raw) * 1_000_000))
+                        except Exception:
+                            f_hz_raw = 0
+
+                    if 380_000_000 <= f_hz_raw <= 395_000_000 and (f_hz_raw % 25_000) == 0:
+                        old_mhz = f"{f_hz_raw / 1e6:.4f}"
+                        f_hz_raw += 12_500
+                        new_mhz = f"{f_hz_raw / 1e6:.4f}"
+                        n_obj["freq_hz"] = f_hz_raw
+                        n_obj["freq_mhz"] = new_mhz
+                        n_obj["network_id"] = f"NET_{new_mhz}"
+                        if isinstance(n_obj.get("human_text"), str):
+                            n_obj["human_text"] = n_obj["human_text"].replace(old_mhz, new_mhz)
+                        migrated_any_net = True
+                        print(
+                            f"[parser] Migrated Rakel carrier {old_mhz} -> {new_mhz} MHz (+12.5 kHz offset) in discovered_networks.jsonl",
+                            flush=True,
+                        )
+
+                    if isinstance(n_obj.get("neighbours"), list):
+                        nb_changed = False
+                        for nb in n_obj["neighbours"]:
+                            if not isinstance(nb, dict):
+                                continue
+                            nb_hz = int(nb.get("freq_hz") or 0)
+                            if not nb_hz and nb.get("freq_mhz"):
+                                try:
+                                    nb_hz = int(round(float(nb["freq_mhz"]) * 1_000_000))
+                                except Exception:
+                                    nb_hz = 0
+                            if 380_000_000 <= nb_hz <= 395_000_000 and (nb_hz % 25_000) == 0:
+                                old_nb_mhz = nb.get("freq_mhz") or f"{nb_hz / 1e6:.4f}"
+                                nb_hz += 12_500
+                                new_nb_mhz = f"{nb_hz / 1e6:.4f}"
+                                nb["freq_hz"] = nb_hz
+                                nb["freq_mhz"] = new_nb_mhz
+                                if isinstance(n_obj.get("human_text"), str) and old_nb_mhz:
+                                    n_obj["human_text"] = n_obj["human_text"].replace(old_nb_mhz, new_nb_mhz)
+                                nb_changed = True
+                        if nb_changed:
+                            migrated_any_net = True
+
+                    s_line_out = json.dumps(n_obj, ensure_ascii=False)
                     f_mhz = n_obj.get("freq_mhz")
                     if f_mhz:
-                        by_freq_records.setdefault(f_mhz, []).append((s_line, n_obj))
+                        by_freq_records.setdefault(f_mhz, []).append((s_line_out, n_obj))
 
-            pruned_any_net = False
+            pruned_any_net = migrated_any_net
             for f_mhz, recs in by_freq_records.items():
                 has_control = False
                 f_hz_val = 0
@@ -1226,24 +1337,100 @@ def main():
         "NEIGHBOUR_BROADCAST",
     }
     whitelist_data = {}
+    wl_migrated = False
     for k, v in raw_whitelist_data.items():
         if not isinstance(v, dict):
+            wl_migrated = True
             continue
         cat_up = str(v.get("last_category", "")).upper()
         if cat_up not in valid_wl_categories:
+            wl_migrated = True
             continue
         if k in unverified_tch_hz and v.get("mcc") is None and v.get("mnc") is None:
             print(
                 f"[parser] Removed unverified TCH_S-only ghost carrier {v.get('freq_mhz', k)} MHz from whitelist.json",
                 flush=True,
             )
+            wl_migrated = True
             continue
-        whitelist_data[k] = v
-    if len(whitelist_data) != len(raw_whitelist_data):
+        try:
+            f_hz = int(v.get("freq_hz") or k)
+        except Exception:
+            whitelist_data[k] = v
+            continue
+        if 380_000_000 <= f_hz <= 395_000_000 and (f_hz % 25_000) == 0:
+            old_mhz = v.get("freq_mhz", f"{f_hz / 1e6:.4f}")
+            f_hz += 12_500
+            new_key = str(f_hz)
+            new_mhz = f"{f_hz / 1e6:.4f}"
+            v = dict(v)
+            v["freq_hz"] = f_hz
+            v["freq_mhz"] = new_mhz
+            wl_migrated = True
+            print(
+                f"[parser] Migrated Rakel whitelist entry {old_mhz} -> {new_mhz} MHz (+12.5 kHz offset)",
+                flush=True,
+            )
+            if new_key in whitelist_data:
+                existing_wl = whitelist_data[new_key]
+                existing_wl["hit_count"] = int(existing_wl.get("hit_count") or 0) + int(v.get("hit_count") or 1)
+                for fld in ("la", "mcc", "mnc"):
+                    if existing_wl.get(fld) is None and v.get(fld) is not None:
+                        existing_wl[fld] = v[fld]
+            else:
+                whitelist_data[new_key] = v
+        else:
+            k_str = str(f_hz)
+            if k_str in whitelist_data:
+                existing_wl = whitelist_data[k_str]
+                existing_wl["hit_count"] = max(int(existing_wl.get("hit_count") or 0), int(v.get("hit_count") or 1))
+                for fld in ("la", "mcc", "mnc"):
+                    if existing_wl.get(fld) is None and v.get(fld) is not None:
+                        existing_wl[fld] = v[fld]
+            else:
+                whitelist_data[k_str] = v
+    if wl_migrated or len(whitelist_data) != len(raw_whitelist_data):
         save_json_dict(WHITELIST_FILE, whitelist_data)
+
+    rt_cfg_path = os.path.join(LOG_DIR, "runtime_config.json")
+    rt_cfg = load_json_dict(rt_cfg_path)
+    if isinstance(rt_cfg, dict) and str(rt_cfg.get("TETRA_CHANNELS") or ""):
+        cur_ch_str = str(rt_cfg.get("TETRA_CHANNELS") or "")
+        rt_modified = False
+        new_ch_entries = []
+        seen_ch_hz = set()
+        ch_hz_list = []
+        for entry in cur_ch_str.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(":", 1)
+            try:
+                f_hz = int(float(parts[0].strip()))
+            except Exception:
+                continue
+            la_part = parts[1].strip() if len(parts) > 1 else "?"
+            if 380_000_000 <= f_hz <= 395_000_000 and (f_hz % 25_000) == 0:
+                f_hz += 12_500
+                rt_modified = True
+            if f_hz not in seen_ch_hz:
+                seen_ch_hz.add(f_hz)
+                ch_hz_list.append(f_hz)
+                new_ch_entries.append(f"{f_hz}:{la_part}")
+        cur_center = int(float(rt_cfg.get("CENTER_FREQ") or 0))
+        if ch_hz_list and any(abs(cur_center - f) < 25_000 for f in ch_hz_list):
+            cur_center = compute_safe_center_hz(ch_hz_list)
+            rt_cfg["CENTER_FREQ"] = cur_center
+            rt_modified = True
+        if rt_modified and new_ch_entries:
+            rt_cfg["TETRA_CHANNELS"] = ",".join(new_ch_entries)
+            save_json_dict(rt_cfg_path, rt_cfg)
+            print(
+                f"[parser] Migrated runtime_config.json -> Center {rt_cfg['CENTER_FREQ'] / 1e6:.4f} MHz, Channels: {rt_cfg['TETRA_CHANNELS']}",
+                flush=True,
+            )
+
     if unverified_tch_hz:
-        rt_cfg_path = os.path.join(LOG_DIR, "runtime_config.json")
-        rt_cfg = load_json_dict(rt_cfg_path)
         if isinstance(rt_cfg, dict) and str(rt_cfg.get("TETRA_CHANNELS") or ""):
             cur_ch_str = str(rt_cfg.get("TETRA_CHANNELS") or "")
             if any(bad_hz in cur_ch_str for bad_hz in unverified_tch_hz) and whitelist_data:
@@ -1270,10 +1457,7 @@ def main():
                         best_cluster = in_w
                 if best_cluster:
                     f_list = [int(it["freq_hz"]) for it in best_cluster]
-                    mid_raw = (min(f_list) + max(f_list)) // 2
-                    opt_center = int(round(mid_raw / 25_000.0) * 25_000)
-                    if any(abs(opt_center - f) < 5_000 for f in f_list):
-                        opt_center += 12_500
+                    opt_center = compute_safe_center_hz(f_list)
                     new_ch_parts = [
                         f"{int(it['freq_hz'])}:{it.get('la') if it.get('la') is not None else idx}"
                         for idx, it in enumerate(best_cluster, start=1)
@@ -1494,14 +1678,26 @@ def main():
     def calc_carrier_number(freq_hz):
         f_hz = int(freq_hz)
         base_hz = 300_000_000 if f_hz < 400_000_000 else 400_000_000
-        if f_hz >= base_hz and (f_hz - base_hz) % 25_000 == 0:
+        if f_hz < base_hz:
+            return None
+        rem = (f_hz - base_hz) % 25_000
+        if rem == 0:
             return (f_hz - base_hz) // 25_000
+        if rem == 12_500:
+            return (f_hz - base_hz - 12_500) // 25_000
+        if rem == 6_250:
+            return (f_hz - base_hz - 6_250) // 25_000
+        if rem == 18_750:
+            return (f_hz - base_hz + 6_250) // 25_000
         return None
 
     def extract_neighbour_cells(pkt, serving_freq_hz):
         if not isinstance(pkt, dict):
             return []
-        base_hz = 300_000_000 if int(serving_freq_hz) < 400_000_000 else 400_000_000
+        default_base_hz = 300_000_000 if int(serving_freq_hz) < 400_000_000 else 400_000_000
+        pkt_offset_code = to_int(
+            get_ci(pkt, ["offset", "freq_offset", "frequency offset", "carrier_offset", "main carrier offset"])
+        )
         neighbours = []
         for k, v in pkt.items():
             k_low = str(k).lower().strip()
@@ -1533,11 +1729,50 @@ def main():
                 reselect_types = to_int(
                     get_ci(cdict, ["cell reselection types supported"])
                 )
+                nb_offset_code = to_int(
+                    get_ci(
+                        cdict,
+                        [
+                            "offset",
+                            "freq_offset",
+                            "frequency offset",
+                            "carrier_offset",
+                            "main carrier offset",
+                        ],
+                    )
+                )
+                if nb_offset_code is None:
+                    nb_offset_code = pkt_offset_code
+                nb_band = to_int(get_ci(cdict, ["freq_band", "frequency band", "band"]))
+                base_hz = (
+                    nb_band * 100_000_000
+                    if nb_band in (3, 4)
+                    else default_base_hz
+                )
+
                 nb_freq_hz = None
                 nb_freq_mhz = None
+                raw_nb_freq = get_ci(
+                    cdict,
+                    ["dl_freq", "downlink frequency", "freq_hz", "freq", "frequency"],
+                )
                 if carrier_num is not None and 0 < carrier_num < 4096:
-                    nb_freq_hz = base_hz + carrier_num * 25_000
+                    raw_hz = base_hz + carrier_num * 25_000
+                    nb_freq_hz = normalize_tetra_freq_hz(
+                        raw_hz,
+                        serving_freq_hz=serving_freq_hz,
+                        explicit_offset_code=nb_offset_code,
+                    )
                     nb_freq_mhz = f"{nb_freq_hz / 1e6:.4f}"
+                elif raw_nb_freq is not None:
+                    nb_freq_hz = normalize_tetra_freq_hz(
+                        raw_nb_freq,
+                        serving_freq_hz=serving_freq_hz,
+                        explicit_offset_code=nb_offset_code,
+                    )
+                    if nb_freq_hz:
+                        nb_freq_mhz = f"{nb_freq_hz / 1e6:.4f}"
+
                 if nb_freq_mhz or nb_la is not None or cell_id is not None:
                     neighbours.append(
                         {
@@ -1803,6 +2038,41 @@ def main():
         )
         dl_f = get_ci(pkt, ["dl_freq", "downlink frequency"])
         ul_f = get_ci(pkt, ["ul_freq", "uplink frequency"])
+        pkt_offset_code = to_int(
+            get_ci(
+                pkt,
+                [
+                    "offset",
+                    "freq_offset",
+                    "frequency offset",
+                    "carrier_offset",
+                    "main carrier offset",
+                ],
+            )
+        )
+        pkt_main_carrier = to_int(
+            get_ci(pkt, ["main_carrier", "main carrier", "main carrier number", "carrier"])
+        )
+        pkt_freq_band = to_int(get_ci(pkt, ["freq_band", "frequency band", "band"]))
+        if dl_f is not None:
+            norm_dl = normalize_tetra_freq_hz(
+                dl_f,
+                serving_freq_hz=ch["freq_hz"],
+                explicit_offset_code=pkt_offset_code,
+            )
+            if norm_dl:
+                dl_f = norm_dl
+        elif pkt_main_carrier is not None and 0 < pkt_main_carrier < 4096:
+            base_hz = (
+                pkt_freq_band * 100_000_000
+                if pkt_freq_band in (3, 4)
+                else (300_000_000 if int(ch["freq_hz"]) < 400_000_000 else 400_000_000)
+            )
+            dl_f = normalize_tetra_freq_hz(
+                base_hz + pkt_main_carrier * 25_000,
+                serving_freq_hz=ch["freq_hz"],
+                explicit_offset_code=pkt_offset_code,
+            )
 
         if pkt_mcc is not None:
             state["mcc"] = pkt_mcc

@@ -1340,14 +1340,21 @@
       const minF = Math.min(...freqs);
       const maxF = Math.max(...freqs);
       const rawCenter = Math.floor((minF + maxF) / 2);
-      let centerHz = Math.round(rawCenter / 25000) * 25000;
-      for (const f of freqs) {
-        if (Math.abs(f - centerHz) < 12500) {
-          centerHz += 12500;
-          break;
+      const baseCenter = Math.round(rawCenter / 12500) * 12500;
+      for (const guardHz of [37500, 25000]) {
+        for (let step = 0; step < 40; step++) {
+          const signs = step === 0 ? [1] : [1, -1];
+          for (const sign of signs) {
+            const cand = baseCenter + sign * step * 12500;
+            if (freqs.every((f) => Math.abs(cand - f) >= guardHz)) {
+              if ((cand - minF) <= 950000 && (maxF - cand) <= 950000) {
+                return cand;
+              }
+            }
+          }
         }
       }
-      return centerHz;
+      return baseCenter + 50000;
     }
 
     const btnAutoCenter = document.getElementById("btn-auto-center");

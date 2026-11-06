@@ -47,6 +47,7 @@ def parse_env_str(key, default):
 
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 EVENTS_LOG_FILE = os.path.join(LOG_DIR, "tetra_events.jsonl")
+DISCOVERED_NETWORKS_FILE = os.path.join(LOG_DIR, "discovered_networks.jsonl")
 BLACKLIST_FILE = os.path.join(LOG_DIR, "blacklist.json")
 WHITELIST_FILE = os.path.join(LOG_DIR, "whitelist.json")
 RUNTIME_CONFIG_FILE = os.path.join(LOG_DIR, "runtime_config.json")
@@ -58,6 +59,7 @@ SOFT_CONFIG_FLAG = "/tmp/soft_config.flag"
 FORCE_SWEEP_PENALTY_SEC = 900
 MAX_PEAKS = 8
 PTS_GRID_HZ = 25000
+PTS_GRID_12K5_HZ = 12500
 MIN_PEAK_SEPARATION_HZ = 25000
 LOCAL_PEAK_RADIUS_HZ = 25000
 DC_SPIKE_GUARD_HZ = 10000
@@ -65,6 +67,32 @@ EDGE_GUARD_HZ = 15000
 MAX_WINDOW_SPAN_HZ = 1800000
 MIN_SNR_ABOVE_FLOOR_DB = parse_env_float("SCAN_MIN_SNR_DB", 1.8)
 ABSOLUTE_MIN_DBM = parse_env_float("SCAN_MIN_DBM", -75.0)
+
+
+def compute_safe_center_hz(freq_hz_list, min_dc_guard_hz=25000):
+    if not freq_hz_list:
+        return 427750000
+    freqs = sorted(set(int(f) for f in freq_hz_list if f))
+    if not freqs:
+        return 427750000
+    min_f = freqs[0]
+    max_f = freqs[-1]
+    raw_center = (min_f + max_f) // 2
+    base_center = int(round(raw_center / 12500.0) * 12500)
+
+    for guard_hz in (37500, min_dc_guard_hz):
+        for step in range(0, 40):
+            for sign in (1, -1) if step > 0 else (1,):
+                cand = base_center + sign * step * 12500
+                if all(abs(cand - f) >= guard_hz for f in freqs):
+                    if (cand - min_f) <= 950000 and (max_f - cand) <= 950000:
+                        return cand
+    for step in range(0, 40):
+        for sign in (1, -1) if step > 0 else (1,):
+            cand = base_center + sign * step * 12500
+            if all(abs(cand - f) >= min_dc_guard_hz for f in freqs):
+                return cand
+    return base_center + 50000
 
 PAYLOAD_TAGS = ("[SDS]", "[CALL]", "[VOICE]", "[STATUS]", "[ROAMING]")
 
@@ -140,12 +168,42 @@ def load_runtime_config():
     cfg["BLACKLIST_STRIKES"] = max(1, int(cfg.get("BLACKLIST_STRIKES", 3)))
     cfg["BLACKLIST_TIME_SEC"] = max(10, int(cfg.get("BLACKLIST_TIME_SEC", 3600)))
     cfg["CENTER_FREQ"] = int(float(cfg.get("CENTER_FREQ", 427750000)))
-    cfg["TETRA_CHANNELS"] = str(
+    raw_ch_str = str(
         cfg.get(
             "TETRA_CHANNELS",
             "427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7",
         )
     ).strip()
+    ch_modified = False
+    norm_entries = []
+    seen_hz = set()
+    ch_hz_list = []
+    for entry in raw_ch_str.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":", 1)
+        try:
+            f_hz = int(float(parts[0].strip()))
+        except Exception:
+            continue
+        la_part = parts[1].strip() if len(parts) > 1 else "?"
+        if 380000000 <= f_hz <= 395000000 and (f_hz % 25000) == 0:
+            f_hz += 12500
+            ch_modified = True
+        if f_hz not in seen_hz:
+            seen_hz.add(f_hz)
+            ch_hz_list.append(f_hz)
+            norm_entries.append(f"{f_hz}:{la_part}")
+    if norm_entries:
+        cfg["TETRA_CHANNELS"] = ",".join(norm_entries)
+    else:
+        cfg["TETRA_CHANNELS"] = raw_ch_str
+    if ch_hz_list and any(abs(cfg["CENTER_FREQ"] - f) < 25000 for f in ch_hz_list):
+        cfg["CENTER_FREQ"] = compute_safe_center_hz(ch_hz_list)
+        ch_modified = True
+    if ch_modified:
+        save_runtime_config(cfg)
     return cfg
 
 
@@ -191,6 +249,7 @@ VALID_WHITELIST_CATEGORIES = {
     "STATUS",
     "ROAMING",
     "NETWORK",
+    "NEIGHBOUR_BROADCAST",
 }
 
 
@@ -223,13 +282,125 @@ def load_whitelist():
                 if last_cat and last_cat not in VALID_WHITELIST_CATEGORIES:
                     modified = True
                     continue
-                cleaned[k] = v
+                try:
+                    f_hz = int(v.get("freq_hz") or k)
+                except Exception:
+                    cleaned[k] = v
+                    continue
+                if 380000000 <= f_hz <= 395000000 and (f_hz % 25000) == 0:
+                    old_mhz = v.get("freq_mhz", f"{f_hz / 1e6:.4f}")
+                    f_hz += 12500
+                    new_key = str(f_hz)
+                    new_mhz = f"{f_hz / 1e6:.4f}"
+                    v = dict(v)
+                    v["freq_hz"] = f_hz
+                    v["freq_mhz"] = new_mhz
+                    modified = True
+                    print(
+                        f"[scanner] Migrated Rakel whitelist entry {old_mhz} -> {new_mhz} MHz (+12.5 kHz offset)",
+                        flush=True,
+                    )
+                    if new_key in cleaned:
+                        ex = cleaned[new_key]
+                        ex["hit_count"] = int(ex.get("hit_count") or 0) + int(v.get("hit_count") or 1)
+                        for fld in ("la", "mcc", "mnc"):
+                            if ex.get(fld) is None and v.get(fld) is not None:
+                                ex[fld] = v[fld]
+                    else:
+                        cleaned[new_key] = v
+                else:
+                    k_str = str(f_hz)
+                    if k_str in cleaned:
+                        ex = cleaned[k_str]
+                        ex["hit_count"] = max(int(ex.get("hit_count") or 0), int(v.get("hit_count") or 1))
+                        for fld in ("la", "mcc", "mnc"):
+                            if ex.get(fld) is None and v.get(fld) is not None:
+                                ex[fld] = v[fld]
+                    else:
+                        cleaned[k_str] = v
             if modified:
                 save_whitelist(cleaned)
             return cleaned
     except Exception as exc:
         print(f"[scanner] Warning: failed reading {WHITELIST_FILE}: {exc}", flush=True)
     return {}
+
+
+def migrate_discovered_networks_and_blacklist():
+    if os.path.exists(DISCOVERED_NETWORKS_FILE):
+        try:
+            out_lines = []
+            changed = False
+            with open(DISCOVERED_NETWORKS_FILE, "r", encoding="utf-8", errors="replace") as nf:
+                for raw_line in nf:
+                    s_line = raw_line.strip()
+                    if not s_line:
+                        continue
+                    try:
+                        n_obj = json.loads(s_line)
+                    except Exception:
+                        continue
+                    if not isinstance(n_obj, dict):
+                        continue
+                    f_hz = int(n_obj.get("freq_hz") or 0)
+                    if not f_hz and n_obj.get("freq_mhz"):
+                        try:
+                            f_hz = int(round(float(n_obj["freq_mhz"]) * 1_000_000))
+                        except Exception:
+                            f_hz = 0
+                    if 380000000 <= f_hz <= 395000000 and (f_hz % 25000) == 0:
+                        old_mhz = n_obj.get("freq_mhz") or f"{f_hz / 1e6:.4f}"
+                        f_hz += 12500
+                        new_mhz = f"{f_hz / 1e6:.4f}"
+                        n_obj["freq_hz"] = f_hz
+                        n_obj["freq_mhz"] = new_mhz
+                        n_obj["network_id"] = f"NET_{new_mhz}"
+                        if isinstance(n_obj.get("human_text"), str) and old_mhz:
+                            n_obj["human_text"] = n_obj["human_text"].replace(old_mhz, new_mhz)
+                        changed = True
+                    if isinstance(n_obj.get("neighbours"), list):
+                        for nb in n_obj["neighbours"]:
+                            if not isinstance(nb, dict):
+                                continue
+                            nb_hz = int(nb.get("freq_hz") or 0)
+                            if not nb_hz and nb.get("freq_mhz"):
+                                try:
+                                    nb_hz = int(round(float(nb["freq_mhz"]) * 1_000_000))
+                                except Exception:
+                                    nb_hz = 0
+                            if 380000000 <= nb_hz <= 395000000 and (nb_hz % 25000) == 0:
+                                old_nb_mhz = nb.get("freq_mhz") or f"{nb_hz / 1e6:.4f}"
+                                nb_hz += 12500
+                                new_nb_mhz = f"{nb_hz / 1e6:.4f}"
+                                nb["freq_hz"] = nb_hz
+                                nb["freq_mhz"] = new_nb_mhz
+                                if isinstance(n_obj.get("human_text"), str) and old_nb_mhz:
+                                    n_obj["human_text"] = n_obj["human_text"].replace(old_nb_mhz, new_nb_mhz)
+                                changed = True
+                    out_lines.append(json.dumps(n_obj, ensure_ascii=False))
+            if changed:
+                tmp_nf = f"{DISCOVERED_NETWORKS_FILE}.tmp"
+                with open(tmp_nf, "w", encoding="utf-8") as wf:
+                    for ol in out_lines:
+                        wf.write(ol + "\n")
+                os.replace(tmp_nf, DISCOVERED_NETWORKS_FILE)
+                print("[scanner] Migrated Rakel entries (+12.5 kHz offset) in discovered_networks.jsonl", flush=True)
+        except Exception as exc:
+            print(f"[scanner] Warning migrating {DISCOVERED_NETWORKS_FILE}: {exc}", flush=True)
+
+    bl = load_blacklist()
+    wl = load_whitelist()
+    bl_modified = False
+    for k in list(bl.keys()):
+        try:
+            f_hz = int(k)
+        except Exception:
+            continue
+        if k in wl or (380000000 <= f_hz <= 395000000 and (f_hz % 25000) == 0):
+            del bl[k]
+            bl_modified = True
+    if bl_modified:
+        save_blacklist(bl)
 
 
 def emit_system_event(human_text):
@@ -688,9 +859,9 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
         "src.set_gain_mode(False, 0)\n"
         f"src.set_center_freq({center_hz}, 0)\n"
         f"src.set_gain({gain_val}, 0)\n"
-        "s2v = blocks.stream_to_vector(gr.sizeof_gr_complex, 1024)\n"
-        "keep = blocks.keep_one_in_n(gr.sizeof_gr_complex * 1024, 20)\n"
-        "sink = blocks.vector_sink_c(1024)\n"
+        "s2v = blocks.stream_to_vector(gr.sizeof_gr_complex, 4096)\n"
+        "keep = blocks.keep_one_in_n(gr.sizeof_gr_complex * 4096, 5)\n"
+        "sink = blocks.vector_sink_c(4096)\n"
         "tb.connect(src, s2v, keep, sink)\n"
         "tb.start()\n"
         "time.sleep(1.0)\n"
@@ -707,21 +878,21 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
         "del tb\n"
         "gc.collect()\n"
         "time.sleep(0.25)\n"
-        "nvec = len(raw) // 1024\n"
+        "nvec = len(raw) // 4096\n"
         "if nvec <= 0:\n"
         "    sys.exit(2)\n"
-        "vecs = raw[:nvec * 1024].reshape((nvec, 1024))\n"
-        "win = np.hanning(1024).astype(np.float32)\n"
+        "vecs = raw[:nvec * 4096].reshape((nvec, 4096))\n"
+        "win = np.hanning(4096).astype(np.float32)\n"
         "win /= np.sum(win)\n"
         "spec = np.fft.fftshift(np.fft.fft(vecs * win, axis=1), axes=1)\n"
         "pwr = np.mean(np.abs(spec) ** 2, axis=0)\n"
         "dbm = 10.0 * np.log10(np.maximum(pwr, 1e-12))\n"
-        "step_hz = 2000000.0 / 1024.0\n"
+        "step_hz = 2000000.0 / 4096.0\n"
         f"low_hz = {center_hz} - 1000000.0\n"
         f"high_hz = {center_hz} + 1000000.0 - step_hz\n"
         "vals_str = ', '.join(f'{v:.2f}' for v in dbm)\n"
         f"with open({repr(csv_path)}, 'w', encoding='utf-8') as f:\n"
-        "    f.write(f'2026-11-05, 00:00:00, {low_hz:.0f}, {high_hz:.0f}, {step_hz:.2f}, {nvec * 1024}, {vals_str}\\n')\n"
+        "    f.write(f'2026-11-06, 00:00:00, {low_hz:.0f}, {high_hz:.0f}, {step_hz:.2f}, {nvec * 4096}, {vals_str}\\n')\n"
     )
     cmd = ["python3", "-c", gr_sweep_code]
     scan_msg = (
@@ -847,38 +1018,50 @@ def parse_block_csv(csv_path, start_hz, end_hz, center_hz, current_gain=24.0):
 
     block_grid = {}
     for freq_hz, dbm in avg_spectrum:
-        snapped_25k = int(round(freq_hz / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
+        if 380_000_000 <= freq_hz <= 395_000_000:
+            # Swedish Rakel (380-395 MHz) uses ETSI Offset = 3 (+12.5 kHz: .xx125, .xx375, .xx625, .xx875 MHz)
+            snapped_hz = int(round((freq_hz - 12_500.0) / 25_000.0) * 25_000) + 12_500
+        else:
+            # Support both Offset = 0 (.xx00/.xx25/.xx50/.xx75) and Offset = 3 (.xx125/.xx375/.xx625/.xx875)
+            snapped_hz = int(round(freq_hz / float(PTS_GRID_12K5_HZ)) * PTS_GRID_12K5_HZ)
         snr_db = round(dbm - noise_floor, 1)
         grid_entry = {
-            "freq_hz": snapped_25k,
+            "freq_hz": snapped_hz,
             "dbm": round(dbm, 2),
             "snr_db": snr_db,
             "noise_floor": round(noise_floor, 2),
         }
         if (
-            snapped_25k not in block_grid
-            or grid_entry["dbm"] > block_grid[snapped_25k]["dbm"]
+            snapped_hz not in block_grid
+            or grid_entry["dbm"] > block_grid[snapped_hz]["dbm"]
         ):
-            block_grid[snapped_25k] = grid_entry
+            block_grid[snapped_hz] = grid_entry
 
     snapped_peaks = {}
     sorted_grid_freqs = sorted(block_grid.keys())
-    for snapped_25k in sorted_grid_freqs:
-        g_entry = block_grid[snapped_25k]
+    for snapped_hz in sorted_grid_freqs:
+        g_entry = block_grid[snapped_hz]
         dbm = g_entry["dbm"]
         if dbm < min_threshold:
             continue
 
-        left_nb = block_grid.get(snapped_25k - PTS_GRID_HZ)
-        right_nb = block_grid.get(snapped_25k + PTS_GRID_HZ)
-        if left_nb and left_nb["dbm"] > dbm:
+        left_12k = block_grid.get(snapped_hz - PTS_GRID_12K5_HZ)
+        right_12k = block_grid.get(snapped_hz + PTS_GRID_12K5_HZ)
+        left_25k = block_grid.get(snapped_hz - PTS_GRID_HZ)
+        right_25k = block_grid.get(snapped_hz + PTS_GRID_HZ)
+
+        if left_12k and left_12k["dbm"] > dbm:
             continue
-        if right_nb and right_nb["dbm"] >= dbm and right_nb["dbm"] >= min_threshold:
+        if right_12k and right_12k["dbm"] >= dbm and right_12k["dbm"] >= min_threshold:
+            continue
+        if left_25k and left_25k["dbm"] > dbm:
+            continue
+        if right_25k and right_25k["dbm"] >= dbm and right_25k["dbm"] >= min_threshold:
             continue
 
         entry = dict(g_entry)
         entry["measured_peak"] = True
-        snapped_peaks[snapped_25k] = entry
+        snapped_peaks[snapped_hz] = entry
 
     block_peaks = list(snapped_peaks.values())
     block_peaks.sort(key=lambda x: x["dbm"], reverse=True)
@@ -1290,10 +1473,7 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
         return None, []
 
     best_window_peaks.sort(key=lambda x: x["freq_hz"])
-    min_f = best_window_peaks[0]["freq_hz"]
-    max_f = best_window_peaks[-1]["freq_hz"]
-    raw_center = (min_f + max_f) // 2
-    center_hz = int(round(raw_center / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
+    center_hz = compute_safe_center_hz([p["freq_hz"] for p in best_window_peaks])
 
     if len(best_window_peaks) < MAX_PEAKS:
         existing_hz = {p["freq_hz"] for p in best_window_peaks}
@@ -1320,13 +1500,10 @@ def phase2_select_best_window(all_peaks, cfg, measured_grid=None):
             min_f = best_window_peaks[0]["freq_hz"]
             max_f = best_window_peaks[-1]["freq_hz"]
             if (max_f - min_f) <= max_bandwidth_hz:
-                raw_center = (min_f + max_f) // 2
-                center_hz = int(round(raw_center / float(PTS_GRID_HZ)) * PTS_GRID_HZ)
+                center_hz = compute_safe_center_hz([p["freq_hz"] for p in best_window_peaks])
 
-    for p in best_window_peaks:
-        if abs(p["freq_hz"] - center_hz) < 12500:
-            center_hz += 12500
-            break
+    if any(abs(p["freq_hz"] - center_hz) < 25000 for p in best_window_peaks):
+        center_hz = compute_safe_center_hz([p["freq_hz"] for p in best_window_peaks])
 
     p2_lines = [
         f"[PHASE 2: SELECTED 1.8 MHz WINDOW]",
@@ -1759,6 +1936,7 @@ def phase3_monitor_channels(center_hz, channels_str, cfg, is_scanner_mode=True, 
 
 
 def main():
+    migrate_discovered_networks_and_blacklist()
     cycle = 1
     try:
         while RUNNING:

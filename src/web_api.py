@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.01")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.02")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -111,18 +111,30 @@ async def get_config():
     return cfg
 
 
-def compute_optimal_center_hz(freq_hz_list):
+def compute_optimal_center_hz(freq_hz_list, min_dc_guard_hz=25000):
     if not freq_hz_list:
         return 427750000
-    min_f = min(freq_hz_list)
-    max_f = max(freq_hz_list)
+    freqs = sorted(set(int(f) for f in freq_hz_list if f))
+    if not freqs:
+        return 427750000
+    min_f = freqs[0]
+    max_f = freqs[-1]
     raw_center = (min_f + max_f) // 2
-    center_hz = int(round(raw_center / 25000.0) * 25000)
-    for f_hz in freq_hz_list:
-        if abs(f_hz - center_hz) < 12500:
-            center_hz += 12500
-            break
-    return center_hz
+    base_center = int(round(raw_center / 12500.0) * 12500)
+
+    for guard_hz in (37500, min_dc_guard_hz):
+        for step in range(0, 40):
+            for sign in (1, -1) if step > 0 else (1,):
+                cand = base_center + sign * step * 12500
+                if all(abs(cand - f) >= guard_hz for f in freqs):
+                    if (cand - min_f) <= 950000 and (max_f - cand) <= 950000:
+                        return cand
+    for step in range(0, 40):
+        for sign in (1, -1) if step > 0 else (1,):
+            cand = base_center + sign * step * 12500
+            if all(abs(cand - f) >= min_dc_guard_hz for f in freqs):
+                return cand
+    return base_center + 50000
 
 
 def normalize_channels_and_center(channels_raw: str, center_raw=None):
@@ -150,6 +162,8 @@ def normalize_channels_and_center(channels_raw: str, center_raw=None):
         elif c_val >= 100000.0:
             center_hz = int(round(c_val))
         else:
+            center_hz = compute_optimal_center_hz(freq_hz_list)
+        if any(abs(center_hz - f) < 25000 for f in freq_hz_list):
             center_hz = compute_optimal_center_hz(freq_hz_list)
     else:
         center_hz = compute_optimal_center_hz(freq_hz_list)
