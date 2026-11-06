@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.04")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.05")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -462,7 +462,8 @@ def _load_and_compact_networks_sync():
 
 @app.get("/api/networks", response_class=JSONResponse)
 async def get_networks():
-    return await asyncio.to_thread(_load_and_compact_networks_sync)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _load_and_compact_networks_sync)
 
 
 @app.delete("/api/networks", response_class=JSONResponse)
@@ -878,7 +879,8 @@ def _read_tail_chunk_sync(filepath: str, file_pos: int):
 
 
 async def read_recent_lines(filepath: str, max_lines: int = 100):
-    lines, _ = await asyncio.to_thread(_read_recent_lines_sync, filepath, max_lines)
+    loop = asyncio.get_running_loop()
+    lines, _ = await loop.run_in_executor(None, _read_recent_lines_sync, filepath, max_lines)
     return lines
 
 
@@ -889,8 +891,9 @@ async def websocket_events(websocket: WebSocket):
 
     try:
         if os.path.exists(EVENTS_FILE):
-            recent, file_pos = await asyncio.to_thread(
-                _read_recent_lines_sync, EVENTS_FILE, 100
+            loop = asyncio.get_running_loop()
+            recent, file_pos = await loop.run_in_executor(
+                None, _read_recent_lines_sync, EVENTS_FILE, 100
             )
             for line in recent:
                 await websocket.send_text(line)

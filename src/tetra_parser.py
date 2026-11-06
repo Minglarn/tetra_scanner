@@ -96,7 +96,7 @@ def compute_safe_center_hz(freq_hz_list, min_dc_guard_hz=25_000):
     return base_center + 50_000
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.04")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.05")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
