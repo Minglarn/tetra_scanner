@@ -129,7 +129,7 @@ def load_runtime_config():
     cfg["RTL_GAIN"] = float(cfg.get("RTL_GAIN", 24.0))
     cfg["RTL_PPM"] = int(cfg.get("RTL_PPM", 0))
     cfg["MODE"] = str(cfg.get("MODE", "scanner")).strip().lower()
-    if cfg["MODE"] not in ("scanner", "static"):
+    if cfg["MODE"] not in ("scanner", "static", "stopped"):
         cfg["MODE"] = "scanner"
     cfg["SCAN_START_MHZ"] = float(cfg.get("SCAN_START_MHZ", 420.0))
     cfg["SCAN_END_MHZ"] = float(cfg.get("SCAN_END_MHZ", 430.0))
@@ -614,6 +614,43 @@ def build_center_frequencies(start_mhz, end_mhz):
     return centers
 
 
+def _run_sweep_subproc(cmd, timeout=35):
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    deadline = time.time() + timeout
+    while proc.poll() is None:
+        if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            return -1, "", "Aborted due to config reload"
+        if time.time() >= deadline:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+            return -2, "", "Sweep timeout"
+        time.sleep(0.15)
+    out, err = proc.communicate()
+    return proc.returncode, out or "", err or ""
+
+
 def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
     if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
         return None
@@ -699,38 +736,24 @@ def run_rtl_power_sweep(center_mhz, start_hz, end_hz, cfg):
     if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
         return None
     try:
-        res = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=35,
-            check=False,
-        )
-        if res.returncode != 0:
-            err_str = (res.stderr or "").strip()
-            print(
-                f"[scanner] Phase 1 sweep exited with code {res.returncode}: {err_str}",
-                flush=True,
-            )
+        retcode, _, stderr_text = _run_sweep_subproc(cmd, timeout=35)
+        if retcode != 0:
             if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
                 return None
-            if "usb_claim_interface" in err_str.lower() or res.returncode != 0:
+            err_str = (stderr_text or "").strip()
+            print(
+                f"[scanner] Phase 1 sweep exited with code {retcode}: {err_str}",
+                flush=True,
+            )
+            if "usb_claim_interface" in err_str.lower() or retcode != 0:
                 print("[scanner] Attempting USB reset and retry for Phase 1 block...", flush=True)
                 reset_rtl_usb_device(cfg, center_hz=int(center_mhz * 1e6), perform_usb_ioctl=True)
                 if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
                     return None
-                res_retry = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=35,
-                    check=False,
-                )
-                if res_retry.returncode != 0:
+                ret_retry, _, err_retry = _run_sweep_subproc(cmd, timeout=35)
+                if ret_retry != 0 and RUNNING and not os.path.exists(RELOAD_CONFIG_FLAG):
                     print(
-                        f"[scanner] Phase 1 sweep retry exited with code {res_retry.returncode}: {(res_retry.stderr or '').strip()}",
+                        f"[scanner] Phase 1 sweep retry exited with code {ret_retry}: {(err_retry or '').strip()}",
                         flush=True,
                     )
     except Exception as exc:
@@ -949,6 +972,9 @@ def phase1_sweep_band(centers, cfg):
             f_hz = pk["freq_hz"]
             if f_hz not in merged_peaks or pk["dbm"] > merged_peaks[f_hz]["dbm"]:
                 merged_peaks[f_hz] = pk
+
+    if not RUNNING or os.path.exists(RELOAD_CONFIG_FLAG):
+        return [], {}
 
     all_peaks = list(merged_peaks.values())
     all_peaks.sort(key=lambda x: x["dbm"], reverse=True)
@@ -1745,6 +1771,20 @@ def main():
 
             cfg = load_runtime_config()
             mode = cfg["MODE"]
+
+            if mode == "stopped":
+                terminate_children()
+                stop_msg = (
+                    f"[STOPPED / SDR RELEASED] Scanning stopped. RTL-SDR device #{cfg['RTL_DEVICE_INDEX']} "
+                    f"is completely released and free for other applications."
+                )
+                print(f"[scanner] {stop_msg}", flush=True)
+                emit_system_event(stop_msg)
+                while RUNNING:
+                    if os.path.exists(RELOAD_CONFIG_FLAG) or os.path.exists(FORCE_SWEEP_FLAG):
+                        break
+                    time.sleep(0.4)
+                continue
 
             if mode == "static":
                 print(

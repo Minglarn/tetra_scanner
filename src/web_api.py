@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.05.12")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.01")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -192,7 +192,7 @@ async def update_config(request: Request):
             new_cfg["TETRA_FILTER_TRANS"] = float(body["TETRA_FILTER_TRANS"])
         if "MODE" in body:
             m = str(body["MODE"]).strip().lower()
-            if m in ("scanner", "static"):
+            if m in ("scanner", "static", "stopped"):
                 new_cfg["MODE"] = m
         if "SCAN_START_MHZ" in body:
             new_cfg["SCAN_START_MHZ"] = float(body["SCAN_START_MHZ"])
@@ -295,14 +295,72 @@ async def update_config(request: Request):
     }
 
 
+@app.post("/api/stop-sdr", response_class=JSONResponse)
+async def stop_and_release_sdr():
+    old_cfg = await read_runtime_config()
+    new_cfg = dict(old_cfg)
+    new_cfg["MODE"] = "stopped"
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
+    async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+        await f.write(json.dumps(new_cfg, indent=2, sort_keys=True))
+    os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+
+    try:
+        async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as f:
+            await f.write(str(time.time()))
+    except Exception:
+        pass
+
+    try:
+        iso_ts = datetime.now(timezone.utc).isoformat()
+        sys_event = {
+            "time": iso_ts,
+            "timestamp": iso_ts,
+            "category": "SYSTEM",
+            "freq_mhz": "SYS",
+            "human_text": (
+                f"Stop requested: Stopping radio pipeline and releasing RTL-SDR device "
+                f"#{new_cfg.get('RTL_DEVICE_INDEX', 0)}."
+            ),
+        }
+        async with aiofiles.open(EVENTS_FILE, mode="a", encoding="utf-8") as ef:
+            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
+            await ef.flush()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "status": "ok",
+        "hard_reload": True,
+        "restarted_pipeline": True,
+        "config": new_cfg,
+    }
+
+
 @app.post("/api/force-sweep", response_class=JSONResponse)
 async def trigger_force_sweep():
+    cfg = await read_runtime_config()
+    if cfg.get("MODE") == "stopped":
+        cfg["MODE"] = "scanner"
+        os.makedirs(LOG_DIR, exist_ok=True)
+        tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
+        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
+            await f.write(json.dumps(cfg, indent=2, sort_keys=True))
+        os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+        try:
+            async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as f:
+                await f.write(str(time.time()))
+        except Exception:
+            pass
     try:
         async with aiofiles.open(FORCE_SWEEP_FLAG, mode="w", encoding="utf-8") as f:
             await f.write(str(time.time()))
     except Exception:
         pass
-    return {"status": "ok", "message": "Force sweep triggered"}
+    return {"status": "ok", "message": "Force sweep triggered", "config": cfg}
 
 
 @app.get("/api/networks", response_class=JSONResponse)
