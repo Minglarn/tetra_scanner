@@ -324,8 +324,23 @@
       <div id="main-view-live" class="flex-1 flex flex-col min-h-0">
         <!-- Filter Bar -->
         <div class="px-4 py-3 border-b border-gray-800 bg-gray-900/90 flex flex-wrap items-center justify-between gap-3">
-          <div class="flex flex-wrap items-center gap-4 text-xs">
+          <div class="flex flex-wrap items-center gap-3 text-xs">
             <span class="text-gray-400 font-semibold uppercase tracking-wider">Filters:</span>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600" title="Show or hide [NETWORK] ACTIVE CELL and NEIGHBOUR CELL cards in Live Stream">
+              <input type="checkbox" id="filter-network" class="accent-emerald-500 rounded" />
+              <span class="text-gray-200">Show Network / Cell Info</span>
+            </label>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600" title="Show or hide periodic [60s CHANNEL CHECK] telemetry cards in Live Stream">
+              <input type="checkbox" id="filter-heartbeat" class="accent-emerald-500 rounded" />
+              <span class="text-gray-200">Show 60s Heartbeat</span>
+            </label>
+
+            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600" title="Show or hide scanner status events ([PHASE 1], [PHASE 2], [SDR TUNER INIT], etc.)">
+              <input type="checkbox" id="filter-system" checked class="accent-emerald-500 rounded" />
+              <span class="text-gray-200">Show System Events</span>
+            </label>
 
             <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
               <input type="checkbox" id="filter-triona" checked class="accent-emerald-500 rounded" />
@@ -338,21 +353,14 @@
             </label>
 
             <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
-              <input type="checkbox" id="filter-system" checked class="accent-emerald-500 rounded" />
-              <span class="text-gray-200">Show System Events</span>
-            </label>
-
-            <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-800/80 border border-gray-700 px-2.5 py-1 rounded hover:border-gray-600">
               <input type="checkbox" id="filter-raw-mac" class="accent-emerald-500 rounded" />
-              <span class="text-gray-400">Show Raw Data (TETRA System Noise)</span>
+              <span class="text-gray-400">Show Raw Data</span>
             </label>
 
             <label class="inline-flex items-center gap-2 cursor-pointer select-none bg-emerald-950/60 border border-emerald-700/70 px-2.5 py-1 rounded hover:border-emerald-500">
               <input type="checkbox" id="autoplay-voice" checked class="accent-emerald-500 rounded" />
               <span class="text-emerald-200">Auto-Play Voice</span>
             </label>
-
-            <span class="text-[11px] text-gray-500 uppercase tracking-wider">Order: Newest First</span>
           </div>
 
           <div class="flex items-center gap-2">
@@ -553,6 +561,8 @@
     const wsDot = document.getElementById("ws-dot");
     const wsStatusText = document.getElementById("ws-status-text");
     const eventCounterEl = document.getElementById("event-counter");
+    const filterNetworkEl = document.getElementById("filter-network");
+    const filterHeartbeatEl = document.getElementById("filter-heartbeat");
     const filterTrionaEl = document.getElementById("filter-triona");
     const filterControlEl = document.getElementById("filter-control");
     const filterSystemEl = document.getElementById("filter-system");
@@ -560,6 +570,54 @@
     const autoplayVoiceEl = document.getElementById("autoplay-voice");
     const searchInputEl = document.getElementById("search-input");
     const clearLogBtn = document.getElementById("clear-log-btn");
+    const FILTER_STORAGE_KEY = "tetra_scanner_filters_v1";
+
+    function loadSavedFilters() {
+      try {
+        const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+        if (!raw) {
+          filterNetworkEl.checked = false;
+          filterHeartbeatEl.checked = false;
+          filterSystemEl.checked = true;
+          filterTrionaEl.checked = true;
+          filterControlEl.checked = true;
+          filterRawMacEl.checked = false;
+          autoplayVoiceEl.checked = true;
+          return;
+        }
+        const saved = JSON.parse(raw);
+        if (typeof saved === "object" && saved !== null) {
+          filterNetworkEl.checked = Boolean(saved.network ?? false);
+          filterHeartbeatEl.checked = Boolean(saved.heartbeat ?? false);
+          filterSystemEl.checked = Boolean(saved.system ?? true);
+          filterTrionaEl.checked = Boolean(saved.triona ?? true);
+          filterControlEl.checked = Boolean(saved.control ?? true);
+          filterRawMacEl.checked = Boolean(saved.rawMac ?? false);
+          autoplayVoiceEl.checked = Boolean(saved.autoplayVoice ?? true);
+        }
+      } catch (e) {
+        // Ignore storage errors
+      }
+    }
+
+    function saveFiltersToStorage() {
+      try {
+        const state = {
+          network: filterNetworkEl.checked,
+          heartbeat: filterHeartbeatEl.checked,
+          system: filterSystemEl.checked,
+          triona: filterTrionaEl.checked,
+          control: filterControlEl.checked,
+          rawMac: filterRawMacEl.checked,
+          autoplayVoice: autoplayVoiceEl.checked
+        };
+        localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(state));
+      } catch (e) {
+        // Ignore storage errors
+      }
+    }
+
+    loadSavedFilters();
     const networksContainer = document.getElementById("networks-container");
     const refreshNetworksBtn = document.getElementById("refresh-networks-btn");
     const clearNetworksBtn = document.getElementById("clear-networks-btn");
@@ -590,49 +648,54 @@
     function getCategoryStyle(category) {
       const cat = (category || "OTHER").toUpperCase();
       switch (cat) {
-        case "SDS":
+        case "VOICE":
           return {
-            badge: "bg-blue-950/80 text-blue-300 border-blue-700/70",
-            rowBorder: "border-l-2 border-l-blue-500",
-            text: "text-blue-200"
-          };
-        case "ROAMING":
-          return {
-            badge: "bg-amber-950/80 text-amber-300 border-amber-700/70",
-            rowBorder: "border-l-2 border-l-amber-500",
-            text: "text-amber-200"
+            badge: "bg-emerald-500 text-gray-950 border-emerald-300 font-extrabold shadow-sm",
+            rowBorder: "border-l-4 border-l-emerald-400",
+            text: "text-emerald-100 font-bold",
+            rowBg: "bg-emerald-950/75 hover:bg-emerald-900/70 border-emerald-500/80 shadow-md ring-1 ring-emerald-500/30"
           };
         case "CALL":
           return {
-            badge: "bg-emerald-950/80 text-emerald-300 border-emerald-700/70",
-            rowBorder: "border-l-2 border-l-emerald-500",
-            text: "text-emerald-200"
+            badge: "bg-amber-500 text-gray-950 border-amber-300 font-extrabold shadow-sm",
+            rowBorder: "border-l-4 border-l-amber-400",
+            text: "text-amber-100 font-semibold",
+            rowBg: "bg-amber-950/55 hover:bg-amber-950/75 border-amber-600/75 shadow-sm"
           };
-        case "VOICE":
+        case "SDS":
           return {
-            badge: "bg-emerald-600 text-white border-emerald-400",
-            rowBorder: "border-l-4 border-l-emerald-400",
-            text: "text-emerald-100 font-bold",
-            rowBg: "bg-emerald-950/40 hover:bg-emerald-950/60 border-emerald-700/70 shadow-sm"
+            badge: "bg-cyan-500 text-gray-950 border-cyan-300 font-extrabold shadow-sm",
+            rowBorder: "border-l-4 border-l-cyan-400",
+            text: "text-cyan-100 font-semibold",
+            rowBg: "bg-cyan-950/55 hover:bg-cyan-950/75 border-cyan-600/75 shadow-sm"
+          };
+        case "ROAMING":
+          return {
+            badge: "bg-purple-900/90 text-purple-200 border-purple-500/80",
+            rowBorder: "border-l-4 border-l-purple-400",
+            text: "text-purple-100 font-medium",
+            rowBg: "bg-purple-950/40 hover:bg-purple-950/60 border-purple-800/70"
           };
         case "STATUS":
           return {
-            badge: "bg-purple-950/80 text-purple-300 border-purple-700/70",
-            rowBorder: "border-l-2 border-l-purple-500",
-            text: "text-purple-200"
+            badge: "bg-indigo-900/90 text-indigo-200 border-indigo-500/80",
+            rowBorder: "border-l-4 border-l-indigo-400",
+            text: "text-indigo-100 font-medium",
+            rowBg: "bg-indigo-950/40 hover:bg-indigo-950/60 border-indigo-800/70"
           };
         case "NETWORK":
           return {
-            badge: "bg-cyan-950/80 text-cyan-300 border-cyan-700/70",
-            rowBorder: "border-l-2 border-l-cyan-500",
-            text: "text-cyan-200"
+            badge: "bg-gray-800 text-teal-300 border-teal-800/70",
+            rowBorder: "border-l-2 border-l-teal-600",
+            text: "text-gray-300",
+            rowBg: "bg-gray-900/60 hover:bg-gray-800/60 border-gray-800"
           };
         case "SYSTEM":
           return {
-            badge: "bg-blue-600 text-white border-blue-400",
-            rowBorder: "border-l-4 border-l-cyan-400",
-            text: "text-white font-bold",
-            rowBg: "bg-blue-900/90 hover:bg-blue-800/90 border-blue-600 shadow-sm"
+            badge: "bg-blue-700 text-white border-blue-400",
+            rowBorder: "border-l-4 border-l-blue-400",
+            text: "text-blue-100 font-semibold",
+            rowBg: "bg-blue-950/75 hover:bg-blue-900/75 border-blue-700/80 shadow-sm"
           };
         case "RAW_MAC":
           return {
@@ -669,8 +732,16 @@
       if (category === "RAW_MAC" && !filterRawMacEl.checked) {
         return true;
       }
-      if (!filterSystemEl.checked && category === "SYSTEM") {
+      if (category === "NETWORK" && !filterNetworkEl.checked) {
         return true;
+      }
+      if (category === "SYSTEM") {
+        const isHeartbeat = humanText.includes("[60s CHANNEL CHECK]");
+        if (isHeartbeat) {
+          if (!filterHeartbeatEl.checked) return true;
+        } else {
+          if (!filterSystemEl.checked) return true;
+        }
       }
       if (!filterTrionaEl.checked && humanText.includes("TrionaGateway")) {
         return true;
@@ -686,6 +757,7 @@
     }
 
     function applyFiltersToAllRows() {
+      saveFiltersToStorage();
       const rows = logStream.querySelectorAll(".event-row");
       rows.forEach((row) => {
         if (shouldHideRow(row)) {
@@ -696,10 +768,13 @@
       });
     }
 
+    filterNetworkEl.addEventListener("change", applyFiltersToAllRows);
+    filterHeartbeatEl.addEventListener("change", applyFiltersToAllRows);
     filterTrionaEl.addEventListener("change", applyFiltersToAllRows);
     filterControlEl.addEventListener("change", applyFiltersToAllRows);
     filterSystemEl.addEventListener("change", applyFiltersToAllRows);
     filterRawMacEl.addEventListener("change", applyFiltersToAllRows);
+    autoplayVoiceEl.addEventListener("change", saveFiltersToStorage);
     searchInputEl.addEventListener("input", applyFiltersToAllRows);
 
     clearLogBtn.addEventListener("click", () => {

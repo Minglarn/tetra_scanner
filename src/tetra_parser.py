@@ -96,7 +96,7 @@ def compute_safe_center_hz(freq_hz_list, min_dc_guard_hz=25_000):
     return base_center + 50_000
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.02")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.03")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1838,38 +1838,51 @@ def main():
         usage_list = sorted(state["usage_markers"])[:12]
         neighbours_list = list(state["neighbours"].values())
 
-        sig = (
+        nb_freqs_tuple = tuple(
+            sorted(
+                str(nb.get("freq_mhz") or "")
+                for nb in neighbours_list
+                if nb.get("freq_mhz")
+            )
+        )
+        # Signature for LIVE STREAM / SQLite logging: excludes transient slots, usage markers, and cell load
+        log_sig = (
             state["role"],
             state["mcc"],
             state["mnc"],
             state["la"],
+            state["encryption_mode"],
+            nb_freqs_tuple,
+        )
+        # Full state signature for silent background updates to discovered_networks.jsonl
+        full_sig = (
+            log_sig,
             state["cell_id"],
             state["cell_load"],
-            state["encryption_mode"],
-            state["fast_reselect_threshold"],
-            state["fast_reselect_hysteresis"],
             tuple(active_slots),
             tuple(usage_list[:6]),
-            tuple(
-                (
-                    nb.get("freq_mhz"),
-                    nb.get("la"),
-                    nb.get("cell_id"),
-                    nb.get("synchronized"),
-                )
-                for nb in neighbours_list
-            ),
         )
 
-        sig_changed = sig != state.get("last_sig")
-        cooldown_key = f"LOG_{freq_str}_{state.get('la')}_{len(neighbours_list)}"
+        full_sig_changed = full_sig != state.get("last_sig")
+        cooldown_key = f"LOG_{freq_str}"
         last_log = seen_networks.get(cooldown_key, 0.0)
-        need_log = bool(emit_log_event and (sig_changed or (now_ts - last_log) >= 300.0))
-        if not sig_changed and not need_log and (now_ts - state.get("last_emit_ts", 0.0)) < 15.0:
+        prev_nb_freqs = state.setdefault("logged_nb_freqs", set())
+        has_new_neighbour = bool(set(nb_freqs_tuple) - prev_nb_freqs)
+
+        need_log = False
+        if emit_log_event and state.get("role") == "ACTIVE CELL":
+            if last_log == 0.0 or (now_ts - last_log) >= 300.0:
+                need_log = True
+            elif has_new_neighbour and (now_ts - last_log) >= 15.0:
+                need_log = True
+
+        if not need_log and (not full_sig_changed or (now_ts - state.get("last_emit_ts", 0.0)) < 30.0):
             return
 
-        state["last_sig"] = sig
+        state["last_sig"] = full_sig
         state["last_emit_ts"] = now_ts
+        if need_log:
+            prev_nb_freqs.update(nb_freqs_tuple)
 
         net_id = f"NET_{freq_str}"
         seen_networks[net_id] = now_ts
@@ -2014,10 +2027,12 @@ def main():
             get_ci(pkt, ["la", "location area", "cell la"])
         )
         pkt_colour = to_int(get_ci(pkt, ["colour code", "color code", "cc"]))
-        pkt_cell_id = to_int(
-            get_ci(pkt, ["cell identifier ca", "cell identifier", "cell_id"])
+        pkt_cell_id = (
+            to_int(get_ci(pkt, ["serving cell identifier", "cell_id"]))
+            if pdu != "D-NWRK-BROADCAST"
+            else None
         )
-        pkt_cell_load = to_int(get_ci(pkt, ["cell load ca", "cell_load"]))
+        pkt_cell_load = to_int(get_ci(pkt, ["serving cell load", "cell_load"]))
         pkt_fast_thr = to_int(
             get_ci(pkt, ["fast_reselect_threshold", "fast reselect threshold"])
         )
