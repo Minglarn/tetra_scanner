@@ -19,13 +19,19 @@ _pkt_buffer = {}  # (freq_mhz, hour_bucket) -> {"la": la, "total": int, "raw_mac
 _last_pkt_flush_ts = 0.0
 
 
-def get_connection():
+def get_connection(read_only=False):
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     conn = sqlite3.connect(DB_FILE, timeout=15.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA busy_timeout=15000;")
+    if read_only:
+        conn.execute("PRAGMA query_only=ON;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+    else:
+        if not _initialized:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
     return conn
 
 
@@ -610,7 +616,7 @@ def query_history(
     safe_offset = max(0, int(offset or 0))
 
     try:
-        conn = get_connection()
+        conn = get_connection(read_only=True)
         try:
             cnt_row = conn.execute(
                 f"SELECT COUNT(1) AS total FROM events {where_sql}", params
@@ -651,7 +657,7 @@ def get_analytics_summary(hours=24):
     cutoff_bucket = _hour_bucket_from_ts(cutoff_ts)
 
     try:
-        conn = get_connection()
+        conn = get_connection(read_only=True)
         try:
             # 1. Totals by category from events
             cat_rows = conn.execute(

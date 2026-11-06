@@ -18,7 +18,7 @@ if _SRC_DIR not in sys.path:
 import db
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.03")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.04")
 LOG_DIR = os.environ.get("LOG_DIR", "/app/logs")
 AUDIO_DIR = os.environ.get("AUDIO_DIR", os.path.join(LOG_DIR, "audio"))
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -75,20 +75,55 @@ def get_default_config():
     }
 
 
+def _read_json_file_sync(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+            if not content.strip():
+                return default
+            data = json.loads(content)
+            return data if isinstance(data, type(default)) else default
+    except Exception:
+        return default
+
+
+def _write_json_file_sync(path: str, data):
+    os.makedirs(os.path.dirname(path) or LOG_DIR, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def _touch_flag_sync(path: str):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _append_event_sync(sys_event: dict):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(EVENTS_FILE, "a", encoding="utf-8") as ef:
+            ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
+            ef.flush()
+    except Exception:
+        pass
+    try:
+        db.record_event(sys_event)
+    except Exception:
+        pass
+
+
 async def read_runtime_config():
     cfg = get_default_config()
-    if os.path.exists(RUNTIME_CONFIG_FILE):
-        try:
-            async with aiofiles.open(
-                RUNTIME_CONFIG_FILE, mode="r", encoding="utf-8", errors="replace"
-            ) as f:
-                content = await f.read()
-                if content.strip():
-                    saved = json.loads(content)
-                    if isinstance(saved, dict):
-                        cfg.update(saved)
-        except Exception:
-            pass
+    saved = _read_json_file_sync(RUNTIME_CONFIG_FILE, {})
+    if isinstance(saved, dict) and saved:
+        cfg.update(saved)
     return cfg
 
 
@@ -240,11 +275,7 @@ async def update_config(request: Request):
             status_code=400,
         )
 
-    os.makedirs(LOG_DIR, exist_ok=True)
-    tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
-    async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-        await f.write(json.dumps(new_cfg, indent=2, sort_keys=True))
-    os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+    _write_json_file_sync(RUNTIME_CONFIG_FILE, new_cfg)
 
     hard_keys = (
         "RTL_DEVICE_INDEX",
@@ -267,38 +298,29 @@ async def update_config(request: Request):
     )
 
     flag_to_touch = RELOAD_CONFIG_FLAG if needs_pipeline_restart else SOFT_CONFIG_FLAG
-    try:
-        async with aiofiles.open(flag_to_touch, mode="w", encoding="utf-8") as f:
-            await f.write(str(time.time()))
-    except Exception:
-        pass
+    _touch_flag_sync(flag_to_touch)
 
-    try:
-        iso_ts = datetime.now(timezone.utc).isoformat()
-        action_str = (
-            "restarting radio/sweep pipeline"
-            if needs_pipeline_restart
-            else "applied live in memory"
-        )
-        sys_event = {
-            "time": iso_ts,
-            "timestamp": iso_ts,
-            "category": "SYSTEM",
-            "freq_mhz": "SYS",
-            "human_text": (
-                f"Settings updated ({action_str}): Mode={new_cfg['MODE']}, "
-                f"Center={new_cfg.get('CENTER_FREQ', 0) / 1e6:.4f} MHz, "
-                f"Channels={new_cfg.get('TETRA_CHANNELS', '')}, "
-                f"Band={new_cfg['SCAN_START_MHZ']}-{new_cfg['SCAN_END_MHZ']} MHz, "
-                f"Gain={new_cfg['RTL_GAIN']} dB, IdleTimeout={new_cfg['IDLE_TIMEOUT_SEC']}s, "
-                f"Strikes={new_cfg['BLACKLIST_STRIKES']}."
-            ),
-        }
-        async with aiofiles.open(EVENTS_FILE, mode="a", encoding="utf-8") as ef:
-            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
-            await ef.flush()
-    except Exception:
-        pass
+    iso_ts = datetime.now(timezone.utc).isoformat()
+    action_str = (
+        "restarting radio/sweep pipeline"
+        if needs_pipeline_restart
+        else "applied live in memory"
+    )
+    sys_event = {
+        "time": iso_ts,
+        "timestamp": iso_ts,
+        "category": "SYSTEM",
+        "freq_mhz": "SYS",
+        "human_text": (
+            f"Settings updated ({action_str}): Mode={new_cfg['MODE']}, "
+            f"Center={new_cfg.get('CENTER_FREQ', 0) / 1e6:.4f} MHz, "
+            f"Channels={new_cfg.get('TETRA_CHANNELS', '')}, "
+            f"Band={new_cfg['SCAN_START_MHZ']}-{new_cfg['SCAN_END_MHZ']} MHz, "
+            f"Gain={new_cfg['RTL_GAIN']} dB, IdleTimeout={new_cfg['IDLE_TIMEOUT_SEC']}s, "
+            f"Strikes={new_cfg['BLACKLIST_STRIKES']}."
+        ),
+    }
+    _append_event_sync(sys_event)
 
     return {
         "ok": True,
@@ -315,35 +337,21 @@ async def stop_and_release_sdr():
     new_cfg = dict(old_cfg)
     new_cfg["MODE"] = "stopped"
 
-    os.makedirs(LOG_DIR, exist_ok=True)
-    tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
-    async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-        await f.write(json.dumps(new_cfg, indent=2, sort_keys=True))
-    os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+    _write_json_file_sync(RUNTIME_CONFIG_FILE, new_cfg)
+    _touch_flag_sync(RELOAD_CONFIG_FLAG)
 
-    try:
-        async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as f:
-            await f.write(str(time.time()))
-    except Exception:
-        pass
-
-    try:
-        iso_ts = datetime.now(timezone.utc).isoformat()
-        sys_event = {
-            "time": iso_ts,
-            "timestamp": iso_ts,
-            "category": "SYSTEM",
-            "freq_mhz": "SYS",
-            "human_text": (
-                f"Stop requested: Stopping radio pipeline and releasing RTL-SDR device "
-                f"#{new_cfg.get('RTL_DEVICE_INDEX', 0)}."
-            ),
-        }
-        async with aiofiles.open(EVENTS_FILE, mode="a", encoding="utf-8") as ef:
-            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
-            await ef.flush()
-    except Exception:
-        pass
+    iso_ts = datetime.now(timezone.utc).isoformat()
+    sys_event = {
+        "time": iso_ts,
+        "timestamp": iso_ts,
+        "category": "SYSTEM",
+        "freq_mhz": "SYS",
+        "human_text": (
+            f"Stop requested: Stopping radio pipeline and releasing RTL-SDR device "
+            f"#{new_cfg.get('RTL_DEVICE_INDEX', 0)}."
+        ),
+    }
+    _append_event_sync(sys_event)
 
     return {
         "ok": True,
@@ -359,38 +367,41 @@ async def trigger_force_sweep():
     cfg = await read_runtime_config()
     if cfg.get("MODE") == "stopped":
         cfg["MODE"] = "scanner"
-        os.makedirs(LOG_DIR, exist_ok=True)
-        tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
-        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-            await f.write(json.dumps(cfg, indent=2, sort_keys=True))
-        os.replace(tmp_path, RUNTIME_CONFIG_FILE)
-        try:
-            async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as f:
-                await f.write(str(time.time()))
-        except Exception:
-            pass
-    try:
-        async with aiofiles.open(FORCE_SWEEP_FLAG, mode="w", encoding="utf-8") as f:
-            await f.write(str(time.time()))
-    except Exception:
-        pass
+        _write_json_file_sync(RUNTIME_CONFIG_FILE, cfg)
+        _touch_flag_sync(RELOAD_CONFIG_FLAG)
+    _touch_flag_sync(FORCE_SWEEP_FLAG)
     return {"status": "ok", "message": "Force sweep triggered", "config": cfg}
 
 
-@app.get("/api/networks", response_class=JSONResponse)
-async def get_networks():
+_NETWORKS_CACHE = {"mtime_ns": 0, "size": 0, "data": []}
+
+
+def _load_and_compact_networks_sync():
     if not os.path.exists(NETWORKS_FILE):
+        _NETWORKS_CACHE["mtime_ns"] = 0
+        _NETWORKS_CACHE["size"] = 0
+        _NETWORKS_CACHE["data"] = []
         return []
 
-    networks_by_freq = {}
     try:
-        async with aiofiles.open(
-            NETWORKS_FILE, mode="r", encoding="utf-8", errors="replace"
-        ) as f:
-            async for line in f:
+        st = os.stat(NETWORKS_FILE)
+        if (
+            st.st_mtime_ns == _NETWORKS_CACHE["mtime_ns"]
+            and st.st_size == _NETWORKS_CACHE["size"]
+        ):
+            return list(_NETWORKS_CACHE["data"])
+    except OSError:
+        return list(_NETWORKS_CACHE["data"])
+
+    networks_by_freq = {}
+    line_count = 0
+    try:
+        with open(NETWORKS_FILE, mode="r", encoding="utf-8", errors="replace") as f:
+            for line in f:
                 raw = line.strip()
                 if not raw:
                     continue
+                line_count += 1
                 try:
                     item = json.loads(raw)
                 except json.JSONDecodeError:
@@ -411,7 +422,7 @@ async def get_networks():
                     if prev_role == "ACTIVE CELL":
                         existing["role"] = "ACTIVE CELL"
     except Exception:
-        return []
+        return list(_NETWORKS_CACHE["data"])
 
     result = [
         net
@@ -431,17 +442,40 @@ async def get_networks():
         ),
         reverse=True,
     )
-    return result
+
+    if line_count > max(100, len(result) * 4):
+        try:
+            tmp_path = f"{NETWORKS_FILE}.compact.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as wf:
+                for net in reversed(result):
+                    wf.write(json.dumps(net, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, NETWORKS_FILE)
+            st = os.stat(NETWORKS_FILE)
+        except Exception:
+            pass
+
+    _NETWORKS_CACHE["mtime_ns"] = st.st_mtime_ns
+    _NETWORKS_CACHE["size"] = st.st_size
+    _NETWORKS_CACHE["data"] = result
+    return list(result)
+
+
+@app.get("/api/networks", response_class=JSONResponse)
+async def get_networks():
+    return await asyncio.to_thread(_load_and_compact_networks_sync)
 
 
 @app.delete("/api/networks", response_class=JSONResponse)
 async def clear_networks():
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        tmp_path = f"{NETWORKS_FILE}.tmp"
-        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-            await f.write("")
+        tmp_path = f"{NETWORKS_FILE}.tmp.{os.getpid()}"
+        with open(tmp_path, mode="w", encoding="utf-8") as f:
+            f.write("")
         os.replace(tmp_path, NETWORKS_FILE)
+        _NETWORKS_CACHE["mtime_ns"] = 0
+        _NETWORKS_CACHE["size"] = 0
+        _NETWORKS_CACHE["data"] = []
     except Exception:
         pass
     return {"status": "ok", "cleared": True}
@@ -449,20 +483,8 @@ async def clear_networks():
 
 @app.get("/api/blacklist", response_class=JSONResponse)
 async def get_blacklist():
-    if not os.path.exists(BLACKLIST_FILE):
-        return {}
-
-    try:
-        async with aiofiles.open(
-            BLACKLIST_FILE, mode="r", encoding="utf-8", errors="replace"
-        ) as f:
-            content = await f.read()
-            if not content.strip():
-                return {}
-            data = json.loads(content)
-            if not isinstance(data, dict):
-                return {}
-    except Exception:
+    data = _read_json_file_sync(BLACKLIST_FILE, {})
+    if not data:
         return {}
 
     now_ts = time.time()
@@ -494,41 +516,20 @@ async def get_blacklist():
 
 @app.delete("/api/blacklist/{freq_hz}", response_class=JSONResponse)
 async def remove_from_blacklist(freq_hz: str):
-    if not os.path.exists(BLACKLIST_FILE):
-        return {"status": "ok", "removed": freq_hz}
-
-    try:
-        async with aiofiles.open(
-            BLACKLIST_FILE, mode="r", encoding="utf-8", errors="replace"
-        ) as f:
-            content = await f.read()
-            data = json.loads(content) if content.strip() else {}
-            if not isinstance(data, dict):
-                data = {}
-    except Exception:
-        data = {}
-
+    data = _read_json_file_sync(BLACKLIST_FILE, {})
     if freq_hz in data:
         del data[freq_hz]
-        tmp_path = f"{BLACKLIST_FILE}.tmp"
         try:
-            async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, indent=2, sort_keys=True))
-            os.replace(tmp_path, BLACKLIST_FILE)
+            _write_json_file_sync(BLACKLIST_FILE, data)
         except Exception:
             pass
-
     return {"status": "ok", "removed": freq_hz}
 
 
 @app.delete("/api/blacklist", response_class=JSONResponse)
 async def clear_blacklist():
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        tmp_path = f"{BLACKLIST_FILE}.tmp"
-        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-            await f.write("{}\n")
-        os.replace(tmp_path, BLACKLIST_FILE)
+        _write_json_file_sync(BLACKLIST_FILE, {})
     except Exception:
         pass
     return {"status": "ok", "cleared": True}
@@ -536,20 +537,8 @@ async def clear_blacklist():
 
 @app.get("/api/whitelist", response_class=JSONResponse)
 async def get_whitelist():
-    if not os.path.exists(WHITELIST_FILE):
-        return []
-
-    try:
-        async with aiofiles.open(
-            WHITELIST_FILE, mode="r", encoding="utf-8", errors="replace"
-        ) as f:
-            content = await f.read()
-            if not content.strip():
-                return []
-            data = json.loads(content)
-            if not isinstance(data, dict):
-                return []
-    except Exception:
+    data = _read_json_file_sync(WHITELIST_FILE, {})
+    if not data:
         return []
 
     valid_wl_categories = {
@@ -573,41 +562,20 @@ async def get_whitelist():
 
 @app.delete("/api/whitelist/{freq_hz}", response_class=JSONResponse)
 async def remove_from_whitelist(freq_hz: str):
-    if not os.path.exists(WHITELIST_FILE):
-        return {"status": "ok", "removed": freq_hz}
-
-    try:
-        async with aiofiles.open(
-            WHITELIST_FILE, mode="r", encoding="utf-8", errors="replace"
-        ) as f:
-            content = await f.read()
-            data = json.loads(content) if content.strip() else {}
-            if not isinstance(data, dict):
-                data = {}
-    except Exception:
-        data = {}
-
+    data = _read_json_file_sync(WHITELIST_FILE, {})
     if freq_hz in data:
         del data[freq_hz]
-        tmp_path = f"{WHITELIST_FILE}.tmp"
         try:
-            async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, indent=2, sort_keys=True))
-            os.replace(tmp_path, WHITELIST_FILE)
+            _write_json_file_sync(WHITELIST_FILE, data)
         except Exception:
             pass
-
     return {"status": "ok", "removed": freq_hz}
 
 
 @app.delete("/api/whitelist", response_class=JSONResponse)
 async def clear_whitelist():
     try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        tmp_path = f"{WHITELIST_FILE}.tmp"
-        async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-            await f.write("{}\n")
-        os.replace(tmp_path, WHITELIST_FILE)
+        _write_json_file_sync(WHITELIST_FILE, {})
     except Exception:
         pass
     return {"status": "ok", "cleared": True}
@@ -618,22 +586,19 @@ async def reset_all_discovery():
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
         for jf in (WHITELIST_FILE, BLACKLIST_FILE):
-            tmp_p = f"{jf}.tmp"
-            async with aiofiles.open(tmp_p, mode="w", encoding="utf-8") as f:
-                await f.write("{}\n")
-            os.replace(tmp_p, jf)
+            _write_json_file_sync(jf, {})
 
-        tmp_net = f"{NETWORKS_FILE}.tmp"
-        async with aiofiles.open(tmp_net, mode="w", encoding="utf-8") as f:
-            await f.write("")
+        tmp_net = f"{NETWORKS_FILE}.tmp.{os.getpid()}"
+        with open(tmp_net, mode="w", encoding="utf-8") as f:
+            f.write("")
         os.replace(tmp_net, NETWORKS_FILE)
+        _NETWORKS_CACHE["mtime_ns"] = 0
+        _NETWORKS_CACHE["size"] = 0
+        _NETWORKS_CACHE["data"] = []
 
         cfg = await read_runtime_config()
         cfg["MODE"] = "scanner"
-        tmp_cfg = f"{RUNTIME_CONFIG_FILE}.tmp"
-        async with aiofiles.open(tmp_cfg, mode="w", encoding="utf-8") as f:
-            await f.write(json.dumps(cfg, indent=2, sort_keys=True))
-        os.replace(tmp_cfg, RUNTIME_CONFIG_FILE)
+        _write_json_file_sync(RUNTIME_CONFIG_FILE, cfg)
 
         iso_ts = datetime.now(timezone.utc).isoformat()
         sys_event = {
@@ -643,18 +608,21 @@ async def reset_all_discovery():
             "freq_mhz": "SYS",
             "human_text": "Factory discovery reset executed: Cleared whitelist, blacklist, and discovered networks. Restarting in Auto-Scanner mode.",
         }
-        tmp_ev = f"{EVENTS_FILE}.tmp"
-        async with aiofiles.open(tmp_ev, mode="w", encoding="utf-8") as ef:
-            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
+        tmp_ev = f"{EVENTS_FILE}.tmp.{os.getpid()}"
+        with open(tmp_ev, mode="w", encoding="utf-8") as ef:
+            ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
         os.replace(tmp_ev, EVENTS_FILE)
+        try:
+            db.record_event(sys_event)
+        except Exception:
+            pass
 
         if os.path.exists(FORCE_SWEEP_FLAG):
             try:
                 os.remove(FORCE_SWEEP_FLAG)
             except Exception:
                 pass
-        async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as ff:
-            await ff.write(str(time.time()))
+        _touch_flag_sync(RELOAD_CONFIG_FLAG)
     except Exception as exc:
         return JSONResponse(
             {"status": "error", "message": f"Reset failed: {exc}"}, status_code=500
@@ -720,36 +688,22 @@ async def lock_to_whitelist(request: Request):
     cfg["CENTER_FREQ"] = center_hz
     cfg["TETRA_CHANNELS"] = channels_str
 
-    os.makedirs(LOG_DIR, exist_ok=True)
-    tmp_path = f"{RUNTIME_CONFIG_FILE}.tmp"
-    async with aiofiles.open(tmp_path, mode="w", encoding="utf-8") as f:
-        await f.write(json.dumps(cfg, indent=2, sort_keys=True))
-    os.replace(tmp_path, RUNTIME_CONFIG_FILE)
+    _write_json_file_sync(RUNTIME_CONFIG_FILE, cfg)
+    _touch_flag_sync(RELOAD_CONFIG_FLAG)
 
-    try:
-        async with aiofiles.open(RELOAD_CONFIG_FLAG, mode="w", encoding="utf-8") as f:
-            await f.write(str(time.time()))
-    except Exception:
-        pass
-
-    try:
-        iso_ts = datetime.now(timezone.utc).isoformat()
-        freqs_mhz = ", ".join(f"{hz / 1e6:.4f} MHz" for hz in freq_hz_list)
-        sys_event = {
-            "time": iso_ts,
-            "timestamp": iso_ts,
-            "category": "SYSTEM",
-            "freq_mhz": "SYS",
-            "human_text": (
-                f"Locked receiver to {len(freq_hz_list)} whitelisted channels in STATIC mode "
-                f"(Center {center_hz / 1e6:.4f} MHz): {freqs_mhz}"
-            ),
-        }
-        async with aiofiles.open(EVENTS_FILE, mode="a", encoding="utf-8") as ef:
-            await ef.write(json.dumps(sys_event, ensure_ascii=False) + "\n")
-            await ef.flush()
-    except Exception:
-        pass
+    iso_ts = datetime.now(timezone.utc).isoformat()
+    freqs_mhz = ", ".join(f"{hz / 1e6:.4f} MHz" for hz in freq_hz_list)
+    sys_event = {
+        "time": iso_ts,
+        "timestamp": iso_ts,
+        "category": "SYSTEM",
+        "freq_mhz": "SYS",
+        "human_text": (
+            f"Locked receiver to {len(freq_hz_list)} whitelisted channels in STATIC mode "
+            f"(Center {center_hz / 1e6:.4f} MHz): {freqs_mhz}"
+        ),
+    }
+    _append_event_sync(sys_event)
 
     return {
         "ok": True,
@@ -850,36 +804,82 @@ def get_sdr_devices(refresh: int = 0):
     return {"count": len(devices), "devices": devices}
 
 
-async def read_recent_lines(filepath: str, max_lines: int = 150):
+def _read_recent_lines_sync(filepath: str, max_lines: int = 100):
     if not os.path.exists(filepath):
-        return []
+        return [], 0
     payload_buf = deque(maxlen=max_lines)
     system_buf = deque(maxlen=25)
+    file_size = 0
     try:
         file_size = os.path.getsize(filepath)
-        seek_pos = max(0, file_size - 20 * 1024 * 1024)
-        idx = 0
-        async with aiofiles.open(
-            filepath, mode="r", encoding="utf-8", errors="replace"
-        ) as f:
+        if file_size > 15 * 1024 * 1024:
+            try:
+                with open(filepath, "rb") as rf:
+                    rf.seek(max(0, file_size - 5 * 1024 * 1024))
+                    rf.readline()
+                    tail_bytes = rf.read()
+                tmp_ev = f"{filepath}.trim.{os.getpid()}"
+                with open(tmp_ev, "wb") as wf:
+                    wf.write(tail_bytes)
+                os.replace(tmp_ev, filepath)
+                file_size = os.path.getsize(filepath)
+            except Exception:
+                pass
+
+        seek_pos = max(0, file_size - 256 * 1024)
+        with open(filepath, "rb") as f:
             if seek_pos > 0:
-                await f.seek(seek_pos)
-                await f.readline()
-            async for line in f:
-                s = line.strip()
-                if not s:
-                    continue
-                if '"category": "RAW_MAC"' in s or '"category":"RAW_MAC"' in s:
-                    continue
-                idx += 1
-                if '"category": "SYSTEM"' in s or '"category":"SYSTEM"' in s:
-                    system_buf.append((idx, s))
-                else:
-                    payload_buf.append((idx, s))
+                f.seek(seek_pos)
+                f.readline()
+            chunk = f.read().decode("utf-8", errors="replace")
+            end_pos = f.tell()
+
+        idx = 0
+        for line in chunk.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if '"category": "RAW_MAC"' in s or '"category":"RAW_MAC"' in s:
+                continue
+            idx += 1
+            if '"category": "SYSTEM"' in s or '"category":"SYSTEM"' in s:
+                system_buf.append((idx, s))
+            else:
+                payload_buf.append((idx, s))
     except Exception:
-        return []
+        return [], file_size
     merged = sorted(list(payload_buf) + list(system_buf), key=lambda item: item[0])
-    return [line_str for _, line_str in merged]
+    return [line_str for _, line_str in merged], end_pos
+
+
+def _read_tail_chunk_sync(filepath: str, file_pos: int):
+    if not os.path.exists(filepath):
+        return [], 0
+    try:
+        current_size = os.path.getsize(filepath)
+        if current_size < file_pos:
+            file_pos = max(0, current_size - 128 * 1024)
+        if current_size <= file_pos:
+            return [], current_size
+        if (current_size - file_pos) > 256 * 1024:
+            file_pos = current_size - 256 * 1024
+        with open(filepath, "rb") as f:
+            f.seek(file_pos)
+            raw_bytes = f.read()
+            new_pos = f.tell()
+        lines = []
+        for line in raw_bytes.decode("utf-8", errors="replace").splitlines():
+            clean = line.strip()
+            if clean and '"category": "RAW_MAC"' not in clean and '"category":"RAW_MAC"' not in clean:
+                lines.append(clean)
+        return lines, new_pos
+    except Exception:
+        return [], file_pos
+
+
+async def read_recent_lines(filepath: str, max_lines: int = 100):
+    lines, _ = await asyncio.to_thread(_read_recent_lines_sync, filepath, max_lines)
+    return lines
 
 
 @app.websocket("/ws/events")
@@ -889,13 +889,11 @@ async def websocket_events(websocket: WebSocket):
 
     try:
         if os.path.exists(EVENTS_FILE):
-            recent = await read_recent_lines(EVENTS_FILE, max_lines=100)
+            recent, file_pos = await asyncio.to_thread(
+                _read_recent_lines_sync, EVENTS_FILE, 100
+            )
             for line in recent:
                 await websocket.send_text(line)
-            try:
-                file_pos = os.path.getsize(EVENTS_FILE)
-            except OSError:
-                file_pos = 0
 
         while True:
             if not os.path.exists(EVENTS_FILE):
@@ -903,31 +901,9 @@ async def websocket_events(websocket: WebSocket):
                 await asyncio.sleep(0.5)
                 continue
 
-            try:
-                current_size = os.path.getsize(EVENTS_FILE)
-            except OSError:
-                await asyncio.sleep(0.5)
-                continue
-
-            if current_size < file_pos:
-                file_pos = 0
-
-            if current_size > file_pos:
-                try:
-                    async with aiofiles.open(
-                        EVENTS_FILE, mode="r", encoding="utf-8", errors="replace"
-                    ) as f:
-                        await f.seek(file_pos)
-                        while True:
-                            line = await f.readline()
-                            if not line:
-                                break
-                            clean = line.strip()
-                            if clean:
-                                await websocket.send_text(clean)
-                        file_pos = await f.tell()
-                except OSError:
-                    pass
+            new_lines, file_pos = _read_tail_chunk_sync(EVENTS_FILE, file_pos)
+            for clean in new_lines:
+                await websocket.send_text(clean)
 
             await asyncio.sleep(0.25)
     except WebSocketDisconnect:

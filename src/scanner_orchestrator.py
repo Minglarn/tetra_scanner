@@ -329,13 +329,15 @@ def load_whitelist():
 def migrate_discovered_networks_and_blacklist():
     if os.path.exists(DISCOVERED_NETWORKS_FILE):
         try:
-            out_lines = []
+            merged_by_freq = {}
+            total_lines = 0
             changed = False
             with open(DISCOVERED_NETWORKS_FILE, "r", encoding="utf-8", errors="replace") as nf:
                 for raw_line in nf:
                     s_line = raw_line.strip()
                     if not s_line:
                         continue
+                    total_lines += 1
                     try:
                         n_obj = json.loads(s_line)
                     except Exception:
@@ -377,14 +379,31 @@ def migrate_discovered_networks_and_blacklist():
                                 if isinstance(n_obj.get("human_text"), str) and old_nb_mhz:
                                     n_obj["human_text"] = n_obj["human_text"].replace(old_nb_mhz, new_nb_mhz)
                                 changed = True
-                    out_lines.append(json.dumps(n_obj, ensure_ascii=False))
+                    key = n_obj.get("freq_mhz") or n_obj.get("network_id")
+                    if not key:
+                        continue
+                    existing = merged_by_freq.get(key)
+                    if existing is None:
+                        merged_by_freq[key] = dict(n_obj)
+                    else:
+                        prev_role = existing.get("role")
+                        for k_f, v_f in n_obj.items():
+                            if v_f is not None and v_f != [] and v_f != {}:
+                                existing[k_f] = v_f
+                        if prev_role == "ACTIVE CELL":
+                            existing["role"] = "ACTIVE CELL"
+            if total_lines > len(merged_by_freq):
+                changed = True
             if changed:
                 tmp_nf = f"{DISCOVERED_NETWORKS_FILE}.tmp"
                 with open(tmp_nf, "w", encoding="utf-8") as wf:
-                    for ol in out_lines:
-                        wf.write(ol + "\n")
+                    for net_item in merged_by_freq.values():
+                        wf.write(json.dumps(net_item, ensure_ascii=False) + "\n")
                 os.replace(tmp_nf, DISCOVERED_NETWORKS_FILE)
-                print("[scanner] Migrated Rakel entries (+12.5 kHz offset) in discovered_networks.jsonl", flush=True)
+                print(
+                    f"[scanner] Compacted and migrated discovered_networks.jsonl ({total_lines} -> {len(merged_by_freq)} records)",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"[scanner] Warning migrating {DISCOVERED_NETWORKS_FILE}: {exc}", flush=True)
 

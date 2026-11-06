@@ -96,7 +96,7 @@ def compute_safe_center_hz(freq_hz_list, min_dc_guard_hz=25_000):
     return base_center + 50_000
 
 
-APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.03")
+APP_VERSION = os.environ.get("APP_VERSION", "2026.11.06.04")
 
 TETRA_CHANNELS_STR = os.environ.get(
     "TETRA_CHANNELS",
@@ -1271,7 +1271,17 @@ def main():
                 if has_control:
                     if f_hz_val > 0:
                         verified_net_hz.add(str(f_hz_val))
-                    last_obj = recs[-1][1]
+                    merged_obj = {}
+                    for _, r_obj in recs:
+                        prev_role = merged_obj.get("role")
+                        for k_fld, v_fld in r_obj.items():
+                            if v_fld is not None and v_fld != [] and v_fld != {}:
+                                merged_obj[k_fld] = v_fld
+                        if prev_role == "ACTIVE CELL":
+                            merged_obj["role"] = "ACTIVE CELL"
+                    if len(recs) > 1:
+                        pruned_any_net = True
+                    last_obj = merged_obj
                     channel_net_cache[f_mhz] = {
                         "freq_mhz": f_mhz,
                         "freq_hz": f_hz_val,
@@ -1307,8 +1317,7 @@ def main():
                         "last_sig": None,
                         "control_verified": False,
                     }
-                    for s_line, _ in recs:
-                        kept_lines.append(s_line)
+                    kept_lines.append(json.dumps(last_obj, ensure_ascii=False))
                 else:
                     pruned_any_net = True
                     if f_hz_val > 0:

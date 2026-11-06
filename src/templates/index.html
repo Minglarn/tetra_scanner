@@ -161,7 +161,7 @@
           </div>
         </div>
 
-        <form id="settings-form" class="p-4 space-y-4 text-xs flex-1 overflow-y-auto">
+        <form id="settings-form" novalidate class="p-4 space-y-4 text-xs flex-1 overflow-y-auto">
 
           <!-- RTL-SDR Configuration -->
           <div class="space-y-2.5">
@@ -176,7 +176,7 @@
               </div>
               <div>
                 <label class="block text-gray-400 mb-1" for="cfg-rtl-gain">Gain (dB)</label>
-                <input id="cfg-rtl-gain" type="number" step="0.1" class="w-full bg-gray-950 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 focus:outline-none focus:border-emerald-500" />
+                <input id="cfg-rtl-gain" type="number" step="any" class="w-full bg-gray-950 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 focus:outline-none focus:border-emerald-500" />
               </div>
               <div>
                 <label class="block text-gray-400 mb-1" for="cfg-rtl-ppm">PPM</label>
@@ -210,11 +210,11 @@
             <div class="grid grid-cols-2 gap-2">
               <div>
                 <label class="block text-gray-400 mb-1" for="cfg-scan-start">Scan Start (MHz)</label>
-                <input id="cfg-scan-start" type="number" step="0.1" class="w-full bg-gray-950 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 focus:outline-none focus:border-emerald-500" />
+                <input id="cfg-scan-start" type="number" step="any" class="w-full bg-gray-950 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 focus:outline-none focus:border-emerald-500" />
               </div>
               <div>
                 <label class="block text-gray-400 mb-1" for="cfg-scan-end">Scan End (MHz)</label>
-                <input id="cfg-scan-end" type="number" step="0.1" class="w-full bg-gray-950 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 focus:outline-none focus:border-emerald-500" />
+                <input id="cfg-scan-end" type="number" step="any" class="w-full bg-gray-950 border border-gray-700 rounded px-2.5 py-1.5 text-gray-100 focus:outline-none focus:border-emerald-500" />
               </div>
             </div>
 
@@ -277,7 +277,7 @@
           </div>
 
           <div class="pt-2 space-y-2">
-            <button type="submit" class="w-full py-2 px-3 bg-emerald-700 hover:bg-emerald-600 text-white font-bold uppercase tracking-wider rounded border border-emerald-500 transition">
+            <button id="save-settings-btn" type="submit" class="w-full py-2 px-3 bg-emerald-700 hover:bg-emerald-600 text-white font-bold uppercase tracking-wider rounded border border-emerald-500 transition">
               Save &amp; Apply Live
             </button>
             <button id="reset-all-btn" type="button" class="w-full py-1.5 px-3 bg-red-950/80 hover:bg-red-900 text-red-200 font-bold uppercase tracking-wider rounded border border-red-800/80 transition text-[11px]">
@@ -886,7 +886,11 @@
       }
     }
 
+    let isLoadingNetworks = false;
+
     async function loadNetworks() {
+      if (isLoadingNetworks) return;
+      isLoadingNetworks = true;
       try {
         const res = await fetch("/api/networks");
         if (!res.ok) return;
@@ -1031,6 +1035,8 @@
         });
       } catch (e) {
         // Ignore transient network errors
+      } finally {
+        isLoadingNetworks = false;
       }
     }
 
@@ -1056,7 +1062,11 @@
       }
     }
 
+    let isLoadingBlacklist = false;
+
     async function fetchBlacklist() {
+      if (isLoadingBlacklist) return;
+      isLoadingBlacklist = true;
       try {
         const res = await fetch("/api/blacklist");
         if (!res.ok) return;
@@ -1135,6 +1145,8 @@
         });
       } catch (e) {
         // Ignore transient network errors
+      } finally {
+        isLoadingBlacklist = false;
       }
     }
 
@@ -1178,7 +1190,11 @@
       }
     }
 
+    let isLoadingWhitelist = false;
+
     async function fetchWhitelist() {
+      if (isLoadingWhitelist) return;
+      isLoadingWhitelist = true;
       try {
         const res = await fetch("/api/whitelist");
         if (!res.ok) return;
@@ -1253,6 +1269,8 @@
         });
       } catch (e) {
         // Ignore transient network errors
+      } finally {
+        isLoadingWhitelist = false;
       }
     }
 
@@ -1326,16 +1344,29 @@
     const tabPanelMonitor = document.getElementById("tab-panel-monitor");
     const tabPanelSettings = document.getElementById("tab-panel-settings");
     const settingsForm = document.getElementById("settings-form");
+    const saveSettingsBtn = document.getElementById("save-settings-btn");
     const settingsStatusMsg = document.getElementById("settings-status-msg");
     const forceSweepBtn = document.getElementById("force-sweep-btn");
     const stopSdrBtn = document.getElementById("stop-sdr-btn");
     const headerSdrToggleBtn = document.getElementById("header-sdr-toggle-btn");
     const headerModeEl = document.getElementById("header-mode");
 
+    let settingsFormDirty = false;
+    let isSavingSettings = false;
+
+    if (settingsForm) {
+      settingsForm.addEventListener("input", () => {
+        settingsFormDirty = true;
+      });
+      settingsForm.addEventListener("change", () => {
+        settingsFormDirty = true;
+      });
+    }
+
     function updateModeUI(modeStr) {
       const m = String(modeStr || "scanner").toLowerCase();
       const cfgModeEl = document.getElementById("cfg-mode");
-      if (cfgModeEl) {
+      if (cfgModeEl && !settingsFormDirty) {
         cfgModeEl.value = m;
       }
       if (headerModeEl) {
@@ -1365,7 +1396,9 @@
         tabPanelSettings.classList.add("flex");
         tabBtnSettings.className = "py-1.5 text-xs font-bold uppercase tracking-wider rounded bg-cyan-950/90 text-cyan-300 border border-cyan-700/70 transition";
         tabBtnMonitor.className = "py-1.5 text-xs font-bold uppercase tracking-wider rounded text-gray-400 hover:text-gray-200 border border-transparent transition";
-        loadRuntimeConfig();
+        if (!settingsFormDirty && !isSavingSettings) {
+          loadRuntimeConfig(false);
+        }
       } else {
         tabPanelSettings.classList.add("hidden");
         tabPanelSettings.classList.remove("flex");
@@ -1378,27 +1411,47 @@
     tabBtnMonitor.addEventListener("click", () => switchSidebarTab("monitor"));
     tabBtnSettings.addEventListener("click", () => switchSidebarTab("settings"));
 
-    async function loadRuntimeConfig() {
+    function applyConfigToForm(cfg) {
+      if (!cfg) return;
+      document.getElementById("cfg-rtl-index").value = cfg.RTL_DEVICE_INDEX ?? 1;
+      document.getElementById("cfg-rtl-gain").value = cfg.RTL_GAIN ?? 28.0;
+      document.getElementById("cfg-rtl-ppm").value = cfg.RTL_PPM ?? 0;
+      document.getElementById("cfg-mode").value = (cfg.MODE || "scanner").toLowerCase();
+      document.getElementById("cfg-scan-start").value = cfg.SCAN_START_MHZ ?? 426.0;
+      document.getElementById("cfg-scan-end").value = cfg.SCAN_END_MHZ ?? 430.0;
+      document.getElementById("cfg-scan-dwell").value = cfg.SCAN_DWELL_TIME ?? 120;
+      document.getElementById("cfg-idle-timeout").value = cfg.IDLE_TIMEOUT_SEC ?? 120;
+      document.getElementById("cfg-blacklist-strikes").value = cfg.BLACKLIST_STRIKES ?? 3;
+      document.getElementById("cfg-blacklist-time").value = cfg.BLACKLIST_TIME_SEC ?? 3600;
+      document.getElementById("cfg-center-freq").value = cfg.CENTER_FREQ ?? 427750000;
+      document.getElementById("cfg-tetra-channels").value = cfg.TETRA_CHANNELS ?? "427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7";
+      settingsFormDirty = false;
+      updateModeUI(cfg.MODE || "scanner");
+    }
+
+    async function loadRuntimeConfig(forceOverwrite = false) {
       try {
         const res = await fetch("/api/config");
         if (!res.ok) return;
         const cfg = await res.json();
-        document.getElementById("cfg-rtl-index").value = cfg.RTL_DEVICE_INDEX ?? 1;
-        document.getElementById("cfg-rtl-gain").value = cfg.RTL_GAIN ?? 28.0;
-        document.getElementById("cfg-rtl-ppm").value = cfg.RTL_PPM ?? 0;
-        document.getElementById("cfg-mode").value = (cfg.MODE || "scanner").toLowerCase();
-        document.getElementById("cfg-scan-start").value = cfg.SCAN_START_MHZ ?? 426.0;
-        document.getElementById("cfg-scan-end").value = cfg.SCAN_END_MHZ ?? 430.0;
-        document.getElementById("cfg-scan-dwell").value = cfg.SCAN_DWELL_TIME ?? 120;
-        document.getElementById("cfg-idle-timeout").value = cfg.IDLE_TIMEOUT_SEC ?? 120;
-        document.getElementById("cfg-blacklist-strikes").value = cfg.BLACKLIST_STRIKES ?? 3;
-        document.getElementById("cfg-blacklist-time").value = cfg.BLACKLIST_TIME_SEC ?? 3600;
-        document.getElementById("cfg-center-freq").value = cfg.CENTER_FREQ ?? 427750000;
-        document.getElementById("cfg-tetra-channels").value = cfg.TETRA_CHANNELS ?? "427000000:71,427300000:17,427550000:23,427850000:1,427950000:16,428500000:7";
-        updateModeUI(cfg.MODE || "scanner");
+        const userEditing = settingsForm && settingsForm.contains(document.activeElement);
+        if (!forceOverwrite && (settingsFormDirty || userEditing || isSavingSettings)) {
+          updateModeUI(cfg.MODE || "scanner");
+          return;
+        }
+        applyConfigToForm(cfg);
       } catch (e) {
         // Ignore transient network errors
       }
+    }
+
+    function parseNumField(id, fallback) {
+      const el = document.getElementById(id);
+      if (!el) return fallback;
+      const raw = String(el.value ?? "").replace(",", ".").trim();
+      if (!raw) return fallback;
+      const num = Number(raw);
+      return isNaN(num) ? fallback : num;
     }
 
     function computeOptimalCenterFromChannelsStr(channelsStr) {
@@ -1437,6 +1490,7 @@
       btnAutoCenter.addEventListener("click", () => {
         const chStr = document.getElementById("cfg-tetra-channels").value;
         document.getElementById("cfg-center-freq").value = computeOptimalCenterFromChannelsStr(chStr);
+        settingsFormDirty = true;
       });
     }
 
@@ -1463,6 +1517,7 @@
           document.getElementById("cfg-tetra-channels").value = chStr;
           document.getElementById("cfg-center-freq").value = computeOptimalCenterFromChannelsStr(chStr);
           document.getElementById("cfg-mode").value = "static";
+          settingsFormDirty = true;
           settingsStatusMsg.textContent = `Loaded ${chParts.length} whitelisted channels. Click Save & Apply Live to activate.`;
           settingsStatusMsg.className = "text-[11px] text-center text-emerald-400 min-h-[1.25rem]";
         } catch (e) {
@@ -1473,21 +1528,27 @@
 
     settingsForm.addEventListener("submit", async (e) => {
       e.preventDefault();
+      if (isSavingSettings) return;
+      isSavingSettings = true;
+      if (saveSettingsBtn) {
+        saveSettingsBtn.disabled = true;
+        saveSettingsBtn.textContent = "Saving & Applying...";
+      }
       settingsStatusMsg.textContent = "Applying configuration...";
       settingsStatusMsg.className = "text-[11px] text-center text-gray-300 min-h-[1.25rem]";
 
       const rawRtlDev = document.getElementById("cfg-rtl-index").value.trim();
       const payload = {
         RTL_DEVICE_INDEX: (/^\d{1,3}$/.test(rawRtlDev)) ? Number(rawRtlDev) : (rawRtlDev || 0),
-        RTL_GAIN: Number(document.getElementById("cfg-rtl-gain").value),
-        RTL_PPM: Number(document.getElementById("cfg-rtl-ppm").value),
+        RTL_GAIN: parseNumField("cfg-rtl-gain", 24.0),
+        RTL_PPM: Math.round(parseNumField("cfg-rtl-ppm", 0)),
         MODE: document.getElementById("cfg-mode").value,
-        SCAN_START_MHZ: Number(document.getElementById("cfg-scan-start").value),
-        SCAN_END_MHZ: Number(document.getElementById("cfg-scan-end").value),
-        SCAN_DWELL_TIME: Number(document.getElementById("cfg-scan-dwell").value),
-        IDLE_TIMEOUT_SEC: Number(document.getElementById("cfg-idle-timeout").value),
-        BLACKLIST_STRIKES: Number(document.getElementById("cfg-blacklist-strikes").value),
-        BLACKLIST_TIME_SEC: Number(document.getElementById("cfg-blacklist-time").value),
+        SCAN_START_MHZ: parseNumField("cfg-scan-start", 420.0),
+        SCAN_END_MHZ: parseNumField("cfg-scan-end", 430.0),
+        SCAN_DWELL_TIME: Math.max(10, Math.round(parseNumField("cfg-scan-dwell", 120))),
+        IDLE_TIMEOUT_SEC: Math.max(15, Math.round(parseNumField("cfg-idle-timeout", 120))),
+        BLACKLIST_STRIKES: Math.max(1, Math.round(parseNumField("cfg-blacklist-strikes", 3))),
+        BLACKLIST_TIME_SEC: Math.max(10, Math.round(parseNumField("cfg-blacklist-time", 3600))),
         CENTER_FREQ: document.getElementById("cfg-center-freq").value.trim(),
         TETRA_CHANNELS: document.getElementById("cfg-tetra-channels").value.trim()
       };
@@ -1500,15 +1561,16 @@
         });
         const data = await res.json();
         if (res.ok && (data.ok || data.status === "ok")) {
-          if (data.config && data.config.MODE) {
-            updateModeUI(data.config.MODE);
+          if (data.config) {
+            applyConfigToForm(data.config);
           }
           const isHard = Boolean(data.hard_reload || data.restarted_pipeline);
+          const gainConfirm = data.config && data.config.RTL_GAIN !== undefined ? ` (Gain: ${data.config.RTL_GAIN} dB)` : "";
           settingsStatusMsg.textContent = (data.config && data.config.MODE === "stopped")
             ? "Stopped scanning and released RTL-SDR device."
             : (isHard
-              ? "Saved. Reloading radio/scanner pipeline..."
-              : "Saved and applied live (no interruption).");
+              ? `Saved${gainConfirm}. Reloading radio/scanner pipeline...`
+              : `Saved${gainConfirm} and applied live (no interruption).`);
           settingsStatusMsg.className = "text-[11px] text-center text-emerald-400 min-h-[1.25rem]";
         } else {
           settingsStatusMsg.textContent = data.message || data.error || "Failed to save settings.";
@@ -1517,6 +1579,12 @@
       } catch (err) {
         settingsStatusMsg.textContent = "Network error while saving settings.";
         settingsStatusMsg.className = "text-[11px] text-center text-red-400 min-h-[1.25rem]";
+      } finally {
+        isSavingSettings = false;
+        if (saveSettingsBtn) {
+          saveSettingsBtn.disabled = false;
+          saveSettingsBtn.textContent = "Save & Apply Live";
+        }
       }
     });
 
@@ -1781,7 +1849,11 @@
       if (e.key === "Enter") loadHistoryArchive();
     });
 
+    let isLoadingAnalytics = false;
+
     async function loadAnalyticsSummary() {
+      if (isLoadingAnalytics) return;
+      isLoadingAnalytics = true;
       const hours = document.getElementById("analytics-hours").value;
       try {
         const res = await fetch(`/api/analytics?hours=${encodeURIComponent(hours)}`);
@@ -1901,6 +1973,8 @@
         }
       } catch (e) {
         // Ignore transient network errors
+      } finally {
+        isLoadingAnalytics = false;
       }
     }
 
